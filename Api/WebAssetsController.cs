@@ -48,6 +48,7 @@ public class WebAssetsController : ControllerBase
         var imageBaseUrl = string.IsNullOrEmpty(config?.ScryerPublicBaseUrl)
             ? config?.ScryerApiBaseUrl ?? string.Empty
             : config.ScryerPublicBaseUrl;
+        Response.Headers.CacheControl = "no-store";
         return Ok(new { imageBaseUrl });
     }
 }
