@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.1.0.0)'
+        required: true
 
 jobs:
   build-and-release:
@@ -21,12 +26,18 @@ jobs:
 
       - name: Package plugin zip
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          if [ -n "${{ inputs.version }}" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$version" >> "$GITHUB_ENV"
           mkdir -p dist
           zip -j "dist/Jellyfin.Plugin.Scryer_${version}.zip" bin/Release/net9.0/Jellyfin.Plugin.Scryer.dll
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ env.version }}
           files: dist/*.zip
           generate_release_notes: true
