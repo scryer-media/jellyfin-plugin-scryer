@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>Jellyfin.Plugin.Scryer</AssemblyName>
+    <RootNamespace>Jellyfin.Plugin.Scryer</RootNamespace>
+    <Product>Scryer</Product>
+    <Version>0.1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Version must match the target Jellyfin server's plugin ABI (10.11.x server -> Jellyfin.Controller 10.11.x). -->
+    <PackageReference Include="Jellyfin.Controller" Version="10.11.11" />
+    <PackageReference Include="Jellyfin.Model" Version="10.11.11" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Configuration\configPage.html" />
+    <EmbeddedResource Include="Web\scryer-core.js" />
+    <EmbeddedResource Include="Web\scryer-styles.js" />
+    <EmbeddedResource Include="Web\scryer-discovery.js" />
+    <EmbeddedResource Include="Web\scryer-calendar.js" />
+    <EmbeddedResource Include="Web\scryer-requests.js" />
+    <EmbeddedResource Include="Web\scryer-downloads.js" />
+  </ItemGroup>
+
+</Project>

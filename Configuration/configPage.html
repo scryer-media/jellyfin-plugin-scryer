@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Scryer</title>
+</head>
+<body>
+<div id="ScryerConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox">
+    <div data-role="content">
+        <div class="content-primary">
+            <form id="ScryerConfigForm">
+                <div class="verticalSection">
+                    <h2>Scryer Plugin Settings</h2>
+                </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="text" id="ScryerApiBaseUrl" label="Scryer API Base URL" />
+                </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="password" id="ScryerApiKey" label="Scryer API Key" />
+                </div>
+                <div class="checkboxContainer">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="EnableRequests" />
+                        <span>Enable request page</span>
+                    </label>
+                </div>
+                <div class="checkboxContainer">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="EnableDownloadPage" />
+                        <span>Enable download page</span>
+                    </label>
+                </div>
+                <div>
+                    <button is="emby-button" type="submit" class="raised button-submit block emby-button">
+                        <span>Save</span>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+    <script type="text/javascript">
+        var ScryerConfig = {
+            pluginUniqueId: '6a9c9f2e-6b2f-4a1a-9d3d-2c7f2f5b3d10'
+        };
+
+        document.querySelector('#ScryerConfigPage')
+            .addEventListener('pageshow', function () {
+                Dashboard.showLoadingMsg();
+                ApiClient.getPluginConfiguration(ScryerConfig.pluginUniqueId).then(function (config) {
+                    document.querySelector('#ScryerApiBaseUrl').value = config.ScryerApiBaseUrl || '';
+                    document.querySelector('#ScryerApiKey').value = config.ScryerApiKey || '';
+                    document.querySelector('#EnableRequests').checked = config.EnableRequests;
+                    document.querySelector('#EnableDownloadPage').checked = config.EnableDownloadPage;
+                    Dashboard.hideLoadingMsg();
+                });
+            });
+
+        document.querySelector('#ScryerConfigForm')
+            .addEventListener('submit', function (e) {
+                Dashboard.showLoadingMsg();
+                ApiClient.getPluginConfiguration(ScryerConfig.pluginUniqueId).then(function (config) {
+                    config.ScryerApiBaseUrl = document.querySelector('#ScryerApiBaseUrl').value;
+                    config.ScryerApiKey = document.querySelector('#ScryerApiKey').value;
+                    config.EnableRequests = document.querySelector('#EnableRequests').checked;
+                    config.EnableDownloadPage = document.querySelector('#EnableDownloadPage').checked;
+
+                    ApiClient.updatePluginConfiguration(ScryerConfig.pluginUniqueId, config).then(function (result) {
+                        Dashboard.processPluginConfigurationUpdateResult(result);
+                    });
+                });
+                e.preventDefault();
+                return false;
+            });
+    </script>
+</div>
+</body>
+</html>
