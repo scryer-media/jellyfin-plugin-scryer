@@ -44,6 +44,10 @@ public class WebAssetsController : ControllerBase
     [HttpGet("config")]
     public ActionResult<object> GetConfig()
     {
-        return Ok(new { imageBaseUrl = Plugin.Instance?.Configuration.ScryerApiBaseUrl ?? string.Empty });
+        var config = Plugin.Instance?.Configuration;
+        var imageBaseUrl = string.IsNullOrEmpty(config?.ScryerPublicBaseUrl)
+            ? config?.ScryerApiBaseUrl ?? string.Empty
+            : config.ScryerPublicBaseUrl;
+        return Ok(new { imageBaseUrl });
     }
 }

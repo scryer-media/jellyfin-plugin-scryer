@@ -15,6 +15,14 @@
                     <input is="emby-input" type="text" id="ScryerApiBaseUrl" label="Scryer API Base URL" />
                 </div>
                 <div class="inputContainer">
+                    <input is="emby-input" type="text" id="ScryerPublicBaseUrl" label="Scryer Public Base URL (optional)" />
+                    <div class="fieldDescription">
+                        Only needed if the API Base URL above isn't reachable from users' browsers
+                        (e.g. it's a Docker-internal address like host.docker.internal). Set this to
+                        a URL the browser can actually reach; leave blank to reuse the API Base URL.
+                    </div>
+                </div>
+                <div class="inputContainer">
                     <input is="emby-input" type="password" id="ScryerApiKey" label="Scryer API Key" />
                 </div>
                 <div class="checkboxContainer">
@@ -42,11 +50,18 @@
             pluginUniqueId: '6a9c9f2e-6b2f-4a1a-9d3d-2c7f2f5b3d10'
         };
 
+        function normalizeUrl(value) {
+            var trimmed = (value || '').trim();
+            if (!trimmed || /^https?:\/\//i.test(trimmed)) return trimmed;
+            return 'https://' + trimmed;
+        }
+
         document.querySelector('#ScryerConfigPage')
             .addEventListener('pageshow', function () {
                 Dashboard.showLoadingMsg();
                 ApiClient.getPluginConfiguration(ScryerConfig.pluginUniqueId).then(function (config) {
                     document.querySelector('#ScryerApiBaseUrl').value = config.ScryerApiBaseUrl || '';
+                    document.querySelector('#ScryerPublicBaseUrl').value = config.ScryerPublicBaseUrl || '';
                     document.querySelector('#ScryerApiKey').value = config.ScryerApiKey || '';
                     document.querySelector('#EnableRequests').checked = config.EnableRequests;
                     document.querySelector('#EnableDownloadPage').checked = config.EnableDownloadPage;
@@ -58,7 +73,8 @@
             .addEventListener('submit', function (e) {
                 Dashboard.showLoadingMsg();
                 ApiClient.getPluginConfiguration(ScryerConfig.pluginUniqueId).then(function (config) {
-                    config.ScryerApiBaseUrl = document.querySelector('#ScryerApiBaseUrl').value;
+                    config.ScryerApiBaseUrl = normalizeUrl(document.querySelector('#ScryerApiBaseUrl').value);
+                    config.ScryerPublicBaseUrl = normalizeUrl(document.querySelector('#ScryerPublicBaseUrl').value);
                     config.ScryerApiKey = document.querySelector('#ScryerApiKey').value;
                     config.EnableRequests = document.querySelector('#EnableRequests').checked;
                     config.EnableDownloadPage = document.querySelector('#EnableDownloadPage').checked;
