@@ -8,6 +8,14 @@
     "category": "General",
     "versions": [
       {
+        "version": "0.1.2.0",
+        "changelog": "",
+        "targetAbi": "10.11.0.0",
+        "sourceUrl": "https://github.com/not-akari/jellyfin-plugin-scryer/releases/download/v0.1.2.0/Jellyfin.Plugin.Scryer_0.1.2.0.zip",
+        "checksum": "8b8c336946dea58a7427c6c6f1b1f242",
+        "timestamp": "2026-08-31T19:51:33Z"
+      },
+      {
         "version": "0.1.1.0",
         "changelog": "Add a separate browser-facing image base URL setting (fixes missing posters when the API base URL is only reachable server-side, e.g. host.docker.internal); auto-normalize config URLs to include https:// if missing.",
         "targetAbi": "10.11.0.0",
