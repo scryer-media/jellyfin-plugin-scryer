@@ -171,26 +171,36 @@ public sealed class ScryerTokenStore : IScryerTokenStore
                     File.Move(path, finalPath, overwrite: true);
                     path = finalPath;
                 }
-                catch (IOException) { continue; }
-                catch (UnauthorizedAccessException) { continue; }
+                catch (IOException error)
+                {
+                    throw new IOException("A detached revocation journal could not be promoted.", error);
+                }
+                catch (UnauthorizedAccessException error)
+                {
+                    throw new IOException("A detached revocation journal could not be promoted.", error);
+                }
             }
             else if (!path.EndsWith(".revoke.dat", StringComparison.Ordinal))
             {
                 continue;
             }
             var bytes = await ReadBoundedAsync(path, cancellationToken).ConfigureAwait(false);
-            if (bytes is null) continue;
-            try
+            if (bytes is null)
             {
-                var record = JsonSerializer.Deserialize<StoredGrant>(Encoding.UTF8.GetString(_protector.Unprotect(bytes)));
-                if (record is not null && record.JellyfinUserId == jellyfinUserId &&
-                    record.LinkState == ScryerGrantLinkState.PendingRevoke.ToString())
-                {
-                    grants.Add(new ScryerRefreshGrant(new ScryerGrantKey(record.JellyfinUserId, record.Authority, record.ClientId), record.RefreshToken, record.UpdatedAt, ScryerGrantLinkState.PendingRevoke, record.LinkIdempotencyKey, record.LinkAttempts));
-                }
+                throw new IOException("A detached revocation record could not be read.");
             }
-            catch (CryptographicException) { }
-            catch (JsonException) { }
+            var record = JsonSerializer.Deserialize<StoredGrant>(Encoding.UTF8.GetString(_protector.Unprotect(bytes)));
+            if (record is null ||
+                !IsValidStoredUserId(record.JellyfinUserId) ||
+                record.LinkState != ScryerGrantLinkState.PendingRevoke.ToString() ||
+                string.IsNullOrWhiteSpace(record.RefreshToken))
+            {
+                throw new InvalidDataException("A detached revocation record is invalid.");
+            }
+            if (record.JellyfinUserId == jellyfinUserId)
+            {
+                grants.Add(new ScryerRefreshGrant(new ScryerGrantKey(record.JellyfinUserId, record.Authority, record.ClientId), record.RefreshToken, record.UpdatedAt, ScryerGrantLinkState.PendingRevoke, record.LinkIdempotencyKey, record.LinkAttempts));
+            }
         }
         return grants;
     }

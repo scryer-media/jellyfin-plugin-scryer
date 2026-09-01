@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Reflection;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
@@ -7,6 +8,8 @@ using System.Text.Json;
 using Jellyfin.Plugin.Scryer.Api;
 using Jellyfin.Plugin.Scryer.Configuration;
 using Jellyfin.Plugin.Scryer.OAuth;
+using MediaBrowser.Common.Configuration;
+using Microsoft.AspNetCore.DataProtection;
 
 var tests = new (string Name, Func<Task> Run)[]
 {
@@ -17,6 +20,16 @@ var tests = new (string Name, Func<Task> Run)[]
     ("PKCE is RFC 7636 S256", PkceAsync),
     ("Jellyfin link GraphQL request and response are fixed", JellyfinLinkAsync),
     ("stable failure mapping is browser-safe", FailureMappingAsync),
+    ("detached revoke journal survives restart discovery, promotion, and cleanup", DetachedRevokeJournalAsync),
+    ("retiring a detached issued family preserves the current family", DetachedRetirementPreservesCurrentAsync),
+    ("detached revoke deletion failure retains its tombstone", DetachedDeletionFailureAsync),
+    ("disconnect fails closed when detached state cannot be read", DisconnectDetachedReadFailureAsync),
+    ("disconnect fails closed on a corrupt encrypted detached record", DisconnectCorruptDetachedRecordAsync),
+    ("OAuth flow binds callback and finalize to one browser and initiating user", OAuthFlowBindingAsync),
+    ("link persistence is pending before link and retires on activation failure", PendingLinkOrderingAsync),
+    ("encrypted token store isolates two Jellyfin users", TokenStoreUserIsolationAsync),
+    ("per-user refresh is single-flight and persists rotation before lease publication", SingleFlightRefreshAsync),
+    ("failed rotated-token persistence quarantines the issued family without releasing a lease", FailedRefreshPersistenceAsync),
 };
 
 var failures = new List<string>();
@@ -178,6 +191,405 @@ static Task FailureMappingAsync()
     return Task.CompletedTask;
 }
 
+static async Task DetachedRevokeJournalAsync()
+{
+    const string jellyfinUserId = "0123456789abcdef0123456789abcdef";
+    var dataPath = Path.Combine(Path.GetTempPath(), "scryer-plugin-selftest-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var store = new ScryerTokenStore(
+            DataProtectionProvider.Create(new DirectoryInfo(dataPath), builder => builder.SetApplicationName("Scryer.Plugin.SelfTest")),
+            ApplicationPathsProxy.Create(dataPath));
+        var grant = PendingRevoke(jellyfinUserId, "detached-refresh");
+        Assert.True(await store.QuarantineDetachedAsync(grant, CancellationToken.None));
+
+        var grantsPath = Path.Combine(dataPath, "plugins", "scryer", "oauth-grants");
+        Assert.Equal(1, Directory.GetFiles(grantsPath, "*.revoke.dat.next").Length);
+        var restartedStore = new ScryerTokenStore(
+            DataProtectionProvider.Create(new DirectoryInfo(dataPath), builder => builder.SetApplicationName("Scryer.Plugin.SelfTest")),
+            ApplicationPathsProxy.Create(dataPath));
+        var pendingUsers = await restartedStore.GetPendingUserIdsAsync(4, null, CancellationToken.None);
+        Assert.Equal(jellyfinUserId, pendingUsers.Single());
+        var discovered = await restartedStore.ReadDetachedQuarantinesAsync(jellyfinUserId, CancellationToken.None);
+        Assert.Equal(1, discovered.Count);
+        Assert.Equal("detached-refresh", discovered[0].RefreshToken);
+        Assert.Equal(ScryerGrantLinkState.PendingRevoke, discovered[0].LinkState);
+        Assert.Equal(0, Directory.GetFiles(grantsPath, "*.revoke.dat.next").Length);
+        Assert.Equal(1, Directory.GetFiles(grantsPath, "*.revoke.dat").Length);
+
+        var handler = new RecordingHandler(_ => new HttpResponseMessage(HttpStatusCode.NoContent));
+        var cleanup = SessionService(ValidOAuthConfiguration(), restartedStore, handler);
+        var discarded = await cleanup.DiscardPendingLinkAsync(jellyfinUserId, CancellationToken.None);
+        Assert.True(discarded.IsSuccess, discarded.Failure?.Code.ToString());
+        Assert.False(discarded.Value == true);
+        Assert.Equal(1, handler.Requests.Count);
+        Assert.Equal("/oauth/revoke", handler.Requests[0].RequestUri!.AbsolutePath);
+        Assert.Equal(0, Directory.GetFiles(grantsPath, "*.revoke.dat*").Length);
+    }
+    finally
+    {
+        if (Directory.Exists(dataPath)) Directory.Delete(dataPath, recursive: true);
+    }
+}
+
+static async Task DetachedRetirementPreservesCurrentAsync()
+{
+    const string jellyfinUserId = "0123456789abcdef0123456789abcdef";
+    var configuration = ValidOAuthConfiguration();
+    var current = ActiveGrant(jellyfinUserId, configuration, "current-refresh");
+    var store = new InMemoryTokenStore { Current = current };
+    var handler = new RecordingHandler(_ => new HttpResponseMessage(HttpStatusCode.NoContent));
+    var service = SessionService(configuration, store, handler);
+
+    var retired = await service.RetireIssuedRefreshTokenAsync(jellyfinUserId, configuration, "issued-refresh", CancellationToken.None);
+
+    Assert.True(retired.IsSuccess, retired.Failure?.Code.ToString());
+    Assert.Equal("current-refresh", store.Current!.RefreshToken);
+    Assert.Equal(ScryerGrantLinkState.Active, store.Current.LinkState);
+    Assert.Equal(0, store.DeleteCurrentCalls);
+    Assert.Equal(1, store.QuarantineDetachedCalls);
+    Assert.Equal(1, store.DeleteDetachedCalls);
+    Assert.Equal(0, store.Detached.Count);
+    Assert.Equal(1, handler.Requests.Count);
+    Assert.Equal("/base/oauth/revoke", handler.Requests[0].RequestUri!.AbsolutePath);
+    Assert.Contains("token=issued-refresh", handler.Requests[0].Content!);
+}
+
+static async Task DetachedDeletionFailureAsync()
+{
+    const string jellyfinUserId = "0123456789abcdef0123456789abcdef";
+    var configuration = ValidOAuthConfiguration();
+    var store = new InMemoryTokenStore
+    {
+        Current = ActiveGrant(jellyfinUserId, configuration, "current-refresh"),
+        DeleteDetachedResult = false,
+    };
+    var handler = new RecordingHandler(_ => new HttpResponseMessage(HttpStatusCode.NoContent));
+    var service = SessionService(configuration, store, handler);
+
+    var retired = await service.RetireIssuedRefreshTokenAsync(jellyfinUserId, configuration, "issued-refresh", CancellationToken.None);
+
+    Assert.False(retired.IsSuccess);
+    Assert.Equal(ScryerFailureCode.AuthorizationExpired, retired.Failure!.Code);
+    Assert.Equal("current-refresh", store.Current!.RefreshToken);
+    Assert.Equal(0, store.DeleteCurrentCalls);
+    Assert.Equal(1, store.DeleteDetachedCalls);
+    Assert.Equal(1, store.Detached.Count);
+    Assert.Equal("issued-refresh", store.Detached[0].RefreshToken);
+    Assert.Equal(ScryerGrantLinkState.PendingRevoke, store.Detached[0].LinkState);
+    Assert.Equal(1, handler.Requests.Count);
+}
+
+static async Task DisconnectDetachedReadFailureAsync()
+{
+    const string jellyfinUserId = "0123456789abcdef0123456789abcdef";
+    var configuration = ValidOAuthConfiguration();
+    var store = new InMemoryTokenStore { Current = ActiveGrant(jellyfinUserId, configuration, "current-refresh") };
+    var handler = new RecordingHandler(request => request.Method == HttpMethod.Get
+        ? JsonResponse(ValidMetadataJson())
+        : JsonResponse(TokenJson("library jellyfin-link")));
+    var service = SessionService(configuration, store, handler);
+
+    var lease = await service.GetAccessTokenAsync(jellyfinUserId, CancellationToken.None);
+    Assert.True(lease.IsSuccess, lease.Failure?.Code.ToString());
+    Assert.Equal("refresh", store.Current!.RefreshToken);
+    Assert.Equal(2, handler.Requests.Count);
+    store.ResetOperationCounts();
+    store.ThrowOnReadDetached = true;
+
+    var disconnected = await service.DisconnectAsync(jellyfinUserId, CancellationToken.None);
+
+    Assert.False(disconnected.IsSuccess);
+    Assert.Equal(ScryerFailureCode.InternalError, disconnected.Failure!.Code);
+    Assert.Equal(0, store.ReadCurrentCalls);
+    Assert.Equal(0, store.DeleteCurrentCalls);
+    Assert.Equal("refresh", store.Current!.RefreshToken);
+    Assert.Equal(ScryerGrantLinkState.Active, store.Current.LinkState);
+    Assert.Equal(2, handler.Requests.Count);
+
+    var afterFailure = await service.GetAccessTokenAsync(jellyfinUserId, CancellationToken.None);
+    Assert.False(afterFailure.IsSuccess);
+    Assert.Equal(ScryerFailureCode.AuthorizationExpired, afterFailure.Failure!.Code);
+    Assert.Equal(2, handler.Requests.Count);
+}
+
+static async Task DisconnectCorruptDetachedRecordAsync()
+{
+    const string jellyfinUserId = "0123456789abcdef0123456789abcdef";
+    var dataPath = Path.Combine(Path.GetTempPath(), "scryer-plugin-selftest-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var configuration = ValidOAuthConfiguration();
+        var store = new ScryerTokenStore(DataProtectionProvider.Create(dataPath), ApplicationPathsProxy.Create(dataPath));
+        Assert.True(await store.SaveAsync(ActiveGrant(jellyfinUserId, configuration, "current-refresh"), CancellationToken.None));
+        var grantsPath = Path.Combine(dataPath, "plugins", "scryer", "oauth-grants");
+        var corruptJournalPath = Path.Combine(grantsPath, "corrupt.revoke.dat.next");
+        await File.WriteAllBytesAsync(corruptJournalPath, [0x01, 0x02, 0x03], CancellationToken.None);
+
+        var handler = new RecordingHandler(_ => throw new InvalidOperationException("Disconnect must not contact Scryer after a detached-store failure."));
+        var service = SessionService(configuration, store, handler);
+        var disconnected = await service.DisconnectAsync(jellyfinUserId, CancellationToken.None);
+
+        Assert.False(disconnected.IsSuccess);
+        Assert.Equal(ScryerFailureCode.InternalError, disconnected.Failure!.Code);
+        Assert.Equal(0, handler.Requests.Count);
+        var current = await store.ReadCurrentAsync(jellyfinUserId, CancellationToken.None);
+        Assert.Equal(ScryerGrantReadState.Found, current.State);
+        Assert.Equal("current-refresh", current.Grant!.RefreshToken);
+        Assert.Equal(1, Directory.GetFiles(grantsPath, "*.revoke.dat").Length);
+
+        var afterFailure = await service.GetAccessTokenAsync(jellyfinUserId, CancellationToken.None);
+        Assert.False(afterFailure.IsSuccess);
+        Assert.Equal(ScryerFailureCode.AuthorizationExpired, afterFailure.Failure!.Code);
+        Assert.Equal(0, handler.Requests.Count);
+    }
+    finally
+    {
+        if (Directory.Exists(dataPath)) Directory.Delete(dataPath, recursive: true);
+    }
+}
+
+static async Task OAuthFlowBindingAsync()
+{
+    var dataPath = Path.Combine(Path.GetTempPath(), "scryer-plugin-selftest-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var configuration = ValidOAuthConfiguration();
+        var session = new RecordingSession();
+        var handler = new RecordingHandler(request => request.Method == HttpMethod.Get
+            ? JsonResponse(ValidMetadataJson())
+            : JsonResponse(TokenJson("library jellyfin-link")));
+        var flow = new ScryerOAuthFlowService(
+            new FixedConfigurationProvider(configuration),
+            new ScryerOAuthMetadataClient(handler),
+            session,
+            new ScryerOAuthFlowStore(),
+            DataProtectionProvider.Create(dataPath));
+
+        var first = await flow.StartAsync("user-a", "#/scryer-calendar", CancellationToken.None);
+        var second = await flow.StartAsync("user-b", null, CancellationToken.None);
+        Assert.True(first.IsSuccess);
+        Assert.True(second.IsSuccess);
+        var firstState = QueryValue(first.Value!.AuthorizationUri, "state");
+        var secondState = QueryValue(second.Value!.AuthorizationUri, "state");
+        Assert.True(flow.TryGetCallbackCookie(firstState, out var callbackCookie));
+        Assert.Equal(first.Value.CookieName, callbackCookie.Name);
+        Assert.Equal("/base/Scryer/Auth/Callback", callbackCookie.Path);
+
+        var wrongBrowser = await flow.StageCallbackAsync(firstState, second.Value!.CookieValue, "first-code", null, CancellationToken.None);
+        Assert.False(wrongBrowser.Success);
+        Assert.Equal(ScryerFailureCode.AuthorizationExpired, wrongBrowser.Failure!.Code);
+        Assert.True(flow.TryGetCallbackCookie(firstState, out _));
+        var firstStage = await flow.StageCallbackAsync(firstState, first.Value.CookieValue, "first-code", null, CancellationToken.None);
+        Assert.True(firstStage.Success, firstStage.Failure?.Code.ToString());
+
+        var staged = await flow.StageCallbackAsync(secondState, second.Value.CookieValue, "second-code", null, CancellationToken.None);
+        Assert.True(staged.Success, staged.Failure?.Code.ToString());
+        var replayedCallback = await flow.StageCallbackAsync(secondState, second.Value.CookieValue, "second-code", null, CancellationToken.None);
+        Assert.False(replayedCallback.Success);
+        Assert.Equal(ScryerFailureCode.AuthorizationExpired, replayedCallback.Failure!.Code);
+        var wrongUser = await flow.FinalizeAsync("user-other", staged.FinalizeCookieValue, CancellationToken.None);
+        Assert.False(wrongUser.IsSuccess);
+        Assert.Equal(ScryerFailureCode.AuthorizationExpired, wrongUser.Failure!.Code);
+        Assert.Equal(0, session.ConnectCalls);
+        var consumedByWrongUser = await flow.FinalizeAsync("user-b", staged.FinalizeCookieValue, CancellationToken.None);
+        Assert.False(consumedByWrongUser.IsSuccess);
+        Assert.Equal(ScryerFailureCode.AuthorizationExpired, consumedByWrongUser.Failure!.Code);
+
+        var successful = await flow.StartAsync("user-c", "#/scryer-requests", CancellationToken.None);
+        var successfulState = QueryValue(successful.Value!.AuthorizationUri, "state");
+        var successfulStage = await flow.StageCallbackAsync(successfulState, successful.Value.CookieValue, "third-code", null, CancellationToken.None);
+        Assert.True(successfulStage.Success, successfulStage.Failure?.Code.ToString());
+        var finalized = await flow.FinalizeAsync("user-c", successfulStage.FinalizeCookieValue, CancellationToken.None);
+        Assert.True(finalized.IsSuccess, finalized.Failure?.Code.ToString());
+        Assert.Equal(1, session.ConnectCalls);
+        Assert.Equal("user-c", session.ConnectedUsers.Single());
+        var replayedFinalize = await flow.FinalizeAsync("user-c", successfulStage.FinalizeCookieValue, CancellationToken.None);
+        Assert.False(replayedFinalize.IsSuccess);
+        Assert.Equal(ScryerFailureCode.AuthorizationExpired, replayedFinalize.Failure!.Code);
+        Assert.Equal(1, session.ConnectCalls);
+    }
+    finally
+    {
+        if (Directory.Exists(dataPath)) Directory.Delete(dataPath, recursive: true);
+    }
+}
+
+static async Task PendingLinkOrderingAsync()
+{
+    const string jellyfinUserId = "0123456789abcdef0123456789abcdef";
+    var configuration = ValidOAuthConfiguration();
+    var store = new InMemoryTokenStore { PromotePendingResult = false };
+    var events = store.Events;
+    var handler = new RecordingHandler(request =>
+    {
+        events.Add(request.RequestUri!.AbsolutePath == "/base/oauth/revoke" ? "revoke" : "unexpected-request");
+        return new HttpResponseMessage(HttpStatusCode.NoContent);
+    });
+    var link = new PendingObservingLinkService(store, events);
+    var service = new ScryerUserSessionService(new FixedConfigurationProvider(configuration), new ScryerOAuthMetadataClient(handler), store, link);
+    var tokenSet = new ScryerOAuthTokenSet("access", "refresh", DateTimeOffset.UtcNow.AddMinutes(5), "library jellyfin-link");
+
+    var connected = await service.ConnectAsync(jellyfinUserId, configuration, tokenSet, CancellationToken.None);
+
+    Assert.False(connected.IsSuccess);
+    Assert.Equal(ScryerFailureCode.AuthorizationExpired, connected.Failure!.Code);
+    Assert.True(link.SawPendingLink);
+    Assert.Equal("save:PendingLink", events[0]);
+    Assert.Equal("link", events[1]);
+    Assert.Equal("promote", events[2]);
+    Assert.Equal("quarantine:PendingRevoke", events[3]);
+    Assert.Equal("revoke", events[4]);
+    Assert.Equal("delete-current", events[5]);
+    Assert.Equal(0, store.ActiveSaveCalls);
+    Assert.True(store.Current is null);
+}
+
+static async Task TokenStoreUserIsolationAsync()
+{
+    const string firstUserId = "0123456789abcdef0123456789abcdef";
+    const string secondUserId = "11111111111111111111111111111111";
+    var dataPath = Path.Combine(Path.GetTempPath(), "scryer-plugin-selftest-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var configuration = ValidOAuthConfiguration();
+        var store = new ScryerTokenStore(DataProtectionProvider.Create(dataPath), ApplicationPathsProxy.Create(dataPath));
+        var first = ActiveGrant(firstUserId, configuration, "first-refresh");
+        var second = ActiveGrant(secondUserId, configuration, "second-refresh");
+        Assert.True(await store.SaveAsync(first, CancellationToken.None));
+        Assert.True(await store.SaveAsync(second, CancellationToken.None));
+        var firstRead = await store.ReadCurrentAsync(firstUserId, CancellationToken.None);
+        var secondRead = await store.ReadCurrentAsync(secondUserId, CancellationToken.None);
+        Assert.Equal("first-refresh", firstRead.Grant!.RefreshToken);
+        Assert.Equal("second-refresh", secondRead.Grant!.RefreshToken);
+        var wrongBinding = await store.ReadAsync(new ScryerGrantKey(firstUserId, first.Key.Authority, "other-client"), CancellationToken.None);
+        Assert.Equal(ScryerGrantReadState.Missing, wrongBinding.State);
+        Assert.True(await store.DeleteCurrentAsync(firstUserId, CancellationToken.None));
+        Assert.Equal(ScryerGrantReadState.Missing, (await store.ReadCurrentAsync(firstUserId, CancellationToken.None)).State);
+        Assert.Equal("second-refresh", (await store.ReadCurrentAsync(secondUserId, CancellationToken.None)).Grant!.RefreshToken);
+    }
+    finally
+    {
+        if (Directory.Exists(dataPath)) Directory.Delete(dataPath, recursive: true);
+    }
+}
+
+static async Task SingleFlightRefreshAsync()
+{
+    const string jellyfinUserId = "0123456789abcdef0123456789abcdef";
+    var configuration = ValidOAuthConfiguration();
+    var saveStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var allowSave = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var store = new InMemoryTokenStore
+    {
+        Current = ActiveGrant(jellyfinUserId, configuration, "current-refresh"),
+        SaveStarted = saveStarted,
+        AllowSave = allowSave,
+    };
+    var handler = new RecordingHandler(request => request.Method == HttpMethod.Get
+        ? JsonResponse(ValidMetadataJson())
+        : JsonResponse(TokenJson("library jellyfin-link")));
+    var service = SessionService(configuration, store, handler);
+
+    var first = service.GetAccessTokenAsync(jellyfinUserId, CancellationToken.None);
+    await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+    var second = service.GetAccessTokenAsync(jellyfinUserId, CancellationToken.None);
+    Assert.False(first.IsCompleted);
+    Assert.False(second.IsCompleted);
+    Assert.Equal("current-refresh", store.Current!.RefreshToken);
+    Assert.Equal(2, handler.Requests.Count);
+    allowSave.SetResult(true);
+
+    var results = await Task.WhenAll(first, second);
+    Assert.True(results.All(result => result.IsSuccess));
+    Assert.True(results.All(result => result.Value!.AccessToken == "access"));
+    Assert.Equal(1, store.SaveCalls);
+    Assert.Equal(1, store.ActiveSaveCalls);
+    Assert.Equal("refresh", store.Current!.RefreshToken);
+    Assert.Equal(2, handler.Requests.Count);
+}
+
+static async Task FailedRefreshPersistenceAsync()
+{
+    await AssertFailedRefreshPersistenceAsync(saveResult: false, saveException: null, quarantineResult: true);
+    await AssertFailedRefreshPersistenceAsync(saveResult: true, saveException: new IOException("test persistence failure"), quarantineResult: true);
+    await AssertFailedRefreshPersistenceAsync(saveResult: false, saveException: null, quarantineResult: false);
+}
+
+static async Task AssertFailedRefreshPersistenceAsync(bool saveResult, Exception? saveException, bool quarantineResult)
+{
+    const string jellyfinUserId = "0123456789abcdef0123456789abcdef";
+    var configuration = ValidOAuthConfiguration();
+    var saveStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var allowSave = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var store = new InMemoryTokenStore
+    {
+        Current = ActiveGrant(jellyfinUserId, configuration, "current-refresh"),
+        SaveResult = saveResult,
+        SaveException = saveException,
+        QuarantineResult = quarantineResult,
+        SaveStarted = saveStarted,
+        AllowSave = allowSave,
+    };
+    var sawCurrentTombstoneAtRevoke = false;
+    var handler = new RecordingHandler(request =>
+    {
+        if (request.Method == HttpMethod.Get) return JsonResponse(ValidMetadataJson());
+        if (request.RequestUri!.AbsolutePath == "/base/oauth/token") return JsonResponse(TokenJson("library jellyfin-link"));
+        sawCurrentTombstoneAtRevoke = store.Current?.RefreshToken == "refresh" && store.Current.LinkState == ScryerGrantLinkState.PendingRevoke;
+        return new HttpResponseMessage(HttpStatusCode.NoContent);
+    });
+    var service = SessionService(configuration, store, handler);
+
+    var first = service.GetAccessTokenAsync(jellyfinUserId, CancellationToken.None);
+    await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+    var second = service.GetAccessTokenAsync(jellyfinUserId, CancellationToken.None);
+    Assert.False(first.IsCompleted);
+    Assert.False(second.IsCompleted);
+    allowSave.SetResult(true);
+
+    var results = await Task.WhenAll(first, second);
+    Assert.True(results.All(result => !result.IsSuccess));
+    Assert.Equal(1, store.SaveCalls);
+    Assert.Equal(1, store.ActiveSaveCalls);
+    Assert.Equal(0, store.QuarantineDetachedCalls);
+    Assert.Equal(0, store.DeleteDetachedCalls);
+    if (quarantineResult)
+    {
+        Assert.Equal(ScryerFailureCode.AuthorizationExpired, results[0].Failure!.Code);
+        Assert.Equal(ScryerFailureCode.NotConnected, results[1].Failure!.Code);
+        Assert.True(sawCurrentTombstoneAtRevoke);
+        Assert.Equal(1, store.DeleteCurrentCalls);
+        Assert.True(store.Current is null);
+        Assert.Equal(3, handler.Requests.Count);
+        Assert.Equal("/base/oauth/revoke", handler.Requests.Last().RequestUri!.AbsolutePath);
+    }
+    else
+    {
+        Assert.True(results.All(result => result.Failure!.Code == ScryerFailureCode.AuthorizationExpired));
+        Assert.False(sawCurrentTombstoneAtRevoke);
+        Assert.Equal(0, store.DeleteCurrentCalls);
+        Assert.Equal("current-refresh", store.Current!.RefreshToken);
+        Assert.Equal(ScryerGrantLinkState.Active, store.Current.LinkState);
+        Assert.Equal(2, handler.Requests.Count);
+    }
+}
+
+static ScryerRefreshGrant ActiveGrant(string jellyfinUserId, ScryerOAuthConfiguration configuration, string refreshToken) =>
+    new(ScryerGrantKey.Create(jellyfinUserId, configuration), refreshToken, DateTimeOffset.UtcNow, ScryerGrantLinkState.Active);
+
+static ScryerRefreshGrant PendingRevoke(string jellyfinUserId, string refreshToken) =>
+    new(new ScryerGrantKey(jellyfinUserId, "https://scryer.example.test", "jellyfin-plugin"), refreshToken, DateTimeOffset.UtcNow, ScryerGrantLinkState.PendingRevoke);
+
+static ScryerUserSessionService SessionService(ScryerOAuthConfiguration configuration, IScryerTokenStore store, HttpMessageHandler handler) =>
+    new(new FixedConfigurationProvider(configuration), new ScryerOAuthMetadataClient(handler), store, new NeverLinkService());
+
+static string QueryValue(Uri uri, string key) => uri.Query.TrimStart('?').Split('&')
+    .Select(value => value.Split('=', 2))
+    .Where(parts => parts.Length == 2 && string.Equals(Uri.UnescapeDataString(parts[0]), key, StringComparison.Ordinal))
+    .Select(parts => Uri.UnescapeDataString(parts[1]))
+    .Single();
+
 static ClaimsPrincipal Principal(string userId, string apiKey) => new(Identity(userId, apiKey));
 static ClaimsIdentity Identity(string userId, string apiKey) => new(new[]
 {
@@ -232,6 +644,191 @@ sealed class SingleClientFactory(HttpMessageHandler handler) : IHttpClientFactor
 {
     private readonly HttpClient _client = new(handler, disposeHandler: false);
     public HttpClient CreateClient(string name) => _client;
+}
+
+sealed class FixedConfigurationProvider(ScryerOAuthConfiguration configuration) : IScryerOAuthConfigurationProvider
+{
+    public ScryerResult<ScryerOAuthConfiguration> GetConfiguration() => ScryerResult<ScryerOAuthConfiguration>.Success(configuration);
+}
+
+sealed class NeverLinkService : IScryerJellyfinLinkService
+{
+    public Task<ScryerResult<bool>> LinkAsync(ScryerOAuthConfiguration configuration, string jellyfinUserId, ScryerAccessTokenLease lease, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Fail(ScryerFailure.Internal));
+}
+
+sealed class PendingObservingLinkService(InMemoryTokenStore store, List<string> events) : IScryerJellyfinLinkService
+{
+    public bool SawPendingLink { get; private set; }
+
+    public Task<ScryerResult<bool>> LinkAsync(ScryerOAuthConfiguration configuration, string jellyfinUserId, ScryerAccessTokenLease lease, CancellationToken cancellationToken)
+    {
+        events.Add("link");
+        SawPendingLink = store.Current?.Key.JellyfinUserId == jellyfinUserId && store.Current.LinkState == ScryerGrantLinkState.PendingLink;
+        return Task.FromResult(ScryerResult<bool>.Success(true));
+    }
+}
+
+sealed class RecordingSession : IScryerUserSessionService
+{
+    public int ConnectCalls { get; private set; }
+    public List<string> ConnectedUsers { get; } = [];
+
+    public Task<ScryerResult<ScryerAccessTokenLease>> GetAccessTokenAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<ScryerAccessTokenLease>.Fail(ScryerFailure.NotConnected));
+
+    public Task<ScryerResult<bool>> ConnectAsync(string jellyfinUserId, ScryerOAuthConfiguration expectedConfiguration, ScryerOAuthTokenSet tokenSet, CancellationToken cancellationToken)
+    {
+        ConnectCalls++;
+        ConnectedUsers.Add(jellyfinUserId);
+        return Task.FromResult(ScryerResult<bool>.Success(true));
+    }
+
+    public Task<ScryerResult<bool>> RetireIssuedRefreshTokenAsync(string jellyfinUserId, ScryerOAuthConfiguration configuration, string refreshToken, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(true));
+
+    public Task<ScryerResult<bool>> DisconnectAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(true));
+
+    public Task<ScryerResult<bool>> HasGrantAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(false));
+
+    public Task<ScryerResult<bool>> DiscardPendingLinkAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(true));
+}
+
+sealed class InMemoryTokenStore : IScryerTokenStore
+{
+    public ScryerRefreshGrant? Current { get; set; }
+    public List<ScryerRefreshGrant> Detached { get; } = [];
+    public List<string> Events { get; } = [];
+    public bool DeleteDetachedResult { get; set; } = true;
+    public bool PromotePendingResult { get; set; } = true;
+    public bool SaveResult { get; set; } = true;
+    public bool QuarantineResult { get; set; } = true;
+    public bool ThrowOnReadDetached { get; set; }
+    public Exception? SaveException { get; set; }
+    public TaskCompletionSource<bool>? SaveStarted { get; set; }
+    public TaskCompletionSource<bool>? AllowSave { get; set; }
+    public int ReadCurrentCalls { get; private set; }
+    public int DeleteCurrentCalls { get; private set; }
+    public int QuarantineDetachedCalls { get; private set; }
+    public int DeleteDetachedCalls { get; private set; }
+    public int SaveCalls { get; private set; }
+    public int ActiveSaveCalls { get; private set; }
+
+    public Task<ScryerGrantReadResult> ReadAsync(ScryerGrantKey key, CancellationToken cancellationToken) =>
+        Task.FromResult(Current is not null && SameBinding(Current.Key, key)
+            ? new ScryerGrantReadResult(ScryerGrantReadState.Found, Current)
+            : ScryerGrantReadResult.Missing);
+
+    public Task<ScryerGrantReadResult> ReadCurrentAsync(string jellyfinUserId, CancellationToken cancellationToken)
+    {
+        ReadCurrentCalls++;
+        return Task.FromResult(Current is not null && Current.Key.JellyfinUserId == jellyfinUserId
+            ? new ScryerGrantReadResult(ScryerGrantReadState.Found, Current)
+            : ScryerGrantReadResult.Missing);
+    }
+
+    public async Task<bool> SaveAsync(ScryerRefreshGrant grant, CancellationToken cancellationToken)
+    {
+        SaveCalls++;
+        if (grant.LinkState == ScryerGrantLinkState.Active) ActiveSaveCalls++;
+        Events.Add("save:" + grant.LinkState);
+        SaveStarted?.TrySetResult(true);
+        if (AllowSave is not null) await AllowSave.Task.ConfigureAwait(false);
+        if (SaveException is not null) throw SaveException;
+        if (!SaveResult) return false;
+        Current = grant;
+        return true;
+    }
+
+    public Task<bool> QuarantineAsync(ScryerRefreshGrant grant, CancellationToken cancellationToken)
+    {
+        Events.Add("quarantine:" + grant.LinkState);
+        if (!QuarantineResult) return Task.FromResult(false);
+        Current = grant;
+        return Task.FromResult(true);
+    }
+
+    public Task<bool> QuarantineDetachedAsync(ScryerRefreshGrant grant, CancellationToken cancellationToken)
+    {
+        QuarantineDetachedCalls++;
+        Detached.RemoveAll(existing => SameBinding(existing.Key, grant.Key) && existing.RefreshToken == grant.RefreshToken);
+        Detached.Add(grant);
+        return Task.FromResult(true);
+    }
+
+    public Task<IReadOnlyList<ScryerRefreshGrant>> ReadDetachedQuarantinesAsync(string jellyfinUserId, CancellationToken cancellationToken)
+    {
+        if (ThrowOnReadDetached) throw new IOException("test detached read failure");
+        return Task.FromResult<IReadOnlyList<ScryerRefreshGrant>>(Detached.Where(grant => grant.Key.JellyfinUserId == jellyfinUserId).ToArray());
+    }
+
+    public Task<bool> DeleteDetachedQuarantineAsync(ScryerRefreshGrant grant, CancellationToken cancellationToken)
+    {
+        DeleteDetachedCalls++;
+        if (!DeleteDetachedResult) return Task.FromResult(false);
+        Detached.RemoveAll(existing => SameBinding(existing.Key, grant.Key) && existing.RefreshToken == grant.RefreshToken);
+        return Task.FromResult(true);
+    }
+
+    public Task<bool> PromotePendingAsync(ScryerRefreshGrant pendingGrant, CancellationToken cancellationToken)
+    {
+        Events.Add("promote");
+        if (!PromotePendingResult) return Task.FromResult(false);
+        Current = new ScryerRefreshGrant(pendingGrant.Key, pendingGrant.RefreshToken, DateTimeOffset.UtcNow, ScryerGrantLinkState.Active);
+        return Task.FromResult(true);
+    }
+
+    public Task<IReadOnlyList<string>> GetPendingUserIdsAsync(int maximumCount, string? afterUserId, CancellationToken cancellationToken) =>
+        Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
+
+    public Task<ScryerLinkedGrantCount> GetActiveLinkedGrantCountAsync(int maximumEntries, CancellationToken cancellationToken) =>
+        Task.FromResult(new ScryerLinkedGrantCount(0, false));
+
+    public Task<bool> DeleteAsync(ScryerGrantKey key, CancellationToken cancellationToken)
+    {
+        if (Current is not null && SameBinding(Current.Key, key)) Current = null;
+        return Task.FromResult(true);
+    }
+
+    public Task<bool> DeleteCurrentAsync(string jellyfinUserId, CancellationToken cancellationToken)
+    {
+        DeleteCurrentCalls++;
+        Events.Add("delete-current");
+        if (Current is not null && Current.Key.JellyfinUserId == jellyfinUserId) Current = null;
+        return Task.FromResult(true);
+    }
+
+    public void ResetOperationCounts()
+    {
+        ReadCurrentCalls = 0;
+        DeleteCurrentCalls = 0;
+        QuarantineDetachedCalls = 0;
+        DeleteDetachedCalls = 0;
+    }
+
+    private static bool SameBinding(ScryerGrantKey left, ScryerGrantKey right) =>
+        left.JellyfinUserId == right.JellyfinUserId && left.Authority == right.Authority && left.ClientId == right.ClientId;
+}
+
+class ApplicationPathsProxy : DispatchProxy
+{
+    public string DataPath { get; private set; } = string.Empty;
+
+    public static IApplicationPaths Create(string dataPath)
+    {
+        var paths = DispatchProxy.Create<IApplicationPaths, ApplicationPathsProxy>();
+        ((ApplicationPathsProxy)(object)paths).DataPath = dataPath;
+        return paths;
+    }
+
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+    {
+        if (targetMethod?.Name == "get_DataPath") return DataPath;
+        return targetMethod?.ReturnType.IsValueType == true ? Activator.CreateInstance(targetMethod.ReturnType) : null;
+    }
 }
 
 static class Assert

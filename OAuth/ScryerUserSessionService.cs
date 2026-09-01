@@ -369,8 +369,8 @@ public sealed class ScryerUserSessionService : IScryerUserSessionService
             else if (stored.RequiresInvalidation ||
                 stored.State is ScryerGrantReadState.Corrupt or ScryerGrantReadState.Unavailable)
             {
-                // Local deletion still proceeds, but unreadable credential material prevents
-                // a trustworthy remote revocation attempt and must not be reported as success.
+                // Preserve unreadable credential material because it may be the only local
+                // handle for a still-valid remote family. Disconnect must fail closed.
                 unexpectedFailure = ScryerFailure.Internal;
             }
         }
