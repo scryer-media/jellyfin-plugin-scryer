@@ -21,7 +21,7 @@ public enum ScryerFailureCode
     InternalError
 }
 
-public sealed record ScryerFailure(ScryerFailureCode Code, string Message)
+public sealed record ScryerFailure(ScryerFailureCode Code, [property: JsonIgnore] string Message)
 {
     public string WireCode => Code switch
     {
@@ -44,6 +44,8 @@ public sealed record ScryerFailure(ScryerFailureCode Code, string Message)
     public static ScryerFailure Incompatible { get; } = new(ScryerFailureCode.ScryerIncompatible, "The configured Scryer server is incompatible with this plugin.");
     public static ScryerFailure InvalidResponse { get; } = new(ScryerFailureCode.InvalidResponse, "Scryer returned an invalid response.");
     public static ScryerFailure Internal { get; } = new(ScryerFailureCode.InternalError, "The connection could not be completed.");
+
+    public override string ToString() => nameof(ScryerFailure) + " [redacted]";
 }
 
 public sealed class ScryerResult<T>

@@ -17,13 +17,22 @@ public sealed class ScryerOAuthFlowStore
     private readonly Dictionary<string, ScryerOAuthFlowTransaction> _transactions = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Queue<DateTimeOffset>> _startsByUser = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _generations = new(StringComparer.Ordinal);
+    private readonly TimeProvider _timeProvider;
+
+    /// <summary>Uses the system clock unless a caller supplies a deterministic clock for validation.</summary>
+    public ScryerOAuthFlowStore(TimeProvider? timeProvider = null)
+    {
+        _timeProvider = timeProvider ?? TimeProvider.System;
+    }
+
+    internal DateTimeOffset GetUtcNow() => _timeProvider.GetUtcNow();
 
     internal bool TryCreate(ScryerOAuthFlowTransaction transaction, out bool rateLimited)
     {
         ArgumentNullException.ThrowIfNull(transaction);
         lock (_gate)
         {
-            var now = DateTimeOffset.UtcNow;
+            var now = GetUtcNow();
             CleanupUnsafe(now);
             rateLimited = false;
             if (_transactions.ContainsKey(transaction.State)) return false;
@@ -45,7 +54,7 @@ public sealed class ScryerOAuthFlowStore
 
     internal void Remove(string state)
     {
-        lock (_gate) { CleanupUnsafe(DateTimeOffset.UtcNow); RemoveUnsafe(state); }
+        lock (_gate) { CleanupUnsafe(GetUtcNow()); RemoveUnsafe(state); }
     }
 
     internal bool TryGet(string state, out ScryerOAuthFlowTransaction transaction)
@@ -53,7 +62,7 @@ public sealed class ScryerOAuthFlowStore
         transaction = null!;
         lock (_gate)
         {
-            CleanupUnsafe(DateTimeOffset.UtcNow);
+            CleanupUnsafe(GetUtcNow());
             return !string.IsNullOrWhiteSpace(state) && _transactions.TryGetValue(state, out transaction!);
         }
     }
@@ -63,7 +72,7 @@ public sealed class ScryerOAuthFlowStore
         transaction = null!;
         lock (_gate)
         {
-            CleanupUnsafe(DateTimeOffset.UtcNow);
+            CleanupUnsafe(GetUtcNow());
             if (!_transactions.TryGetValue(state, out var candidate) || candidate.Status != ScryerOAuthFlowStatus.Active || !FixedTimeEquals(candidate.FlowId, flowId)) return false;
             if (!FixedTimeEquals(candidate.BrowserBinding, browserBinding)) { RemoveUnsafe(state); return false; }
             candidate.CallbackCode = code;
@@ -75,12 +84,25 @@ public sealed class ScryerOAuthFlowStore
         }
     }
 
+    internal void RejectCallback(string state, string flowId, string browserBinding)
+    {
+        lock (_gate)
+        {
+            CleanupUnsafe(GetUtcNow());
+            if (_transactions.TryGetValue(state, out var candidate) && candidate.Status == ScryerOAuthFlowStatus.Active &&
+                FixedTimeEquals(candidate.FlowId, flowId) && FixedTimeEquals(candidate.BrowserBinding, browserBinding))
+            {
+                RemoveUnsafe(state);
+            }
+        }
+    }
+
     internal bool TryBeginFinalize(string flowId, string finalizeBinding, string jellyfinUserId, out ScryerOAuthFlowTransaction transaction)
     {
         transaction = null!;
         lock (_gate)
         {
-            CleanupUnsafe(DateTimeOffset.UtcNow);
+            CleanupUnsafe(GetUtcNow());
             var candidate = _transactions.Values.FirstOrDefault(flow => string.Equals(flow.FlowId, flowId, StringComparison.Ordinal));
             if (candidate is null || candidate.Status != ScryerOAuthFlowStatus.PendingFinalize || !FixedTimeEquals(candidate.FinalizeBinding ?? string.Empty, finalizeBinding)) return false;
             if (!FixedTimeEquals(candidate.JellyfinUserId, jellyfinUserId) || candidate.Generation != GetGenerationUnsafe(jellyfinUserId)) { RemoveUnsafe(candidate.State); return false; }
@@ -94,21 +116,21 @@ public sealed class ScryerOAuthFlowStore
     {
         lock (_gate)
         {
-            CleanupUnsafe(DateTimeOffset.UtcNow);
+            CleanupUnsafe(GetUtcNow());
             return _transactions.TryGetValue(transaction.State, out var current) && ReferenceEquals(current, transaction) && current.Status == ScryerOAuthFlowStatus.Finalizing && !current.Invalidated && current.Generation == GetGenerationUnsafe(current.JellyfinUserId);
         }
     }
 
     internal void CompleteFinalize(ScryerOAuthFlowTransaction transaction)
     {
-        lock (_gate) { RemoveUnsafe(transaction.State); CleanupUnsafe(DateTimeOffset.UtcNow); }
+        lock (_gate) { RemoveUnsafe(transaction.State); CleanupUnsafe(GetUtcNow()); }
     }
 
     internal void InvalidateUser(string jellyfinUserId)
     {
         lock (_gate)
         {
-            CleanupUnsafe(DateTimeOffset.UtcNow);
+            CleanupUnsafe(GetUtcNow());
             var own = _transactions.Values.Where(flow => string.Equals(flow.JellyfinUserId, jellyfinUserId, StringComparison.Ordinal)).ToArray();
             if (own.Length == 0) return;
             _generations[jellyfinUserId] = GetGenerationUnsafe(jellyfinUserId) + 1;

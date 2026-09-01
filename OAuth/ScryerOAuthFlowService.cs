@@ -83,7 +83,7 @@ public sealed class ScryerOAuthFlowService : IScryerOAuthFlowService
         var state = CreateRandomValue(32);
         var flowId = CreateRandomValue(16);
         var browserBinding = CreateRandomValue(32);
-        var now = DateTimeOffset.UtcNow;
+        var now = _flowStore.GetUtcNow();
         var transaction = new ScryerOAuthFlowTransaction(
             flowId,
             state,
@@ -210,9 +210,15 @@ public sealed class ScryerOAuthFlowService : IScryerOAuthFlowService
 
     private ScryerOAuthCallbackStageResult StageCallback(string? state, string? protectedCookie, string? code, string? error)
     {
-        if (!IsWithinBound(state, MaximumStateLength) || !IsWithinBound(code, MaximumCodeLength) || !IsWithinBound(error, MaximumErrorLength) ||
-            string.IsNullOrWhiteSpace(state) || string.IsNullOrWhiteSpace(protectedCookie) || protectedCookie.Length > 4096 ||
+        if (!IsWithinBound(state, MaximumStateLength) || string.IsNullOrWhiteSpace(state) ||
+            string.IsNullOrWhiteSpace(protectedCookie) || protectedCookie.Length > 4096 ||
             !TryUnprotectCookie(protectedCookie, out var flowId, out var browserBinding)) return ScryerOAuthCallbackStageResult.Failed(ScryerFailure.AuthorizationExpired);
+        if (!IsWithinBound(code, MaximumCodeLength) || !IsWithinBound(error, MaximumErrorLength) ||
+            !HasExactlyOneCallbackOutcome(code, error))
+        {
+            _flowStore.RejectCallback(state, flowId, browserBinding);
+            return ScryerOAuthCallbackStageResult.Failed(ScryerFailure.AuthorizationExpired);
+        }
         var binding = CreateRandomValue(32);
         if (!_flowStore.TryStageCallback(state, flowId, browserBinding, code, error, binding, out var transaction)) return ScryerOAuthCallbackStageResult.Failed(ScryerFailure.AuthorizationExpired);
         var configured = _configurationProvider.GetConfiguration();
@@ -355,6 +361,9 @@ public sealed class ScryerOAuthFlowService : IScryerOAuthFlowService
 
     private static bool IsWithinBound(string? value, int maximum) => value is null || value.Length <= maximum;
 
+    private static bool HasExactlyOneCallbackOutcome(string? code, string? error) =>
+        string.IsNullOrWhiteSpace(code) != string.IsNullOrWhiteSpace(error);
+
     private static bool IsBase64UrlValue(string value, int byteLength) => value.Length == ((byteLength * 4 + 2) / 3) &&
         value.All(static c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_');
 
@@ -388,7 +397,7 @@ public sealed record ScryerOAuthCallbackCookie(string Name, string Path);
 public sealed record ScryerOAuthCallbackStageResult(
     bool Success,
     string ReturnPage,
-    ScryerFailure? Failure,
+    [property: JsonIgnore] ScryerFailure? Failure,
     [property: JsonIgnore] string? FinalizeCookieName,
     [property: JsonIgnore] string? FinalizeCookieValue,
     [property: JsonIgnore] string? FinalizeCookiePath,
@@ -398,9 +407,11 @@ public sealed record ScryerOAuthCallbackStageResult(
 {
     public static ScryerOAuthCallbackStageResult Failed(ScryerFailure failure) =>
         new(false, "#/scryer-discovery", failure, null, null, null, false, null, null);
+
+    public override string ToString() => nameof(ScryerOAuthCallbackStageResult) + " [redacted]";
 }
 
-public sealed record ScryerOAuthCallbackResult(bool Success, string ReturnPage, ScryerFailure? Failure)
+public sealed record ScryerOAuthCallbackResult(bool Success, string ReturnPage, [property: JsonIgnore] ScryerFailure? Failure)
 {
     public static ScryerOAuthCallbackResult Succeeded(string returnPage) => new(true, returnPage, null);
     public static ScryerOAuthCallbackResult Failed(ScryerFailure failure, string returnPage = "#/scryer-discovery") => new(false, returnPage, failure);

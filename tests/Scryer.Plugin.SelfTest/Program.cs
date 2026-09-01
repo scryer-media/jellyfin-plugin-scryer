@@ -38,6 +38,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("disconnect fails closed when detached state cannot be read", DisconnectDetachedReadFailureAsync),
     ("disconnect fails closed on a corrupt encrypted detached record", DisconnectCorruptDetachedRecordAsync),
     ("OAuth flow binds callback and finalize to one browser and initiating user", OAuthFlowBindingAsync),
+    ("OAuth flow rejects expired and malformed callbacks while consuming callback errors", OAuthFlowExpiryAndCallbackHandlingAsync),
+    ("OAuth browser DTOs and failures redact credential material", OAuthRedactionAsync),
     ("link persistence is pending before link and retires on activation failure", PendingLinkOrderingAsync),
     ("encrypted token store isolates two Jellyfin users", TokenStoreUserIsolationAsync),
     ("per-user refresh is single-flight and persists rotation before lease publication", SingleFlightRefreshAsync),
@@ -530,6 +532,124 @@ static async Task OAuthFlowBindingAsync()
     }
 }
 
+static async Task OAuthFlowExpiryAndCallbackHandlingAsync()
+{
+    var dataPath = Path.Combine(Path.GetTempPath(), "scryer-plugin-selftest-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var clock = new ManualTimeProvider(new DateTimeOffset(2026, 9, 1, 12, 0, 0, TimeSpan.Zero));
+        var configuration = ValidOAuthConfiguration();
+        var session = new RecordingSession();
+        var flow = new ScryerOAuthFlowService(
+            new FixedConfigurationProvider(configuration),
+            new ScryerOAuthMetadataClient(new RecordingHandler(request => request.Method == HttpMethod.Get
+                ? JsonResponse(ValidMetadataJson())
+                : JsonResponse(TokenJson("library jellyfin-link")))),
+            session,
+            new ScryerOAuthFlowStore(clock),
+            DataProtectionProvider.Create(dataPath));
+
+        var expired = await flow.StartAsync("expired-user", null, CancellationToken.None);
+        Assert.True(expired.IsSuccess);
+        var expiredState = QueryValue(expired.Value!.AuthorizationUri, "state");
+        clock.Advance(TimeSpan.FromMinutes(10));
+        Assert.False(flow.TryGetCallbackCookie(expiredState, out _));
+        var expiredStage = await flow.StageCallbackAsync(expiredState, expired.Value.CookieValue, "oauth-code", null, CancellationToken.None);
+        Assert.False(expiredStage.Success);
+        Assert.Equal(ScryerFailureCode.AuthorizationExpired, expiredStage.Failure!.Code);
+
+        var missing = await flow.StartAsync("missing-user", null, CancellationToken.None);
+        Assert.True(missing.IsSuccess);
+        var missingState = QueryValue(missing.Value!.AuthorizationUri, "state");
+        var missingStage = await flow.StageCallbackAsync(missingState, missing.Value.CookieValue, null, null, CancellationToken.None);
+        Assert.False(missingStage.Success);
+        Assert.False(flow.TryGetCallbackCookie(missingState, out _));
+
+        var contradictory = await flow.StartAsync("contradictory-user", null, CancellationToken.None);
+        Assert.True(contradictory.IsSuccess);
+        var contradictoryState = QueryValue(contradictory.Value!.AuthorizationUri, "state");
+        var contradictoryStage = await flow.StageCallbackAsync(contradictoryState, contradictory.Value.CookieValue, "oauth-code", "access_denied", CancellationToken.None);
+        Assert.False(contradictoryStage.Success);
+        Assert.False(flow.TryGetCallbackCookie(contradictoryState, out _));
+
+        var oversizedCode = await flow.StartAsync("oversized-code-user", null, CancellationToken.None);
+        Assert.True(oversizedCode.IsSuccess);
+        var oversizedCodeState = QueryValue(oversizedCode.Value!.AuthorizationUri, "state");
+        var oversizedCodeStage = await flow.StageCallbackAsync(oversizedCodeState, oversizedCode.Value.CookieValue, new string('c', 2049), null, CancellationToken.None);
+        Assert.False(oversizedCodeStage.Success);
+        Assert.False(flow.TryGetCallbackCookie(oversizedCodeState, out _));
+
+        var oversizedError = await flow.StartAsync("oversized-error-user", null, CancellationToken.None);
+        Assert.True(oversizedError.IsSuccess);
+        var oversizedErrorState = QueryValue(oversizedError.Value!.AuthorizationUri, "state");
+        var oversizedErrorStage = await flow.StageCallbackAsync(oversizedErrorState, oversizedError.Value.CookieValue, null, new string('e', 129), CancellationToken.None);
+        Assert.False(oversizedErrorStage.Success);
+        Assert.False(flow.TryGetCallbackCookie(oversizedErrorState, out _));
+
+        var protectedTarget = await flow.StartAsync("protected-target-user", null, CancellationToken.None);
+        var wrongCookie = await flow.StartAsync("wrong-cookie-user", null, CancellationToken.None);
+        Assert.True(protectedTarget.IsSuccess);
+        Assert.True(wrongCookie.IsSuccess);
+        var protectedTargetState = QueryValue(protectedTarget.Value!.AuthorizationUri, "state");
+        var wrongCookieStage = await flow.StageCallbackAsync(protectedTargetState, wrongCookie.Value!.CookieValue, null, null, CancellationToken.None);
+        Assert.False(wrongCookieStage.Success);
+        Assert.True(flow.TryGetCallbackCookie(protectedTargetState, out _));
+
+        var callbackError = await flow.StartAsync("error-user", null, CancellationToken.None);
+        Assert.True(callbackError.IsSuccess);
+        var callbackErrorState = QueryValue(callbackError.Value!.AuthorizationUri, "state");
+        var errorStage = await flow.StageCallbackAsync(callbackErrorState, callbackError.Value.CookieValue, null, "access_denied", CancellationToken.None);
+        Assert.True(errorStage.Success, errorStage.Failure?.Code.ToString());
+        var errorFinalize = await flow.FinalizeAsync("error-user", errorStage.FinalizeCookieValue, CancellationToken.None);
+        Assert.False(errorFinalize.IsSuccess);
+        Assert.Equal(ScryerFailureCode.NotConnected, errorFinalize.Failure!.Code);
+        var replay = await flow.FinalizeAsync("error-user", errorStage.FinalizeCookieValue, CancellationToken.None);
+        Assert.False(replay.IsSuccess);
+        Assert.Equal(ScryerFailureCode.AuthorizationExpired, replay.Failure!.Code);
+        Assert.Equal(0, session.ConnectCalls);
+    }
+    finally
+    {
+        if (Directory.Exists(dataPath)) Directory.Delete(dataPath, recursive: true);
+    }
+}
+
+static Task OAuthRedactionAsync()
+{
+    const string accessToken = "access-token-secret";
+    const string refreshToken = "refresh-token-secret";
+    const string authorizationCode = "authorization-code-secret";
+    const string verifier = "pkce-verifier-secret";
+    const string authorizationHeader = "Bearer authorization-header-secret";
+    var secretFailure = new ScryerFailure(
+        ScryerFailureCode.InternalError,
+        string.Join(" ", accessToken, refreshToken, authorizationCode, verifier, authorizationHeader));
+    var values = new[]
+    {
+        JsonSerializer.Serialize(new ScryerOAuthTokenSet(accessToken, refreshToken, DateTimeOffset.UtcNow.AddMinutes(5), "library jellyfin-link")),
+        JsonSerializer.Serialize(new ScryerPkcePair(verifier, "public-challenge")),
+        JsonSerializer.Serialize(ScryerOAuthCallbackStageResult.Failed(secretFailure)),
+        JsonSerializer.Serialize(ScryerOAuthCallbackResult.Failed(secretFailure)),
+        JsonSerializer.Serialize(secretFailure),
+        JsonSerializer.Serialize(ScryerAuthStatusDto.Failed(secretFailure)),
+        JsonSerializer.Serialize(ScryerFailureResponse.From(secretFailure)),
+        secretFailure.ToString(),
+        new ScryerOAuthTokenSet(accessToken, refreshToken, DateTimeOffset.UtcNow.AddMinutes(5), "library jellyfin-link").ToString(),
+        new ScryerPkcePair(verifier, "public-challenge").ToString(),
+        new ScryerOAuthCallbackStageResult(true, "#/scryer-discovery", null, "finalize-cookie", authorizationCode, "/", true, DateTimeOffset.UtcNow.AddMinutes(1), new Uri("https://jellyfin.example.test/web/index.html")).ToString(),
+    };
+    foreach (var value in values)
+    {
+        Assert.False(value.Contains(accessToken, StringComparison.Ordinal));
+        Assert.False(value.Contains(refreshToken, StringComparison.Ordinal));
+        Assert.False(value.Contains(authorizationCode, StringComparison.Ordinal));
+        Assert.False(value.Contains(verifier, StringComparison.Ordinal));
+        Assert.False(value.Contains(authorizationHeader, StringComparison.Ordinal));
+    }
+
+    return Task.CompletedTask;
+}
+
 static async Task PendingLinkOrderingAsync()
 {
     const string jellyfinUserId = "0123456789abcdef0123456789abcdef";
@@ -971,6 +1091,15 @@ class ApplicationPathsProxy : DispatchProxy
         if (targetMethod?.Name == "get_DataPath") return DataPath;
         return targetMethod?.ReturnType.IsValueType == true ? Activator.CreateInstance(targetMethod.ReturnType) : null;
     }
+}
+
+sealed class ManualTimeProvider(DateTimeOffset now) : TimeProvider
+{
+    private DateTimeOffset _now = now;
+
+    public override DateTimeOffset GetUtcNow() => _now;
+
+    public void Advance(TimeSpan amount) => _now = _now.Add(amount);
 }
 
 static class Assert
