@@ -8,8 +8,15 @@ using System.Text.Json;
 using Jellyfin.Plugin.Scryer.Api;
 using Jellyfin.Plugin.Scryer.Configuration;
 using Jellyfin.Plugin.Scryer.OAuth;
+using Jellyfin.Plugin.Scryer.Services;
 using MediaBrowser.Common.Configuration;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Abstractions;
+using Microsoft.AspNetCore.Mvc.Filters;
+using Microsoft.AspNetCore.Mvc.ModelBinding;
+using Microsoft.AspNetCore.Routing;
 
 var tests = new (string Name, Func<Task> Run)[]
 {
@@ -20,6 +27,11 @@ var tests = new (string Name, Func<Task> Run)[]
     ("PKCE is RFC 7636 S256", PkceAsync),
     ("Jellyfin link GraphQL request and response are fixed", JellyfinLinkAsync),
     ("stable failure mapping is browser-safe", FailureMappingAsync),
+    ("controllers reject untrusted actors and report unlinked accounts", ControllerActorAndUnlinkedAsync),
+    ("controllers reject bounded invalid input before GraphQL", ControllerInputBoundsAsync),
+    ("disabled feature filters reject direct endpoints", DisabledFeatureAsync),
+    ("GraphQL normalizes upstream protocol failures", GraphqlProtocolFailuresAsync),
+    ("GraphQL maps bounded Scryer capabilities", CapabilityMappingAsync),
     ("detached revoke journal survives restart discovery, promotion, and cleanup", DetachedRevokeJournalAsync),
     ("retiring a detached issued family preserves the current family", DetachedRetirementPreservesCurrentAsync),
     ("detached revoke deletion failure retains its tombstone", DetachedDeletionFailureAsync),
@@ -189,6 +201,109 @@ static Task FailureMappingAsync()
     Assert.Equal("The request conflicts with the current Scryer state.", response.Message);
     Assert.False(response.Message.Contains("sensitive", StringComparison.OrdinalIgnoreCase));
     return Task.CompletedTask;
+}
+
+static async Task ControllerActorAndUnlinkedAsync()
+{
+    var service = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new RecordingSession(), new RecordingHandler(_ => throw new InvalidOperationException("Untrusted actor reached GraphQL.")));
+    foreach (var actor in new[]
+    {
+        new ClaimsPrincipal(),
+        Principal("01234567-89ab-cdef-0123-456789abcdef", "true"),
+        new ClaimsPrincipal(new[]
+        {
+            Identity("01234567-89ab-cdef-0123-456789abcdef", "false"),
+            Identity("11111111-1111-1111-1111-111111111111", "false"),
+        }),
+    })
+    {
+        var result = await Controller(new DiscoveryController(service), actor).GetTrending(CancellationToken.None);
+        Assert.IsType<UnauthorizedResult>(result.Result);
+    }
+
+    var unlinked = await Controller(new DiscoveryController(service), Principal("01234567-89ab-cdef-0123-456789abcdef", "false")).GetTrending(CancellationToken.None);
+    var failure = Assert.IsType<ObjectResult>(unlinked.Result);
+    Assert.Equal(401, failure.StatusCode);
+    Assert.Equal("not_connected", Assert.IsType<ScryerFailureResponse>(failure.Value).Code);
+}
+
+static async Task ControllerInputBoundsAsync()
+{
+    var handler = new RecordingHandler(_ => throw new InvalidOperationException("Invalid input reached GraphQL."));
+    var service = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), handler);
+    var actor = Principal("01234567-89ab-cdef-0123-456789abcdef", "false");
+
+    var search = await Controller(new DiscoveryController(service), actor).Search(new string('x', 257), 51, CancellationToken.None);
+    var calendarTooShort = await Controller(new CalendarController(service), actor).GetUpcoming(0, CancellationToken.None);
+    var calendarTooLong = await Controller(new CalendarController(service), actor).GetUpcoming(63, CancellationToken.None);
+    var downloadsTooEarly = await Controller(new DownloadsController(service), actor).GetQueue(-1, CancellationToken.None);
+    var downloadsTooLate = await Controller(new DownloadsController(service), actor).GetHistory(10_001, CancellationToken.None);
+    var request = await Controller(new RequestsController(service), actor).Create(new SubmitRequestDto
+    {
+        LibraryId = "library",
+        Title = "Title",
+        ExternalIds = [new ExternalIdDto { Source = "tmdb", Value = "1" }],
+        Year = 1799,
+    }, CancellationToken.None);
+
+    Assert.Equal(400, Assert.IsType<ObjectResult>(search.Result).StatusCode);
+    Assert.Equal(400, Assert.IsType<ObjectResult>(calendarTooShort.Result).StatusCode);
+    Assert.Equal(400, Assert.IsType<ObjectResult>(calendarTooLong.Result).StatusCode);
+    Assert.Equal(400, Assert.IsType<ObjectResult>(downloadsTooEarly.Result).StatusCode);
+    Assert.Equal(400, Assert.IsType<ObjectResult>(downloadsTooLate.Result).StatusCode);
+    Assert.Equal(400, Assert.IsType<ObjectResult>(request.Result).StatusCode);
+    Assert.Equal(0, handler.Requests.Count);
+}
+
+static Task DisabledFeatureAsync()
+{
+    var context = new ActionExecutingContext(
+        new ActionContext(new DefaultHttpContext(), new RouteData(), new ActionDescriptor(), new ModelStateDictionary()),
+        [],
+        new Dictionary<string, object?>(),
+        new object());
+    new ScryerFeatureAttribute(ScryerFeature.Discovery).OnActionExecuting(context);
+    var rejected = Assert.IsType<NotFoundObjectResult>(context.Result);
+    using var payload = JsonDocument.Parse(JsonSerializer.Serialize(rejected.Value));
+    Assert.Equal("feature_disabled", payload.RootElement.GetProperty("code").GetString());
+    return Task.CompletedTask;
+}
+
+static async Task GraphqlProtocolFailuresAsync()
+{
+    await AssertGraphqlFailureAsync(new HttpResponseMessage(HttpStatusCode.Unauthorized), ScryerFailureCode.AuthorizationExpired);
+    await AssertGraphqlFailureAsync(new HttpResponseMessage(HttpStatusCode.Forbidden), ScryerFailureCode.PermissionDenied);
+    await AssertGraphqlFailureAsync(new HttpResponseMessage(HttpStatusCode.TooManyRequests), ScryerFailureCode.RateLimited);
+    await AssertGraphqlFailureAsync(new HttpResponseMessage(HttpStatusCode.BadGateway), ScryerFailureCode.ScryerOffline);
+    await AssertGraphqlFailureAsync(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("not json", Encoding.UTF8, "application/json") }, ScryerFailureCode.InvalidResponse);
+    await AssertGraphqlFailureAsync(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("<html>upstream error</html>", Encoding.UTF8, "text/html") }, ScryerFailureCode.InvalidResponse);
+}
+
+static async Task AssertGraphqlFailureAsync(HttpResponseMessage response, ScryerFailureCode expected)
+{
+    var service = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), new RecordingHandler(_ => response));
+    var result = await service.GetDiscoveryHomeCardsAsync("0123456789abcdef0123456789abcdef", CancellationToken.None);
+    Assert.False(result.IsSuccess);
+    Assert.Equal(expected, result.Failure!.Code);
+}
+
+static async Task CapabilityMappingAsync()
+{
+    var service = new ScryerGraphqlService(
+        new FixedConfigurationProvider(ValidOAuthConfiguration()),
+        new TokenSession(),
+        new RecordingHandler(_ => JsonResponse("""{"data":{"me":{"id":"scryer-user","username":"member","appPermissions":["REQUEST","REQUEST"],"libraryPermissions":[{"libraryId":"library-b","permissions":["VIEW"]},{"libraryId":"library-a","permissions":["REQUEST","AUTO_APPROVE_REQUESTS","MANAGE_TITLES"]},{"libraryId":"library-a","permissions":["VIEW"]}]}}}""")));
+    var result = await service.GetCapabilitySnapshotAsync("0123456789abcdef0123456789abcdef", CancellationToken.None);
+    Assert.True(result.IsSuccess, result.Failure?.Code.ToString());
+    Assert.True(result.Value!.AppPermissions.SequenceEqual(new[] { "REQUEST" }, StringComparer.Ordinal));
+    Assert.Equal("library-a", result.Value.Libraries[0].LibraryId);
+    Assert.True(result.Value.Libraries[0].CanView);
+    Assert.True(result.Value.Libraries[0].CanRequest);
+    Assert.True(result.Value.Libraries[0].CanAutoApproveRequests);
+    Assert.True(result.Value.Libraries[0].CanManageTitles);
+    Assert.Equal("library-b", result.Value.Libraries[1].LibraryId);
+    Assert.True(result.Value.Libraries[1].CanView);
+    Assert.False(result.Value.Libraries[1].CanRequest);
 }
 
 static async Task DetachedRevokeJournalAsync()
@@ -590,6 +705,12 @@ static string QueryValue(Uri uri, string key) => uri.Query.TrimStart('?').Split(
     .Select(parts => Uri.UnescapeDataString(parts[1]))
     .Single();
 
+static T Controller<T>(T controller, ClaimsPrincipal user) where T : ControllerBase
+{
+    controller.ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext { User = user } };
+    return controller;
+}
+
 static ClaimsPrincipal Principal(string userId, string apiKey) => new(Identity(userId, apiKey));
 static ClaimsIdentity Identity(string userId, string apiKey) => new(new[]
 {
@@ -692,6 +813,27 @@ sealed class RecordingSession : IScryerUserSessionService
 
     public Task<ScryerResult<bool>> HasGrantAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
         Task.FromResult(ScryerResult<bool>.Success(false));
+
+    public Task<ScryerResult<bool>> DiscardPendingLinkAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(true));
+}
+
+sealed class TokenSession : IScryerUserSessionService
+{
+    public Task<ScryerResult<ScryerAccessTokenLease>> GetAccessTokenAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<ScryerAccessTokenLease>.Success(new ScryerAccessTokenLease("access-token", DateTimeOffset.UtcNow.AddMinutes(5))));
+
+    public Task<ScryerResult<bool>> ConnectAsync(string jellyfinUserId, ScryerOAuthConfiguration expectedConfiguration, ScryerOAuthTokenSet tokenSet, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(true));
+
+    public Task<ScryerResult<bool>> RetireIssuedRefreshTokenAsync(string jellyfinUserId, ScryerOAuthConfiguration configuration, string refreshToken, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(true));
+
+    public Task<ScryerResult<bool>> DisconnectAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(true));
+
+    public Task<ScryerResult<bool>> HasGrantAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(true));
 
     public Task<ScryerResult<bool>> DiscardPendingLinkAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
         Task.FromResult(ScryerResult<bool>.Success(true));

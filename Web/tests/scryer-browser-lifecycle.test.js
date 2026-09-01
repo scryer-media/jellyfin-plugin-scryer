@@ -1,0 +1,241 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+
+const webRoot = path.resolve(__dirname, '..');
+
+function readWebAsset(name) {
+    return fs.readFileSync(path.join(webRoot, name), 'utf8');
+}
+
+function createCoreHarness(apiClient) {
+    const listeners = new Map();
+    const timeouts = new Map();
+    const intervals = new Map();
+    let nextHandle = 1;
+    const window = {
+        ScryerRuntime153: { version: '153.1', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ApiClient: apiClient,
+        addEventListener(name, listener) { listeners.set(name, listener); },
+        removeEventListener(name) { listeners.delete(name); },
+        setTimeout(callback) { const handle = nextHandle++; timeouts.set(handle, callback); return handle; },
+        clearTimeout(handle) { timeouts.delete(handle); },
+        setInterval(callback) { const handle = nextHandle++; intervals.set(handle, callback); return handle; },
+        clearInterval(handle) { intervals.delete(handle); },
+        location: { origin: 'https://jellyfin.test', href: 'https://jellyfin.test/web/index.html', hash: '' }
+    };
+    const document = {
+        body: {},
+        querySelector() { return null; },
+        querySelectorAll() { return []; }
+    };
+    vm.runInNewContext(readWebAsset('scryer-core.js'), {
+        window, document, URL, Promise, MutationObserver: function () {}, history: { pushState() {} }
+    });
+    return { Scryer: window.Scryer, window, document, listeners, timeouts, intervals };
+}
+
+function createLibraryClient(userIdRef, calls) {
+    return {
+        getUrl(pathName) { return 'https://jellyfin.test/' + pathName; },
+        serverAddress() { return 'https://jellyfin.test'; },
+        getCurrentUserId() { return userIdRef.value; },
+        getCurrentUser() { return Promise.resolve({ Id: userIdRef.value }); },
+        ajax(request) {
+            calls.push(request.url);
+            return Promise.resolve({
+                ok: true,
+                status: 200,
+                json() {},
+                text() { return Promise.resolve(JSON.stringify({ libraries: [{ id: userIdRef.value }] })); }
+            });
+        }
+    };
+}
+
+async function settle() {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+}
+
+test('lifecycle navigation remounts are idempotent and clean every owned resource', () => {
+    const harness = createCoreHarness(null);
+    const lifecycle = harness.Scryer._testing.createLifecycle();
+    const target = {
+        listeners: new Map(),
+        addEventListener(name, listener) { this.listeners.set(name, listener); },
+        removeEventListener(name, listener) { assert.equal(this.listeners.get(name), listener); this.listeners.delete(name); }
+    };
+    let disposerCalls = 0;
+    let callbackCalls = 0;
+    lifecycle.registerFeature('page', (container, scope) => {
+        scope.on(target, 'click', () => { callbackCalls++; });
+        scope.timeout(() => { callbackCalls++; }, 50);
+        scope.interval(() => { callbackCalls++; }, 100);
+        return () => { disposerCalls++; };
+    });
+
+    lifecycle.mount('page', {}, {});
+    assert.equal(target.listeners.size, 1);
+    assert.equal(harness.timeouts.size, 1);
+    assert.equal(harness.intervals.size, 1);
+    lifecycle.mount('page', {}, {});
+    assert.equal(disposerCalls, 1);
+    assert.equal(target.listeners.size, 1);
+    assert.equal(harness.timeouts.size, 1);
+    assert.equal(harness.intervals.size, 1);
+
+    lifecycle.disposeAll();
+    assert.equal(disposerCalls, 2);
+    assert.equal(target.listeners.size, 0);
+    assert.equal(harness.timeouts.size, 0);
+    assert.equal(harness.intervals.size, 0);
+    assert.equal(callbackCalls, 0);
+});
+
+test('logout, login, and user switches cannot reuse a prior user cache', async () => {
+    const user = { value: 'alice' };
+    const calls = [];
+    const client = createLibraryClient(user, calls);
+    const harness = createCoreHarness(client);
+
+    assert.equal(JSON.stringify(await harness.Scryer.getLibraries()), JSON.stringify([{ id: 'alice' }]));
+    assert.equal(JSON.stringify(await harness.Scryer.getLibraries()), JSON.stringify([{ id: 'alice' }]));
+    assert.equal(calls.length, 1, 'same-user calls use the in-memory cache');
+
+    user.value = 'bob';
+    assert.equal(JSON.stringify(await harness.Scryer.getLibraries()), JSON.stringify([{ id: 'bob' }]));
+    assert.equal(calls.length, 2, 'a changed Jellyfin user gets a new cache key');
+
+    harness.window.ApiClient = null;
+    const unavailable = harness.Scryer.getLibraries();
+    await settle();
+    for (let attempt = 0; attempt < 201; attempt++) {
+        for (const callback of [...harness.intervals.values()]) callback();
+    }
+    await assert.rejects(unavailable, /Jellyfin API client unavailable/);
+
+    user.value = 'carol';
+    harness.window.ApiClient = client;
+    assert.equal(JSON.stringify(await harness.Scryer.getLibraries()), JSON.stringify([{ id: 'carol' }]));
+    assert.equal(calls.length, 3, 'a post-login call cannot recover Bob\'s cached libraries');
+});
+
+function createDownloadsHarness(responses) {
+    const registered = new Map();
+    const scheduled = [];
+    const cleared = [];
+    const documentListeners = new Map();
+    let nextTimer = 1;
+    const document = { hidden: false };
+    const window = {
+        setTimeout(callback, delay) {
+            const timer = { id: nextTimer++, callback, delay, cleared: false };
+            scheduled.push(timer);
+            return timer.id;
+        },
+        clearTimeout(id) {
+            const timer = scheduled.find((entry) => entry.id === id);
+            if (timer) timer.cleared = true;
+            cleared.push(id);
+        }
+    };
+    const apiCalls = [];
+    const Scryer = {
+        apiGet(pathName) {
+            apiCalls.push(pathName);
+            const response = responses.shift();
+            return response instanceof Error ? Promise.reject(response) : Promise.resolve(response);
+        },
+        escapeHtml(value) { return String(value); },
+        LOADING_HTML: '<p>Loading</p>',
+        lifecycle: { registerFeature(name, mount) { registered.set(name, mount); } },
+        withConnectionGate(container, scope, page, render) { return render(container, scope, page); }
+    };
+    vm.runInNewContext(readWebAsset('scryer-downloads.js'), { window: { Scryer, setTimeout: window.setTimeout, clearTimeout: window.clearTimeout }, document, Date, Math, Promise });
+
+    const list = { innerHTML: '' };
+    const activeButton = { dataset: { tab: 'active' }, classList: { toggle() {} } };
+    const historyButton = { dataset: { tab: 'history' }, classList: { toggle() {} } };
+    const container = {
+        innerHTML: '',
+        querySelector(selector) { return selector === '.scryerDownloadList' ? list : null; },
+        querySelectorAll(selector) { return selector === '.scryerTab' ? [activeButton, historyButton] : []; }
+    };
+    const owned = [];
+    const scope = {
+        isCurrent() { return true; },
+        guard(callback) { return function () { return callback.apply(null, arguments); }; },
+        own(callback) { owned.push(callback); return callback; },
+        on(target, eventName, listener) {
+            if (target === document) documentListeners.set(eventName, listener);
+            else target.listener = listener;
+            return this.own(() => {});
+        }
+    };
+    return { registered, scheduled, cleared, document, documentListeners, container, scope, apiCalls, activeButton, historyButton, owned };
+}
+
+test('download polling backs off, pauses while hidden, and does not poll history', async () => {
+    const harness = createDownloadsHarness([
+        new Error('first failure'),
+        new Error('second failure'),
+        { downloadQueuePage: { items: [] } },
+        { downloadHistory: { items: [] } }
+    ]);
+    harness.registered.get('download')(harness.container, harness.scope, { page: { id: 'download' } });
+    await settle();
+    assert.deepEqual(harness.scheduled.map((timer) => timer.delay), [10000]);
+
+    await harness.scheduled[0].callback();
+    await settle();
+    assert.deepEqual(harness.scheduled.map((timer) => timer.delay), [10000, 20000]);
+
+    harness.document.hidden = true;
+    harness.documentListeners.get('visibilitychange')();
+    assert.equal(harness.scheduled[1].cleared, true, 'hiding the document cancels the outstanding poll');
+
+    harness.document.hidden = false;
+    harness.documentListeners.get('visibilitychange')();
+    await settle();
+    assert.deepEqual(harness.scheduled.map((timer) => timer.delay), [10000, 20000, 5000]);
+
+    harness.container.listener({ target: { closest() { return harness.historyButton; } } });
+    await settle();
+    assert.deepEqual(harness.apiCalls, ['Scryer/Downloads', 'Scryer/Downloads', 'Scryer/Downloads', 'Scryer/Downloads/History']);
+    assert.equal(harness.scheduled[2].cleared, true, 'switching to history cancels active-download polling');
+    assert.equal(harness.scheduled.length, 3, 'history does not schedule a polling timer');
+});
+
+test('modal keyboard/focus and stale-operation protections remain part of the discovery contract', () => {
+    const source = readWebAsset('scryer-discovery.js');
+    assert.match(source, /var modalGate = Scryer\.ui\.createGenerationGate\(\);/);
+    assert.match(source, /scope\.own\(function \(\) \{ modalGate\.invalidate\(\); \}\);/);
+    assert.match(source, /function closeModal\(\) \{[\s\S]*?modalGate\.invalidate\(\);[\s\S]*?lastFocused\.focus\(\);/);
+    assert.match(source, /if \(event\.key === 'Escape'\) \{ event\.preventDefault\(\); closeModal\(\); return; \}/);
+    assert.match(source, /if \(event\.shiftKey && document\.activeElement === first\)[\s\S]*?last\.focus\(\);/);
+    assert.match(source, /if \(!event\.shiftKey && document\.activeElement === last\)[\s\S]*?first\.focus\(\);/);
+    assert.match(source, /var isCurrentModal = function \(\) \{ return scope\.isCurrent\(\) && modalGate\.isCurrent\(modalToken\); \};/);
+    assert.match(source, /if \(!isCurrentModal\(\)\) return;/);
+});
+
+test('disabled feature navigation, API capability gates, and browser credential boundaries stay explicit', () => {
+    const core = readWebAsset('scryer-core.js');
+    const loader = readWebAsset('scryer-loader.js');
+    const runtimeAssets = ['scryer-loader.js', 'scryer-core.js', 'scryer-discovery.js', 'scryer-calendar.js', 'scryer-requests.js', 'scryer-downloads.js'];
+
+    assert.match(core, /PAGES = PAGE_DEFINITIONS\.filter\(function \(page\) \{ return features\[page\.feature\] === true; \}\);/);
+    assert.match(core, /if \(pageId === 'discovery'\) return library\.canView \|\| library\.canRequest;/);
+    assert.match(core, /if \(pageId === 'requests'\) return library\.canRequest \|\| library\.canManageTitles;/);
+    assert.match(core, /if \(pageId === 'calendar' \|\| pageId === 'download'\) return library\.canView;/);
+    ['discovery', 'calendar', 'requests', 'downloads'].forEach((feature) => assert.match(loader, new RegExp("loadScript\\('scryer-" + feature + "\\.js'")));
+
+    const combined = runtimeAssets.map(readWebAsset).join('\n');
+    assert.doesNotMatch(combined, /\b(?:localStorage|sessionStorage|indexedDB)\b/);
+    assert.doesNotMatch(combined, /document\.cookie\b/);
+    assert.doesNotMatch(combined, /\bAuthorization\s*:/);
+    assert.doesNotMatch(combined, /\bBearer\s+/i);
+});
