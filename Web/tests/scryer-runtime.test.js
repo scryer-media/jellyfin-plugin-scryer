@@ -9,7 +9,7 @@ const webRoot = path.resolve(__dirname, '..');
 function loadCore() {
     const listeners = new Map();
     const window = {
-        ScryerRuntime153: { version: '153.1', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.4', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         addEventListener(name, listener) { listeners.set(name, listener); },
         removeEventListener(name) { listeners.delete(name); },
         setInterval() { return 1; },
@@ -65,6 +65,7 @@ test('loader declares the deterministic RFC 153 module sequence', () => {
     });
     assert.match(source, /runtime\.startPromise/);
     assert.match(source, /assertReady/);
+    assert.match(source, /loadScript\('scryer-downloads\.js', 'download',[\s\S]*?hasFeature\('download'\)/);
 });
 
 test('request choices and calendar grouping remain deterministic', () => {
@@ -73,6 +74,20 @@ test('request choices and calendar grouping remain deterministic', () => {
     assert.equal(JSON.stringify(Scryer.ui.profilesForLibrary(profiles, { requestQualityProfileIds: ['two'] })), JSON.stringify([{ id: 'two', name: 'Two' }]));
     assert.equal(JSON.stringify(Scryer.ui.groupByDate([{ airDate: '2026-09-02', id: 'b' }, { airDate: '2026-09-01', id: 'a' }, { airDate: '2026-09-02', id: 'c' }])), JSON.stringify([{ date: '2026-09-01', items: [{ airDate: '2026-09-01', id: 'a' }] }, { date: '2026-09-02', items: [{ airDate: '2026-09-02', id: 'b' }, { airDate: '2026-09-02', id: 'c' }] }]));
     assert.equal(Scryer.ui.monitorOptions.some((option) => option.value === 'MISSING_AND_FUTURE_EPISODES'), true);
+});
+
+test('Jellyfin DTO responses normalize to the browser field contract', () => {
+    const Scryer = loadCore();
+    const normalized = Scryer._testing.normalizeApiPayload({
+        Configured: true,
+        Connected: true,
+        capabilities: { ScryerUserId: 'user-c', Libraries: [{ LibraryId: 'view', CanView: true }] }
+    });
+    assert.equal(JSON.stringify(normalized), JSON.stringify({
+        configured: true,
+        connected: true,
+        capabilities: { scryerUserId: 'user-c', libraries: [{ libraryId: 'view', canView: true }] }
+    }));
 });
 
 test('generation gates reject callbacks from a closed or replaced UI operation', () => {

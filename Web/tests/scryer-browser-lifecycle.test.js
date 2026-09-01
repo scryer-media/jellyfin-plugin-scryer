@@ -14,9 +14,11 @@ function createCoreHarness(apiClient) {
     const listeners = new Map();
     const timeouts = new Map();
     const intervals = new Map();
+    const diagnostics = [];
     let nextHandle = 1;
     const window = {
-        ScryerRuntime153: { version: '153.1', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.4', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerStrings: { pages: {}, states: { requestConflict: 'This request conflicts with its current Scryer state.', internalError: 'The Scryer request could not be completed.' } },
         ApiClient: apiClient,
         addEventListener(name, listener) { listeners.set(name, listener); },
         removeEventListener(name) { listeners.delete(name); },
@@ -32,9 +34,10 @@ function createCoreHarness(apiClient) {
         querySelectorAll() { return []; }
     };
     vm.runInNewContext(readWebAsset('scryer-core.js'), {
-        window, document, URL, Promise, MutationObserver: function () {}, history: { pushState() {} }
+        window, document, URL, Promise, MutationObserver: function () {}, history: { pushState() {} },
+        console: { error(...args) { diagnostics.push(args); } }
     });
-    return { Scryer: window.Scryer, window, document, listeners, timeouts, intervals };
+    return { Scryer: window.Scryer, window, document, listeners, timeouts, intervals, diagnostics };
 }
 
 function createLibraryClient(userIdRef, calls) {
@@ -60,6 +63,65 @@ async function settle() {
     await Promise.resolve();
     await Promise.resolve();
 }
+
+test('rejected Jellyfin responses preserve the plugin error vocabulary', async () => {
+    const client = {
+        getUrl(pathName) { return 'https://jellyfin.test/' + pathName; },
+        serverAddress() { return 'https://jellyfin.test'; },
+        getCurrentUserId() { return 'alice'; },
+        getCurrentUser() { return Promise.resolve({ Id: 'alice' }); },
+        ajax() {
+            return Promise.reject({
+                ok: false,
+                status: 409,
+                text() { return Promise.resolve(JSON.stringify({ Code: 'request_conflict', Message: 'internal detail' })); }
+            });
+        }
+    };
+    const harness = createCoreHarness(client);
+    await assert.rejects(harness.Scryer.apiGet('Scryer/Test'), (error) => {
+        assert.equal(error.code, 'request_conflict');
+        assert.equal(error.status, 409);
+        assert.equal(error.message, 'This request conflicts with its current Scryer state.');
+        return true;
+    });
+});
+
+test('rejected Jellyfin responses never disclose unknown error fields', async () => {
+    const responses = [
+        { Code: 'upstream_secret_code', Message: 'secret-upstream-detail' },
+        { Code: { Nested: 'secret-object-code' }, Message: 'second-secret-detail' }
+    ];
+    const client = {
+        getUrl(pathName) { return 'https://jellyfin.test/' + pathName; },
+        serverAddress() { return 'https://jellyfin.test'; },
+        getCurrentUserId() { return 'alice'; },
+        getCurrentUser() { return Promise.resolve({ Id: 'alice' }); },
+        ajax() {
+            const payload = responses.shift();
+            return Promise.reject({
+                ok: false,
+                status: '500',
+                text() { return Promise.resolve(JSON.stringify(payload)); }
+            });
+        }
+    };
+    const harness = createCoreHarness(client);
+    for (let attempt = 0; attempt < 2; attempt++) {
+        await assert.rejects(harness.Scryer.apiGet('Scryer/Test'), (error) => {
+            assert.equal(error.code, 'internal_error');
+            assert.equal(error.status, 0);
+            assert.equal(error.message, 'The Scryer request could not be completed.');
+            return true;
+        });
+    }
+    const diagnostics = JSON.stringify(harness.diagnostics);
+    assert.doesNotMatch(diagnostics, /upstream_secret_code|secret-upstream-detail|secret-object-code|second-secret-detail/);
+    assert.equal(diagnostics, JSON.stringify([
+        ['[Scryer] API request failed:', 'internal_error', 0],
+        ['[Scryer] API request failed:', 'internal_error', 0]
+    ]));
+});
 
 test('lifecycle navigation remounts are idempotent and clean every owned resource', () => {
     const harness = createCoreHarness(null);
@@ -231,6 +293,7 @@ test('disabled feature navigation, API capability gates, and browser credential 
     assert.match(core, /if \(pageId === 'discovery'\) return library\.canView \|\| library\.canRequest;/);
     assert.match(core, /if \(pageId === 'requests'\) return library\.canRequest \|\| library\.canManageTitles;/);
     assert.match(core, /if \(pageId === 'calendar' \|\| pageId === 'download'\) return library\.canView;/);
+    assert.match(core, /event\.stopImmediatePropagation\(\);[\s\S]*?showPage\(page\.id\);[\s\S]*?\}, true\);/);
     ['discovery', 'calendar', 'requests', 'downloads'].forEach((feature) => assert.match(loader, new RegExp("loadScript\\('scryer-" + feature + "\\.js'")));
 
     const combined = runtimeAssets.map(readWebAsset).join('\n');

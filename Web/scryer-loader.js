@@ -5,7 +5,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '153.1';
+    var VERSION = '153.4';
     var runtime = window.ScryerRuntime153 = window.ScryerRuntime153 || {};
     if (runtime.version && runtime.version !== VERSION) {
         throw new Error('A different Scryer runtime version is already active.');
@@ -87,7 +87,7 @@
                 return window.Scryer.lifecycle.hasFeature('requests');
             });
         }).then(function () {
-            return loadScript('scryer-downloads.js', 'downloads', function () {
+            return loadScript('scryer-downloads.js', 'download', function () {
                 return window.Scryer.lifecycle.hasFeature('download');
             });
         }).then(function () {
@@ -95,6 +95,7 @@
         }).catch(function (error) {
             runtime.startPromise = null;
             runtime.lastError = error && error.message ? error.message : 'Scryer runtime startup failed.';
+            console.error('[Scryer] Runtime startup failed:', runtime.lastError);
             throw error;
         });
         return runtime.startPromise;

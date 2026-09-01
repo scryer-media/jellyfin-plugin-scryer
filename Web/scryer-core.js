@@ -2,7 +2,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '153.1';
+    var VERSION = '153.4';
     var runtime = window.ScryerRuntime153;
     if (!runtime || runtime.version !== VERSION) throw new Error('Scryer loader must run before core.');
     if (window.Scryer && window.Scryer.version === VERSION && window.Scryer._rfc153Installed) {
@@ -258,32 +258,65 @@
         permission_denied: 'permissionDenied', scryer_offline: 'offline', scryer_incompatible: 'incompatible',
         rate_limited: 'rateLimited', invalid_response: 'invalidResponse', request_conflict: 'requestConflict', internal_error: 'internalError'
     };
-    function failureMessage(code, fallback) {
-        var key = FAILURE_STRING_KEYS[code];
-        return (key && Strings.states && Strings.states[key]) || fallback || (Strings.states && Strings.states.internalError) || 'The Scryer request could not be completed.';
+    function knownFailureCode(code) {
+        return typeof code === 'string' && Object.prototype.hasOwnProperty.call(FAILURE_STRING_KEYS, code) ? code : 'internal_error';
+    }
+    function safeHttpStatus(status) {
+        return typeof status === 'number' && Number.isFinite(status) && Math.floor(status) === status && status >= 100 && status <= 599 ? status : 0;
+    }
+    function failureMessage(code) {
+        var key = FAILURE_STRING_KEYS[knownFailureCode(code)];
+        return (key && Strings.states && Strings.states[key]) || (Strings.states && Strings.states.internalError) || 'The Scryer request could not be completed.';
     }
     Scryer.failureMessage = failureMessage;
 
+    function normalizeApiPayload(value) {
+        if (Array.isArray(value)) return value.map(normalizeApiPayload);
+        if (!value || typeof value !== 'object') return value;
+        var normalized = {};
+        Object.keys(value).forEach(function (sourceKey) {
+            if (sourceKey === '__proto__' || sourceKey === 'constructor' || sourceKey === 'prototype') return;
+            var targetKey = /^[A-Z]/.test(sourceKey) ? sourceKey.charAt(0).toLowerCase() + sourceKey.slice(1) : sourceKey;
+            if (Object.prototype.hasOwnProperty.call(normalized, targetKey)) throw new Error('Jellyfin returned ambiguous response fields.');
+            normalized[targetKey] = normalizeApiPayload(value[sourceKey]);
+        });
+        return normalized;
+    }
+    Scryer._testing.normalizeApiPayload = normalizeApiPayload;
+
+    function parseApiResponse(response) {
+        if (!response || typeof response.text !== 'function') return Promise.resolve(normalizeApiPayload(response));
+        return response.text().then(function (text) {
+            var payload = null;
+            if (text) try { payload = JSON.parse(text); } catch (error) {}
+            payload = normalizeApiPayload(payload);
+            if (!response.ok) {
+                var failureCode = knownFailureCode(payload && Object.prototype.hasOwnProperty.call(payload, 'code') ? payload.code : null);
+                var failure = new Error(failureMessage(failureCode));
+                failure.code = failureCode;
+                failure.status = safeHttpStatus(response.status);
+                throw failure;
+            }
+            return payload;
+        });
+    }
+
     function apiCallForClient(client, method, path, body) {
-        return client.ajax({ type: method, url: client.getUrl(path), data: body ? JSON.stringify(body) : undefined, contentType: body ? 'application/json' : undefined }).then(function (response) {
-            if (!response || typeof response.json !== 'function') return response;
-            return response.text().then(function (text) {
-                var payload = null;
-                if (text) try { payload = JSON.parse(text); } catch (error) {}
-                if (!response.ok) {
-                    var failure = new Error(failureMessage(payload && payload.code, payload && payload.message));
-                    failure.code = (payload && payload.code) || 'internal_error';
-                    failure.status = response.status;
-                    throw failure;
-                }
-                return payload;
-            });
+        return client.ajax({ type: method, url: client.getUrl(path), data: body ? JSON.stringify(body) : undefined, contentType: body ? 'application/json' : undefined }).then(parseApiResponse, function (error) {
+            if (error && typeof error.text === 'function') return parseApiResponse(error);
+            throw error;
         });
     }
     function apiCall(method, path, body) {
         return getCurrentJellyfinContext().then(function (context) {
             if (!context.user) throw new Error('No authenticated Jellyfin user is active.');
             return apiCallForClient(context.client, method, path, body).then(function (data) { return requireCurrentContext(context, data); });
+        }).catch(function (error) {
+            var diagnosticCode = error && typeof error.code === 'string' && Object.prototype.hasOwnProperty.call(FAILURE_STRING_KEYS, error.code) ? error.code : 'transport_error';
+            if (error && (error.code === 'context_changed' || error.message === 'The active Jellyfin context changed.')) diagnosticCode = 'context_changed';
+            if (error && error.message === 'Jellyfin API client unavailable') diagnosticCode = 'api_client_unavailable';
+            console.error('[Scryer] API request failed:', diagnosticCode, safeHttpStatus(error && error.status));
+            throw error;
         });
     }
     function apiGet(path) { return apiCall('GET', path); }
@@ -498,7 +531,11 @@
             var link = document.createElement('a');
             link.setAttribute('is', 'emby-linkbutton'); link.className = 'navMenuOption lnkMediaFolder emby-button scryer-nav-' + page.id; link.href = page.route;
             link.innerHTML = '<span class="material-icons navMenuOptionIcon" aria-hidden="true">' + page.icon + '</span><span class="sectionName navMenuOptionText">' + escapeHtml(page.title) + '</span>';
-            link.addEventListener('click', function (event) { event.preventDefault(); showPage(page.id); });
+            link.addEventListener('click', function (event) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                showPage(page.id);
+            }, true);
             section.appendChild(link);
         });
     }

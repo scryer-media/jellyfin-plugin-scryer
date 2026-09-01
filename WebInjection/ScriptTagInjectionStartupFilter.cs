@@ -13,7 +13,7 @@ namespace Jellyfin.Plugin.Scryer.WebInjection;
 public class ScriptTagInjectionStartupFilter : IStartupFilter
 {
     private const string ScriptTag =
-        "<script src=\"/Scryer/Web/scryer-loader.js?v=153.1\" data-scryer-loader=\"153.1\" defer></script>";
+        "<script src=\"/Scryer/Web/scryer-loader.js?v=153.4\" data-scryer-loader=\"153.4\" defer></script>";
 
     private readonly ILogger<ScriptTagInjectionStartupFilter> _logger;
     private readonly ScryerInjectionStatus _status;
@@ -83,7 +83,7 @@ public class ScriptTagInjectionStartupFilter : IStartupFilter
 
         try
         {
-            var alreadyInjected = html.IndexOf("data-scryer-loader=\"153.1\"", StringComparison.OrdinalIgnoreCase) >= 0
+            var alreadyInjected = html.IndexOf("data-scryer-loader=\"153.4\"", StringComparison.OrdinalIgnoreCase) >= 0
                 || html.IndexOf("/Scryer/Web/scryer-loader.js", StringComparison.OrdinalIgnoreCase) >= 0;
             var bodyClose = html.LastIndexOf("</body>", StringComparison.OrdinalIgnoreCase);
 
