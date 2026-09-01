@@ -9,23 +9,22 @@ using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.Scryer.WebInjection;
 
-// Injects <script> tags into jellyfin-web's index.html at request time. scryer-core.js must load first.
+// Injects versioned plugin assets into jellyfin-web's index.html at request time.
 public class ScriptTagInjectionStartupFilter : IStartupFilter
 {
     private const string ScriptTag =
-        "<script src=\"/Scryer/Web/scryer-core.js\" defer></script>" +
-        "<script src=\"/Scryer/Web/scryer-styles.js\" defer></script>" +
-        "<script src=\"/Scryer/Web/scryer-discovery.js\" defer></script>" +
-        "<script src=\"/Scryer/Web/scryer-calendar.js\" defer></script>" +
-        "<script src=\"/Scryer/Web/scryer-requests.js\" defer></script>" +
-        "<script src=\"/Scryer/Web/scryer-downloads.js\" defer></script>";
+        "<script src=\"/Scryer/Web/scryer-loader.js?v=153.1\" data-scryer-loader=\"153.1\" defer></script>";
 
     private readonly ILogger<ScriptTagInjectionStartupFilter> _logger;
+    private readonly ScryerInjectionStatus _status;
     private int _loggedOnce;
 
-    public ScriptTagInjectionStartupFilter(ILogger<ScriptTagInjectionStartupFilter> logger)
+    public ScriptTagInjectionStartupFilter(
+        ILogger<ScriptTagInjectionStartupFilter> logger,
+        ScryerInjectionStatus status)
     {
         _logger = logger;
+        _status = status;
     }
 
     public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next)
@@ -44,6 +43,8 @@ public class ScriptTagInjectionStartupFilter : IStartupFilter
             await nextMiddleware().ConfigureAwait(false);
             return;
         }
+
+        _status.RecordIndexRequest();
 
         context.Request.Headers.Remove("Accept-Encoding");
         context.Request.Headers.Remove("Range");
@@ -82,21 +83,34 @@ public class ScriptTagInjectionStartupFilter : IStartupFilter
 
         try
         {
-            var alreadyInjected = html.IndexOf("Scryer/Web/nav.js", StringComparison.OrdinalIgnoreCase) >= 0;
+            var alreadyInjected = html.IndexOf("data-scryer-loader=\"153.1\"", StringComparison.OrdinalIgnoreCase) >= 0
+                || html.IndexOf("/Scryer/Web/scryer-loader.js", StringComparison.OrdinalIgnoreCase) >= 0;
             var bodyClose = html.LastIndexOf("</body>", StringComparison.OrdinalIgnoreCase);
 
             if (!alreadyInjected && bodyClose >= 0)
             {
                 html = html.Substring(0, bodyClose) + ScriptTag + "\n" + html.Substring(bodyClose);
+                _status.RecordInjected();
 
                 if (System.Threading.Interlocked.Exchange(ref _loggedOnce, 1) == 0)
                 {
-                    _logger.LogInformation("Scryer: injected the nav script tag via request-time middleware.");
+                    _logger.LogInformation("Scryer web assets injected via request-time middleware.");
                 }
+            }
+            else if (alreadyInjected)
+            {
+                _status.RecordAlreadyPresent();
+            }
+            else
+            {
+                var exception = new InvalidOperationException("Jellyfin web shell did not contain a closing body element.");
+                _status.RecordFailure(exception);
+                _logger.LogWarning(exception, "Scryer web asset injection skipped; serving original HTML.");
             }
         }
         catch (Exception ex)
         {
+            _status.RecordFailure(ex);
             _logger.LogWarning(ex, "Scryer script tag injection failed; serving original HTML.");
         }
 

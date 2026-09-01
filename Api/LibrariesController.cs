@@ -10,20 +10,30 @@ namespace Jellyfin.Plugin.Scryer.Api;
 
 [ApiController]
 [Authorize]
+[ScryerFeature(ScryerFeature.Discovery, ScryerFeature.Requests)]
 [Route("Scryer/Libraries")]
 [Produces(MediaTypeNames.Application.Json)]
 public class LibrariesController : ControllerBase
 {
-    private readonly ScryerApiClient _client;
+    private readonly IScryerGraphqlService _graphql;
 
-    public LibrariesController(ScryerApiClient client)
+    public LibrariesController(IScryerGraphqlService graphql)
     {
-        _client = client;
+        _graphql = graphql;
     }
 
     [HttpGet]
-    public async Task<ActionResult<JsonElement>> GetAll(CancellationToken cancellationToken)
+    public async Task<ActionResult<JsonElement>> GetAll([FromQuery] string? facet, CancellationToken cancellationToken)
     {
-        return Ok(await _client.GetLibrariesAsync(cancellationToken).ConfigureAwait(false));
+        if (!TrustedJellyfinActor.TryGetUserId(User, out var jellyfinUserId)) return Unauthorized();
+        if (facet is not null && facet.Trim() is not ("MOVIE" or "SERIES" or "ANIME"))
+        {
+            return ScryerFailureHttpMapper.InvalidClientInput();
+        }
+
+        var result = await _graphql.GetRequestLibrariesAsync(jellyfinUserId, facet, cancellationToken).ConfigureAwait(false);
+        return result.IsSuccess
+            ? Ok(new { libraries = result.Value! })
+            : ScryerFailureHttpMapper.ToActionResult(result.Failure!);
     }
 }

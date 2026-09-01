@@ -14,6 +14,12 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
         : base(applicationPaths, xmlSerializer)
     {
         Instance = this;
+        var configuration = Configuration;
+        if (configuration.RequiresLegacyRewrite)
+        {
+            configuration.MarkLegacyRewriteComplete();
+            SaveConfiguration(configuration);
+        }
     }
 
     public override string Name => "Scryer";

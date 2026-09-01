@@ -1,18 +1,113 @@
+using System.Text.Json.Serialization;
 using MediaBrowser.Model.Plugins;
 
 namespace Jellyfin.Plugin.Scryer.Configuration;
 
 public class PluginConfiguration : BasePluginConfiguration
 {
-    public string ScryerApiBaseUrl { get; set; } = "https://api.scryer.media";
+    private string _scryerInternalBaseUrl = "https://api.scryer.media";
+    private string _scryerPublicBaseUrl = "https://app.scryer.media";
+    private string _oauthClientId = string.Empty;
+    private string _jellyfinPublicBaseUrl = string.Empty;
+    private bool _requiresLegacyRewrite;
 
-    // Used for browser-facing image URLs when ScryerApiBaseUrl isn't reachable from the
-    // client (e.g. host.docker.internal only resolves from inside the Jellyfin container).
-    public string ScryerPublicBaseUrl { get; set; } = string.Empty;
+    /// <summary>URL used by the Jellyfin server for Scryer requests and OAuth discovery.</summary>
+    public string ScryerInternalBaseUrl
+    {
+        get => _scryerInternalBaseUrl;
+        set => _scryerInternalBaseUrl = ScryerConfigurationValidator.NormalizeBaseUrl(value);
+    }
 
-    public string ScryerApiKey { get; set; } = string.Empty;
+    /// <summary>Explicit opt-in for cleartext server-to-server OAuth on trusted private networks.</summary>
+    public bool AllowInsecureInternalScryerHttp { get; set; }
+
+    /// <summary>Public Scryer URL used as the OAuth authorization-server authority.</summary>
+    public string ScryerPublicBaseUrl
+    {
+        get => _scryerPublicBaseUrl;
+        set => _scryerPublicBaseUrl = ScryerConfigurationValidator.NormalizeBaseUrl(value);
+    }
+
+    /// <summary>Registered Scryer OAuth public-client identifier. It is not a secret.</summary>
+    public string OAuthClientId
+    {
+        get => _oauthClientId;
+        set => _oauthClientId = ScryerConfigurationValidator.NormalizeClientId(value);
+    }
+
+    /// <summary>Public Jellyfin URL from which the exact OAuth callback URI is derived.</summary>
+    public string JellyfinPublicBaseUrl
+    {
+        get => _jellyfinPublicBaseUrl;
+        set => _jellyfinPublicBaseUrl = ScryerConfigurationValidator.NormalizeBaseUrl(value);
+    }
+
+    public bool EnableDiscovery { get; set; } = true;
 
     public bool EnableRequests { get; set; } = true;
 
-    public bool EnableDownloadPage { get; set; } = true;
+    public bool EnableCalendar { get; set; } = true;
+
+    public bool EnableDownloads { get; set; } = true;
+
+    public ScryerDiagnosticVerbosity DiagnosticVerbosity { get; set; } = ScryerDiagnosticVerbosity.Basic;
+
+    /// <summary>
+    /// Deserialization-only bridge for configurations written before RFC 153. The
+    /// legacy API key is intentionally not migrated or exposed.
+    /// </summary>
+    [JsonIgnore]
+    [System.Obsolete("Legacy configuration migration only.")]
+    public string ScryerApiBaseUrl
+    {
+        get => string.Empty;
+        set
+        {
+            _requiresLegacyRewrite = true;
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                ScryerInternalBaseUrl = value;
+            }
+        }
+    }
+
+    [JsonIgnore]
+    [System.Obsolete("Legacy configuration migration only.")]
+    public bool EnableDownloadPage
+    {
+        get => EnableDownloads;
+        set
+        {
+            _requiresLegacyRewrite = true;
+            EnableDownloads = value;
+        }
+    }
+
+    [JsonIgnore]
+    [System.Obsolete("Legacy credential scrub only.")]
+    public string ScryerApiKey
+    {
+        get => string.Empty;
+        set => _requiresLegacyRewrite = true;
+    }
+
+    public bool ShouldSerializeScryerApiBaseUrl() => false;
+
+    public bool ShouldSerializeEnableDownloadPage() => false;
+
+    public bool ShouldSerializeScryerApiKey() => false;
+
+    internal bool RequiresLegacyRewrite => _requiresLegacyRewrite;
+
+    internal void MarkLegacyRewriteComplete() => _requiresLegacyRewrite = false;
+
+    [JsonIgnore]
+    public ScryerConfigurationValidation Validation => ScryerConfigurationValidator.Validate(this);
+}
+
+public enum ScryerDiagnosticVerbosity
+{
+    Off = 0,
+    Basic = 1,
+    Detailed = 2
 }

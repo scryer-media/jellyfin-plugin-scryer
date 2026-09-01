@@ -4,26 +4,57 @@
     <title>Scryer</title>
 </head>
 <body>
-<div id="ScryerConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox">
+<div id="ScryerConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox,emby-select">
     <div data-role="content">
         <div class="content-primary">
             <form id="ScryerConfigForm">
                 <div class="verticalSection">
                     <h2>Scryer Plugin Settings</h2>
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="text" id="ScryerApiBaseUrl" label="Scryer API Base URL" />
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="text" id="ScryerPublicBaseUrl" label="Scryer Public Base URL (optional)" />
                     <div class="fieldDescription">
-                        Only needed if the API Base URL above isn't reachable from users' browsers
-                        (e.g. it's a Docker-internal address like host.docker.internal). Set this to
-                        a URL the browser can actually reach; leave blank to reuse the API Base URL.
+                        This Alpha supports Jellyfin 10.11.x web clients and Scryer 0.19.6.
+                        Each person connects their own Scryer account; do not enter a shared Scryer API key here.
                     </div>
                 </div>
                 <div class="inputContainer">
-                    <input is="emby-input" type="password" id="ScryerApiKey" label="Scryer API Key" />
+                    <input is="emby-input" type="url" id="ScryerInternalBaseUrl" label="Internal Scryer URL" required="required" />
+                    <div class="fieldDescription">
+                        Address the Jellyfin server can reach for OAuth discovery and future server-to-server calls.
+                    </div>
+                </div>
+                <div class="checkboxContainer">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="AllowInsecureInternalScryerHttp" />
+                        <span>Allow insecure HTTP to the internal Scryer URL</span>
+                    </label>
+                    <div class="fieldDescription">
+                        Cleartext OAuth sends authorization codes, PKCE verifiers, and rotating tokens over the network.
+                        Enable only for an isolated trusted private network; HTTPS is strongly preferred.
+                    </div>
+                </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="url" id="ScryerPublicBaseUrl" label="Public Scryer URL" required="required" />
+                    <div class="fieldDescription">
+                        Browser-visible Scryer authority used for the OAuth consent redirect. It may differ from the internal URL.
+                    </div>
+                </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="text" id="OAuthClientId" label="Scryer OAuth Client ID" required="required" />
+                    <div class="fieldDescription">Public OAuth client identifier registered in Scryer. It is not a client secret.</div>
+                </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="url" id="JellyfinPublicBaseUrl" label="Public Jellyfin URL" required="required" />
+                    <div class="fieldDescription">Public URL users return to after Scryer authorization. It must match the registered callback exactly.</div>
+                </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="text" id="ScryerCallbackUri" label="Exact OAuth callback URI" readonly="readonly" />
+                    <div class="fieldDescription">Register this exact URI in the Scryer OAuth client. It is calculated from the public Jellyfin URL.</div>
+                </div>
+                <div class="verticalSection"><h3>Enabled Alpha pages</h3></div>
+                <div class="checkboxContainer">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="EnableDiscovery" />
+                        <span>Enable discovery</span>
+                    </label>
                 </div>
                 <div class="checkboxContainer">
                     <label>
@@ -33,9 +64,24 @@
                 </div>
                 <div class="checkboxContainer">
                     <label>
-                        <input is="emby-checkbox" type="checkbox" id="EnableDownloadPage" />
-                        <span>Enable download page</span>
+                        <input is="emby-checkbox" type="checkbox" id="EnableCalendar" />
+                        <span>Enable calendar</span>
                     </label>
+                </div>
+                <div class="checkboxContainer">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="EnableDownloads" />
+                        <span>Enable downloads</span>
+                    </label>
+                </div>
+                <div class="inputContainer">
+                    <label class="selectLabel" for="DiagnosticVerbosity">Diagnostic verbosity</label>
+                    <select is="emby-select" id="DiagnosticVerbosity">
+                        <option value="0">Off</option>
+                        <option value="1">Basic sanitized facts</option>
+                        <option value="2">Detailed sanitized facts</option>
+                    </select>
+                    <div class="fieldDescription">Diagnostics never include Scryer credentials, OAuth material, headers, response bodies, or linked-user identities.</div>
                 </div>
                 <div>
                     <button is="emby-button" type="submit" class="raised button-submit block emby-button">
@@ -43,6 +89,13 @@
                     </button>
                 </div>
             </form>
+            <div class="verticalSection">
+                <h2>Connection diagnostics</h2>
+                <div id="ScryerDiagnostics" class="fieldDescription" aria-live="polite">Save settings, then run diagnostics.</div>
+                <button is="emby-button" type="button" id="ScryerRunDiagnostics" class="raised emby-button">
+                    <span>Run diagnostics</span>
+                </button>
+            </div>
         </div>
     </div>
     <script type="text/javascript">
@@ -56,16 +109,87 @@
             return 'https://' + trimmed;
         }
 
+        function callbackUri(value) {
+            var normalized = normalizeUrl(value);
+            if (!normalized) return '';
+            try {
+                var url = new URL(normalized);
+                if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password) return '';
+                url.search = '';
+                url.hash = '';
+                url.pathname = url.pathname.replace(/\/+$/, '') + '/Scryer/Auth/Callback';
+                return url.href;
+            } catch (error) {
+                return '';
+            }
+        }
+
+        function setCallbackUri() {
+            document.querySelector('#ScryerCallbackUri').value = callbackUri(document.querySelector('#JellyfinPublicBaseUrl').value);
+        }
+
+        function apiGet(path) {
+            return ApiClient.getJSON(ApiClient.getUrl(path));
+        }
+
+        function displayDiagnostics(diagnostics) {
+            var lines = [];
+            lines.push(diagnostics.configurationValid ? 'Configuration: valid.' : 'Configuration: invalid.');
+            (diagnostics.configurationErrors || []).forEach(function (error) { lines.push(error); });
+            lines.push(diagnostics.preflightCompatible
+                ? 'Preflight: OAuth and GraphQL Alpha operation contracts are available.'
+                : 'Preflight: not compatible (requires Scryer ' + diagnostics.minimumScryerVersion + ' or newer).');
+            (diagnostics.compatibilityErrors || []).forEach(function (error) { lines.push(error); });
+            if (diagnostics.callbackUri) lines.push('Callback: ' + diagnostics.callbackUri);
+            if (diagnostics.oAuthMetadata && diagnostics.oAuthMetadata.checked) {
+                lines.push('OAuth metadata: ' + (diagnostics.oAuthMetadata.reachable ? 'reachable' : 'unreachable') +
+                    (diagnostics.oAuthMetadata.supportsAlphaContract ? ' (Alpha contract available).' : ' (Alpha contract not confirmed).'));
+            }
+            if (diagnostics.graphQl && diagnostics.graphQl.checked) {
+                lines.push('GraphQL: ' + (diagnostics.graphQl.reachable ? 'reachable' : 'unreachable') +
+                    (diagnostics.graphQl.contractVerified ? ' (Alpha operation contract verified).' :
+                        ' (' + (diagnostics.graphQl.failureCode || 'contract not verified') + ').'));
+            }
+            if (typeof diagnostics.linkedUserCount === 'number') {
+                lines.push('Linked Jellyfin users: ' + diagnostics.linkedUserCount +
+                    (diagnostics.linkedUserCountTruncated ? '+ (bounded diagnostic count).' : '.'));
+            }
+            if (diagnostics.injection) {
+                lines.push('Web injection: ' + diagnostics.injection.successfulInjections + ' injected, ' +
+                    diagnostics.injection.alreadyPresent + ' already present, ' + diagnostics.injection.failedInjections + ' failed.');
+            }
+            document.querySelector('#ScryerDiagnostics').textContent = lines.join(' ');
+        }
+
+        function runDiagnostics() {
+            var target = document.querySelector('#ScryerDiagnostics');
+            target.textContent = 'Running safe, read-only diagnostics…';
+            return apiGet('Scryer/Diagnostics')
+                .then(displayDiagnostics)
+                .catch(function () { target.textContent = 'Diagnostics could not be loaded. Verify administrator access and server reachability.'; });
+        }
+
         document.querySelector('#ScryerConfigPage')
             .addEventListener('pageshow', function () {
                 Dashboard.showLoadingMsg();
                 ApiClient.getPluginConfiguration(ScryerConfig.pluginUniqueId).then(function (config) {
-                    document.querySelector('#ScryerApiBaseUrl').value = config.ScryerApiBaseUrl || '';
+                    document.querySelector('#ScryerInternalBaseUrl').value = config.ScryerInternalBaseUrl || '';
+                    document.querySelector('#AllowInsecureInternalScryerHttp').checked = config.AllowInsecureInternalScryerHttp === true;
                     document.querySelector('#ScryerPublicBaseUrl').value = config.ScryerPublicBaseUrl || '';
-                    document.querySelector('#ScryerApiKey').value = config.ScryerApiKey || '';
+                    document.querySelector('#OAuthClientId').value = config.OAuthClientId || '';
+                    document.querySelector('#JellyfinPublicBaseUrl').value = config.JellyfinPublicBaseUrl || '';
+                    document.querySelector('#EnableDiscovery').checked = config.EnableDiscovery !== false;
                     document.querySelector('#EnableRequests').checked = config.EnableRequests;
-                    document.querySelector('#EnableDownloadPage').checked = config.EnableDownloadPage;
+                    document.querySelector('#EnableCalendar').checked = config.EnableCalendar !== false;
+                    document.querySelector('#EnableDownloads').checked = config.EnableDownloads !== false;
+                    document.querySelector('#DiagnosticVerbosity').value = String(config.DiagnosticVerbosity == null ? 1 : config.DiagnosticVerbosity);
+                    setCallbackUri();
                     Dashboard.hideLoadingMsg();
+                    if (Number(document.querySelector('#DiagnosticVerbosity').value) === 0) {
+                        document.querySelector('#ScryerDiagnostics').textContent = 'Diagnostics are disabled. Change verbosity and save to enable network checks.';
+                    } else {
+                        runDiagnostics();
+                    }
                 });
             });
 
@@ -73,11 +197,16 @@
             .addEventListener('submit', function (e) {
                 Dashboard.showLoadingMsg();
                 ApiClient.getPluginConfiguration(ScryerConfig.pluginUniqueId).then(function (config) {
-                    config.ScryerApiBaseUrl = normalizeUrl(document.querySelector('#ScryerApiBaseUrl').value);
+                    config.ScryerInternalBaseUrl = normalizeUrl(document.querySelector('#ScryerInternalBaseUrl').value);
+                    config.AllowInsecureInternalScryerHttp = document.querySelector('#AllowInsecureInternalScryerHttp').checked;
                     config.ScryerPublicBaseUrl = normalizeUrl(document.querySelector('#ScryerPublicBaseUrl').value);
-                    config.ScryerApiKey = document.querySelector('#ScryerApiKey').value;
+                    config.OAuthClientId = document.querySelector('#OAuthClientId').value.trim();
+                    config.JellyfinPublicBaseUrl = normalizeUrl(document.querySelector('#JellyfinPublicBaseUrl').value);
+                    config.EnableDiscovery = document.querySelector('#EnableDiscovery').checked;
                     config.EnableRequests = document.querySelector('#EnableRequests').checked;
-                    config.EnableDownloadPage = document.querySelector('#EnableDownloadPage').checked;
+                    config.EnableCalendar = document.querySelector('#EnableCalendar').checked;
+                    config.EnableDownloads = document.querySelector('#EnableDownloads').checked;
+                    config.DiagnosticVerbosity = Number(document.querySelector('#DiagnosticVerbosity').value);
 
                     ApiClient.updatePluginConfiguration(ScryerConfig.pluginUniqueId, config).then(function (result) {
                         Dashboard.processPluginConfigurationUpdateResult(result);
@@ -86,6 +215,9 @@
                 e.preventDefault();
                 return false;
             });
+
+        document.querySelector('#JellyfinPublicBaseUrl').addEventListener('input', setCallbackUri);
+        document.querySelector('#ScryerRunDiagnostics').addEventListener('click', runDiagnostics);
     </script>
 </div>
 </body>

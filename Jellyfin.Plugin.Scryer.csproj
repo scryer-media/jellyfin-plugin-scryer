@@ -11,6 +11,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
     <!-- Version must match the target Jellyfin server's plugin ABI (10.11.x server -> Jellyfin.Controller 10.11.x). -->
     <PackageReference Include="Jellyfin.Controller" Version="10.11.11" />
     <PackageReference Include="Jellyfin.Model" Version="10.11.11" />
@@ -18,6 +19,8 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Configuration\configPage.html" />
+    <EmbeddedResource Include="Web\scryer-loader.js" />
+    <EmbeddedResource Include="Web\scryer-strings.js" />
     <EmbeddedResource Include="Web\scryer-core.js" />
     <EmbeddedResource Include="Web\scryer-styles.js" />
     <EmbeddedResource Include="Web\scryer-discovery.js" />

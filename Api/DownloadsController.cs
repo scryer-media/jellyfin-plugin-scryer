@@ -10,26 +10,40 @@ namespace Jellyfin.Plugin.Scryer.Api;
 
 [ApiController]
 [Authorize]
+[ScryerFeature(ScryerFeature.Downloads)]
 [Route("Scryer/Downloads")]
 [Produces(MediaTypeNames.Application.Json)]
 public class DownloadsController : ControllerBase
 {
-    private readonly ScryerApiClient _client;
+    private const int MaximumOffset = 10_000;
+    private readonly IScryerGraphqlService _graphql;
 
-    public DownloadsController(ScryerApiClient client)
+    public DownloadsController(IScryerGraphqlService graphql)
     {
-        _client = client;
+        _graphql = graphql;
     }
 
     [HttpGet]
-    public async Task<ActionResult<JsonElement>> GetQueue(CancellationToken cancellationToken)
+    public async Task<ActionResult<JsonElement>> GetQueue([FromQuery] int? offset, CancellationToken cancellationToken)
     {
-        return Ok(await _client.GetDownloadQueueAsync(cancellationToken).ConfigureAwait(false));
+        var pageOffset = offset ?? 0;
+        if (!TrustedJellyfinActor.TryGetUserId(User, out var jellyfinUserId)) return Unauthorized();
+        if (pageOffset is < 0 or > MaximumOffset) return ScryerFailureHttpMapper.InvalidClientInput();
+        var result = await _graphql.GetDownloadQueuePageAsync(jellyfinUserId, pageOffset, cancellationToken).ConfigureAwait(false);
+        return result.IsSuccess
+            ? Ok(new { downloadQueuePage = result.Value! })
+            : ScryerFailureHttpMapper.ToActionResult(result.Failure!);
     }
 
     [HttpGet("History")]
-    public async Task<ActionResult<JsonElement>> GetHistory(CancellationToken cancellationToken)
+    public async Task<ActionResult<JsonElement>> GetHistory([FromQuery] int? offset, CancellationToken cancellationToken)
     {
-        return Ok(await _client.GetDownloadHistoryAsync(cancellationToken).ConfigureAwait(false));
+        var pageOffset = offset ?? 0;
+        if (!TrustedJellyfinActor.TryGetUserId(User, out var jellyfinUserId)) return Unauthorized();
+        if (pageOffset is < 0 or > MaximumOffset) return ScryerFailureHttpMapper.InvalidClientInput();
+        var result = await _graphql.GetDownloadHistoryPageAsync(jellyfinUserId, pageOffset, cancellationToken).ConfigureAwait(false);
+        return result.IsSuccess
+            ? Ok(new { downloadHistory = result.Value! })
+            : ScryerFailureHttpMapper.ToActionResult(result.Failure!);
     }
 }

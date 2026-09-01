@@ -4,409 +4,329 @@
     var Scryer = window.Scryer;
     var apiGet = Scryer.apiGet, apiPost = Scryer.apiPost, escapeHtml = Scryer.escapeHtml;
     var resolveImageUrl = Scryer.resolveImageUrl, LOADING_HTML = Scryer.LOADING_HTML;
-    var getLibraries = Scryer.getLibraries, isAdminUser = Scryer.isAdminUser;
-    var getQualityProfiles = Scryer.getQualityProfiles, facetOf = Scryer.facetOf;
-    var populateSelect = Scryer.populateSelect;
+    var getLibraries = Scryer.getLibraries, getCapabilities = Scryer.getCapabilities, facetOf = Scryer.facetOf;
 
-    // Appended to document.body, not the page container: Jellyfin's page-transition
-    // transform on an ancestor breaks position:fixed there. Backdrop and dialog are
-    // siblings, not parent/child: .dialogBackdropOpened sets opacity:.66, which
-    // cascades to descendants, so nesting the dialog inside it washed it out too.
-    function ensureDiscoveryModal() {
-        var existingModal = document.getElementById('scryer-discovery-modal');
-        if (existingModal) {
-            return { backdrop: document.getElementById('scryer-discovery-backdrop'), modal: existingModal };
-        }
-
-        var backdrop = document.createElement('div');
-        backdrop.id = 'scryer-discovery-backdrop';
-        backdrop.className = 'scryerModalBackdrop dialogBackdrop dialogBackdropOpened hide';
-
-        var modal = document.createElement('div');
-        modal.id = 'scryer-discovery-modal';
-        modal.className = 'scryerModal dialog hide';
-        modal.innerHTML =
-            '<button type="button" class="scryerModalClose" aria-label="Close">&times;</button>' +
-            '<div class="scryerModalPoster"></div>' +
-            '<div class="scryerModalBody">' +
-                '<h2 class="scryerModalTitle"></h2>' +
-                '<div class="scryerModalYear"></div>' +
-                '<div class="scryerModalRatings"></div>' +
-                '<p class="scryerModalOverview"></p>' +
-                '<div class="scryerModalLinks"></div>' +
-                '<div class="scryerModalAdminForm hide">' +
-                    '<div class="inputContainer">' +
-                        '<label class="inputLabel">Library</label>' +
-                        '<select is="emby-select" class="scryerLibrarySelect"></select>' +
-                    '</div>' +
-                    '<div class="inputContainer">' +
-                        '<label class="inputLabel">Quality profile</label>' +
-                        '<select is="emby-select" class="scryerQualitySelect"></select>' +
-                    '</div>' +
-                    '<div class="inputContainer">' +
-                        '<label class="inputLabel">Root folder</label>' +
-                        '<select is="emby-select" class="scryerRootFolderSelect"></select>' +
-                    '</div>' +
-                    '<label class="scryerMonitoredRow">' +
-                        '<input type="checkbox" is="emby-checkbox" class="scryerMonitoredCheckbox" checked />' +
-                        '<span>Monitored</span>' +
-                    '</label>' +
-                '</div>' +
-                '<div class="scryerModalMessage"></div>' +
-                '<button is="emby-button" type="button" class="raised scryerModalRequestBtn">Request</button>' +
-            '</div>';
-
-        // Theme CSS sets .dialogBackdrop.dialogBackdropOpened's z-index to 999998 via a
-        // two-class selector (beats our single-class rule regardless of source order);
-        // inline style always wins, so it's set directly instead of via the cascade.
-        backdrop.style.zIndex = '2147483000';
-        modal.style.zIndex = '2147483001';
-
-        document.body.appendChild(backdrop);
-        document.body.appendChild(modal);
-        return { backdrop: backdrop, modal: modal };
-    }
-
-    function renderDiscovery(container) {
-        container.innerHTML =
-            '<h1>Discover</h1>' +
-            '<div class="inputContainer"><input is="emby-input" type="text" class="scryerSearchBox" placeholder="Search movies and shows" /></div>' +
-            '<div class="scryerCategories"></div>';
-
-        var categoriesEl = container.querySelector('.scryerCategories');
-        var modalRefs = ensureDiscoveryModal();
+    function renderDiscovery(container, scope) {
+        container.innerHTML = '<h1>Discover</h1><div class="inputContainer"><input is="emby-input" type="text" class="scryerSearchBox" placeholder="Search movies and shows" /></div><div class="scryerTabGroup scryerDiscoveryFacetTabs" aria-label="Search result type"></div><div class="scryerCategories"></div>';
+        var categories = container.querySelector('.scryerCategories');
+        var facetTabs = container.querySelector('.scryerDiscoveryFacetTabs');
+        var modalRefs = createModal(scope);
         var backdrop = modalRefs.backdrop;
         var modal = modalRefs.modal;
         var items = [];
+        var searchTimer = null;
+        var searchGeneration = 0;
+        var activeFacet = 'ALL';
+        var latestSearchResults = null;
+        var lastFocused = null;
+        var modalGate = Scryer.ui.createGenerationGate();
+        scope.own(function () { if (searchTimer) window.clearTimeout(searchTimer); });
+        scope.own(function () { modalGate.invalidate(); });
 
         function posterPlaceholderHtml() {
             return '<div class="scryerPosterPlaceholder"><span class="material-icons" aria-hidden="true">movie</span></div>';
         }
-
-        function renderPosterInto(el, url) {
-            el.innerHTML = posterPlaceholderHtml();
+        function renderPosterInto(element, url, isCurrent) {
+            element.innerHTML = posterPlaceholderHtml();
             if (!url) return;
-
-            resolveImageUrl(url).then(function (resolved) {
-                var img = new Image();
-                img.alt = '';
-                img.onload = function () {
-                    el.innerHTML = '';
-                    el.appendChild(img);
-                };
-                img.src = resolved;
-            });
+            resolveImageUrl(url).then(scope.guard(function (resolved) {
+                if (isCurrent && !isCurrent()) return;
+                var image = new Image();
+                image.alt = '';
+                image.onload = scope.guard(function () {
+                    if (isCurrent && !isCurrent()) return;
+                    element.innerHTML = ''; element.appendChild(image);
+                });
+                image.src = resolved;
+            }));
         }
-
         function cardHtml(item) {
-            return '<div class="scryerCardPoster"></div>' +
-                '<div class="scryerCardTitle">' + escapeHtml(item.displayTitle || item.name || 'Untitled') + '</div>';
+            return '<div class="scryerCardPoster"></div><div class="scryerCardTitle">' + escapeHtml(item.displayTitle || item.name || 'Untitled') + '</div>';
         }
-
-        function renderCategories(categories) {
+        function renderCategories(groups) {
             items = [];
-            categoriesEl.innerHTML = '';
-            categories.forEach(function (cat) {
-                if (!cat.items || !cat.items.length) return;
-
+            categories.innerHTML = '';
+            var visible = 0;
+            groups.forEach(function (group) {
+                if (!group.items || !group.items.length) return;
+                visible++;
                 var section = document.createElement('section');
                 section.className = 'scryerCategory';
-                section.innerHTML =
-                    '<h2 class="scryerCategoryTitle">' + escapeHtml(cat.title) + '</h2>' +
-                    '<div class="scryerCarousel">' +
-                        '<button type="button" class="scryerCarouselNav scryerCarouselPrev" aria-label="Previous">&lsaquo;</button>' +
-                        '<div class="scryerRow"></div>' +
-                        '<button type="button" class="scryerCarouselNav scryerCarouselNext" aria-label="Next">&rsaquo;</button>' +
-                    '</div>';
-                categoriesEl.appendChild(section);
-
+                section.innerHTML = '<h2 class="scryerCategoryTitle">' + escapeHtml(group.title) + '</h2><div class="scryerCarousel"><button type="button" class="scryerCarouselNav scryerCarouselPrev" aria-label="Previous">&lsaquo;</button><div class="scryerRow"></div><button type="button" class="scryerCarouselNav scryerCarouselNext" aria-label="Next">&rsaquo;</button></div>';
+                categories.appendChild(section);
                 var row = section.querySelector('.scryerRow');
-                cat.items.forEach(function (item) {
+                group.items.forEach(function (item) {
                     var index = items.length;
                     items.push(item);
-
-                    var card = document.createElement('div');
+                    var card = document.createElement('button');
+                    card.type = 'button';
                     card.className = 'scryerCard';
                     card.dataset.index = index;
+                    card.setAttribute('aria-label', item.displayTitle || item.name || 'Untitled');
                     card.innerHTML = cardHtml(item);
                     row.appendChild(card);
                     renderPosterInto(card.querySelector('.scryerCardPoster'), item.posterUrl);
                 });
-
-                section.querySelector('.scryerCarouselPrev').addEventListener('click', function () {
-                    row.scrollBy({ left: -row.clientWidth * 0.9, behavior: 'smooth' });
-                });
-                section.querySelector('.scryerCarouselNext').addEventListener('click', function () {
-                    row.scrollBy({ left: row.clientWidth * 0.9, behavior: 'smooth' });
-                });
+                scope.on(section.querySelector('.scryerCarouselPrev'), 'click', function () { row.scrollBy({ left: -row.clientWidth * 0.9, behavior: 'smooth' }); });
+                scope.on(section.querySelector('.scryerCarouselNext'), 'click', function () { row.scrollBy({ left: row.clientWidth * 0.9, behavior: 'smooth' }); });
             });
+            if (!visible) categories.innerHTML = '<p role="status">No matching titles were found.</p>';
         }
-
-        function renderCards(newItems) {
-            renderCategories([{ title: 'Results', items: newItems }]);
+        function renderFacetTabs() {
+            facetTabs.innerHTML = ['ALL', 'MOVIE', 'SERIES', 'ANIME'].map(function (facet) {
+                var label = facet === 'ALL' ? 'All' : facet.charAt(0) + facet.slice(1).toLowerCase();
+                return '<button type="button" class="scryerTab' + (facet === activeFacet ? ' scryerTabActive' : '') + '" data-facet="' + facet + '">' + label + '</button>';
+            }).join('');
         }
-
+        function renderCards(found) {
+            latestSearchResults = found;
+            renderFacetTabs();
+            renderCategories([{ title: 'Results', items: found.filter(function (item) { return activeFacet === 'ALL' || facetOf(item) === activeFacet; }) }]);
+        }
         function loadTrending() {
-            categoriesEl.innerHTML = LOADING_HTML;
-            apiGet('Scryer/Discovery/Trending').then(function (data) {
+            categories.innerHTML = LOADING_HTML;
+            apiGet('Scryer/Discovery/Trending').then(scope.guard(function (data) {
                 var payload = data.discoveryHomeCards || {};
-                var categories = [];
-                (payload.publicSections || []).forEach(function (s) { categories.push({ title: s.title, items: s.items }); });
-                if (payload.canViewPersonalized) {
-                    (payload.personalizedSections || []).forEach(function (s) { categories.push({ title: s.title, items: s.items }); });
-                }
-                renderCategories(categories);
-            }).catch(function (err) { categoriesEl.innerHTML = '<p>' + escapeHtml(err.message) + '</p>'; });
+                var groups = [];
+                (payload.publicSections || []).forEach(function (section) { groups.push({ title: section.title, items: section.items }); });
+                if (payload.canViewPersonalized) (payload.personalizedSections || []).forEach(function (section) { groups.push({ title: section.title, items: section.items }); });
+                renderCategories(groups);
+            }), scope.guard(function (error) { categories.innerHTML = '<p role="alert">' + escapeHtml(error.message) + '</p>'; }));
         }
-
-        // Trending-grid items (DiscoveryHomeCardPayload) carry no overview/externalIds;
-        // only search results and the on-demand item-detail query do.
         function externalIdsFor(item) {
-            if (Array.isArray(item.externalIds) && item.externalIds.length) {
-                return item.externalIds.map(function (e) { return { Source: e.source, Value: String(e.id) }; });
-            }
+            if (Array.isArray(item.externalIds) && item.externalIds.length) return item.externalIds.map(function (entry) { return { Source: entry.source, Value: String(entry.id || entry.value) }; });
             var ids = [];
             if (item.tmdbId) ids.push({ Source: 'tmdb', Value: String(item.tmdbId) });
             if (item.tvdbId) ids.push({ Source: 'tvdb', Value: String(item.tvdbId) });
             return ids;
         }
-
         function externalLinkUrl(source, id, facet) {
-            var s = (source || '').toLowerCase();
+            var normalized = (source || '').toLowerCase();
             if (!id) return null;
-            if (s === 'imdb') return 'https://www.imdb.com/title/' + id + '/';
-            if (s === 'tmdb') return 'https://www.themoviedb.org/' + (facet === 'MOVIE' ? 'movie' : 'tv') + '/' + id;
-            if (s === 'tvdb') return 'https://www.thetvdb.com/dereferrer/' + (facet === 'MOVIE' ? 'movie' : 'series') + '/' + id;
+            if (normalized === 'imdb') return 'https://www.imdb.com/title/' + id + '/';
+            if (normalized === 'tmdb') return 'https://www.themoviedb.org/' + (facet === 'MOVIE' ? 'movie' : 'tv') + '/' + id;
+            if (normalized === 'tvdb') return 'https://www.thetvdb.com/dereferrer/' + (facet === 'MOVIE' ? 'movie' : 'series') + '/' + id;
             return null;
         }
-
         function renderLinks(item) {
-            var facet = facetOf(item);
             var pairs = [];
-            if (Array.isArray(item.externalIds)) {
-                item.externalIds.forEach(function (e) { pairs.push([e.source, e.id]); });
-            } else {
-                if (item.imdbId) pairs.push(['imdb', item.imdbId]);
-                if (item.tmdbId) pairs.push(['tmdb', item.tmdbId]);
-                if (item.tvdbId) pairs.push(['tvdb', item.tvdbId]);
-            }
-
-            var html = pairs.map(function (p) {
-                var url = externalLinkUrl(p[0], p[1], facet);
-                if (!url) return '';
-                return '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer" class="scryerLinkBtn">' +
-                    escapeHtml(p[0]) + '</a>';
+            (item.externalIds || []).forEach(function (entry) { pairs.push([entry.source, entry.id || entry.value]); });
+            modal.querySelector('.scryerModalLinks').innerHTML = pairs.map(function (pair) {
+                var url = externalLinkUrl(pair[0], pair[1], facetOf(item));
+                return url ? '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer" class="scryerLinkBtn">' + escapeHtml(pair[0]) + '</a>' : '';
             }).join('');
-
-            modal.querySelector('.scryerModalLinks').innerHTML = html;
         }
-
         function renderRatings(item) {
-            var ratings = Array.isArray(item.externalRatings) ? item.externalRatings : [];
-            var html = ratings.map(function (r) {
-                var display = r.value != null ? r.value
-                    : (r.normalized != null ? r.normalized + '%' : (r.score != null ? r.score : ''));
-                var inner = escapeHtml(r.source) + ' ' + escapeHtml(String(display));
-                return r.url
-                    ? '<a href="' + escapeHtml(r.url) + '" target="_blank" rel="noopener noreferrer" class="scryerRatingBadge">' + inner + '</a>'
-                    : '<span class="scryerRatingBadge">' + inner + '</span>';
+            modal.querySelector('.scryerModalRatings').innerHTML = (item.externalRatings || []).map(function (rating) {
+                var value = rating.value != null ? rating.value : (rating.normalized != null ? rating.normalized + '%' : (rating.score != null ? rating.score : ''));
+                var text = escapeHtml(rating.source) + ' ' + escapeHtml(String(value));
+                var url = null;
+                try {
+                    var parsed = new URL(rating.url);
+                    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') url = parsed.href;
+                } catch (error) {}
+                return url ? '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer" class="scryerRatingBadge">' + text + '</a>' : '<span class="scryerRatingBadge">' + text + '</span>';
             }).join('');
-
-            modal.querySelector('.scryerModalRatings').innerHTML = html;
         }
-
-        // Root folders belong to a specific library (LibraryPayload.roots); the
-        // standalone rootFolders(facet) query returns path/isDefault but no ID, and
-        // Scryer's addTitle rejects a path used as rootFolderId. So this re-populates
-        // from whichever library is currently selected.
-        function populateRootFoldersForLibrary(rootFolderSelect, libraries, libraryId) {
-            var lib = libraries.filter(function (l) { return l.id === libraryId; })[0];
-            var roots = (lib && lib.roots) || [];
-            var defaultRoot = roots.filter(function (r) { return r.isDefault; })[0] || roots[0];
-            populateSelect(rootFolderSelect, roots, 'id', 'path', defaultRoot && defaultRoot.id);
+        function closeModal() {
+            modalGate.invalidate();
+            modal.querySelector('.scryerModalRequestBtn').onclick = null;
+            backdrop.classList.add('hide');
+            modal.classList.add('hide');
+            if (lastFocused && lastFocused.focus) lastFocused.focus();
         }
-
-        function setupAdminForm(item) {
+        function monitorOptionsHtml(selected) {
+            return Scryer.ui.monitorOptions.map(function (option) {
+                return '<option value="' + option.value + '"' + (option.value === selected ? ' selected' : '') + '>' + escapeHtml(option.label) + '</option>';
+            }).join('');
+        }
+        function profilesHtml(profiles, selected) {
+            return profiles.map(function (profile) {
+                return '<option value="' + escapeHtml(profile.id) + '"' + (profile.id === selected ? ' selected' : '') + '>' + escapeHtml(profile.name) + '</option>';
+            }).join('');
+        }
+        function submitRequest(item, button, choices, isCurrentModal) {
+            if (!isCurrentModal()) return;
             var facet = facetOf(item);
-            var librarySelect = modal.querySelector('.scryerLibrarySelect');
-            var qualitySelect = modal.querySelector('.scryerQualitySelect');
-            var rootFolderSelect = modal.querySelector('.scryerRootFolderSelect');
-
-            return Promise.all([getLibraries(), getQualityProfiles()])
-                .then(function (results) {
-                    var libraries = results[0];
-                    var profiles = results[1];
-
-                    var facetLibraries = libraries.filter(function (l) { return l.facet === facet; });
-                    var selectableLibraries = facetLibraries.length ? facetLibraries : libraries;
-                    populateSelect(librarySelect, selectableLibraries, 'id', 'name');
-
-                    var defaultProfileId = facetLibraries[0] && facetLibraries[0].qualityProfileId;
-                    populateSelect(qualitySelect, profiles, 'id', 'name', defaultProfileId);
-
-                    populateRootFoldersForLibrary(rootFolderSelect, libraries, librarySelect.value);
-                    librarySelect.onchange = function () {
-                        populateRootFoldersForLibrary(rootFolderSelect, libraries, librarySelect.value);
-                    };
-                });
+            var message = modal.querySelector('.scryerModalMessage');
+            var librarySelect = modal.querySelector('.scryerRequestLibrary');
+            var profileSelect = modal.querySelector('.scryerRequestQuality');
+            var monitorSelect = modal.querySelector('.scryerRequestMonitor');
+            var library = choices.libraries.filter(function (entry) { return entry.id === librarySelect.value; })[0];
+            if (!library || !profileSelect.value || !monitorSelect.value) {
+                message.textContent = 'Choose a library, quality profile, and monitoring policy.';
+                message.className = 'scryerModalMessage scryerModalMessage-error';
+                return;
+            }
+            button.disabled = true;
+            button.textContent = 'Requesting…';
+            message.textContent = '';
+            apiPost('Scryer/Requests', {
+                LibraryId: library.id, Facet: facet, Title: item.displayTitle || item.name, Year: item.year || null,
+                ExternalIds: externalIdsFor(item), Overview: item.overview || null, SortTitle: item.sortTitle || null,
+                Slug: item.slug || null, RuntimeMinutes: item.runtimeMinutes || null, Language: item.language || null,
+                ContentStatus: item.status || null, RequestedQualityProfileId: profileSelect.value, RequestedMonitorType: monitorSelect.value
+            }).then(scope.guard(function (data) {
+                if (!isCurrentModal()) return;
+                button.textContent = 'Requested';
+                var requestId = data && data.submitMediaRequest && data.submitMediaRequest.requestId;
+                message.textContent = requestId ? 'Pending request submitted.' : 'Request submitted.';
+                message.className = 'scryerModalMessage scryerModalMessage-success';
+            }), scope.guard(function (error) {
+                if (!isCurrentModal()) return;
+                button.disabled = false;
+                button.textContent = 'Request';
+                message.textContent = error.message;
+                message.className = 'scryerModalMessage scryerModalMessage-error';
+            }));
         }
-
         function openModal(item) {
-            renderPosterInto(modal.querySelector('.scryerModalPoster'), item.posterUrl);
+            var modalToken = modalGate.begin();
+            var isCurrentModal = function () { return scope.isCurrent() && modalGate.isCurrent(modalToken); };
+            renderPosterInto(modal.querySelector('.scryerModalPoster'), item.posterUrl, isCurrentModal);
             modal.querySelector('.scryerModalTitle').textContent = item.displayTitle || item.name || 'Untitled';
             modal.querySelector('.scryerModalYear').textContent = item.year || '';
             modal.querySelector('.scryerModalMessage').textContent = '';
             renderRatings(item);
             renderLinks(item);
-
-            var overviewEl = modal.querySelector('.scryerModalOverview');
-            var requestBtn = modal.querySelector('.scryerModalRequestBtn');
-            var adminForm = modal.querySelector('.scryerModalAdminForm');
-            requestBtn.disabled = false;
-
+            var overview = modal.querySelector('.scryerModalOverview');
+            var request = modal.querySelector('.scryerModalRequestBtn');
+            request.onclick = null;
+            request.disabled = false;
             var needsDetail = item.targetKey && !item._detailFetched;
-            var detailPromise = needsDetail
-                ? apiGet('Scryer/Discovery/Item?targetKey=' + encodeURIComponent(item.targetKey)).then(function (data) {
+            overview.textContent = needsDetail ? 'Loading…' : (item.overview || '');
+            if (needsDetail) {
+                apiGet('Scryer/Discovery/Item?targetKey=' + encodeURIComponent(item.targetKey)).then(scope.guard(function (data) {
+                    if (!isCurrentModal()) return;
                     var detail = data.discoveryItemDetail;
                     item._detailFetched = true;
                     if (!detail) return;
                     item.overview = detail.overview || '';
                     item.externalIds = detail.externalIds || [];
                     item.externalRatings = detail.externalRatings || [];
-                    if (!item.posterUrl && detail.posterUrl) {
-                        item.posterUrl = detail.posterUrl;
-                        renderPosterInto(modal.querySelector('.scryerModalPoster'), item.posterUrl);
-                    }
+                    if (!item.posterUrl && detail.posterUrl) { item.posterUrl = detail.posterUrl; renderPosterInto(modal.querySelector('.scryerModalPoster'), item.posterUrl, isCurrentModal); }
+                    overview.textContent = item.overview;
                     renderRatings(item);
                     renderLinks(item);
-                }).catch(function () {})
-                : Promise.resolve();
-
-            overviewEl.textContent = needsDetail ? 'Loading…' : (item.overview || '');
-            detailPromise.then(function () { overviewEl.textContent = item.overview || ''; });
-
-            isAdminUser().then(function (admin) {
-                if (admin) {
-                    requestBtn.textContent = 'Add to Catalog';
-                    requestBtn.onclick = function () { submitAddToCatalog(item, requestBtn); };
-                    adminForm.classList.remove('hide');
-                    setupAdminForm(item).catch(function (err) {
-                        modal.querySelector('.scryerModalMessage').textContent = err.message;
-                    });
-                } else {
-                    requestBtn.textContent = 'Request';
-                    requestBtn.onclick = function () { submitRequest(item, requestBtn); };
-                    adminForm.classList.add('hide');
+                }));
+            }
+            var requestForm = modal.querySelector('.scryerModalAdminForm');
+            requestForm.classList.add('hide');
+            requestForm.innerHTML = '';
+            request.disabled = true;
+            request.textContent = 'Loading request choices…';
+            Promise.all([apiGet('Scryer/Libraries?facet=' + encodeURIComponent(facetOf(item))), Scryer.getQualityProfiles()]).then(scope.guard(function (results) {
+                if (!isCurrentModal()) return;
+                var libraries = (results[0].libraries || []).filter(function (library) { return library.facet === facetOf(item); });
+                if (!libraries.length) {
+                    request.disabled = true;
+                    request.textContent = 'Request unavailable';
+                    modal.querySelector('.scryerModalMessage').textContent = 'Your Scryer account cannot request this title.';
+                    return;
                 }
-            });
-
+                var profiles = results[1] || [];
+                var availableProfiles = Scryer.ui.profilesForLibrary(profiles, libraries[0]);
+                if (!availableProfiles.length) {
+                    request.disabled = true;
+                    request.textContent = 'Request unavailable';
+                    modal.querySelector('.scryerModalMessage').textContent = 'This library has no requestable quality profile.';
+                    return;
+                }
+                requestForm.classList.remove('hide');
+                requestForm.innerHTML = '<label><span class="inputLabel">Library</span><select class="scryerRequestLibrary">' + libraries.map(function (library) { return '<option value="' + escapeHtml(library.id) + '">' + escapeHtml(library.name || library.slug || library.id) + '</option>'; }).join('') + '</select></label><label><span class="inputLabel">Quality profile</span><select class="scryerRequestQuality">' + profilesHtml(availableProfiles, libraries[0].qualityProfileId) + '</select></label><label><span class="inputLabel">Monitoring</span><select class="scryerRequestMonitor">' + monitorOptionsHtml('MONITORED') + '</select></label>';
+                var librarySelect = requestForm.querySelector('.scryerRequestLibrary');
+                var qualitySelect = requestForm.querySelector('.scryerRequestQuality');
+                scope.on(librarySelect, 'change', function () {
+                    if (!isCurrentModal()) return;
+                    var selected = libraries.filter(function (library) { return library.id === librarySelect.value; })[0];
+                    var choices = Scryer.ui.profilesForLibrary(profiles, selected);
+                    qualitySelect.innerHTML = profilesHtml(choices, selected && selected.qualityProfileId);
+                    request.disabled = !choices.length;
+                });
+                request.disabled = false;
+                request.textContent = 'Request';
+                request.onclick = scope.guard(function () { submitRequest(item, request, { libraries: libraries }, isCurrentModal); });
+            }), scope.guard(function (error) {
+                if (!isCurrentModal()) return;
+                request.disabled = true;
+                request.textContent = 'Request unavailable';
+                modal.querySelector('.scryerModalMessage').textContent = error.message;
+            }));
+            lastFocused = document.activeElement;
             backdrop.classList.remove('hide');
             modal.classList.remove('hide');
+            modal.querySelector('.scryerModalClose').focus();
         }
 
-        function closeModal() {
-            backdrop.classList.add('hide');
-            modal.classList.add('hide');
-        }
-
-        function submitRequest(item, button) {
-            var facet = facetOf(item);
-            var messageEl = modal.querySelector('.scryerModalMessage');
-            button.disabled = true;
-            button.textContent = 'Requesting…';
-            messageEl.textContent = '';
-
-            getLibraries().then(function (libraries) {
-                var lib = libraries.filter(function (l) { return l.facet === facet; })[0];
-                if (!lib) {
-                    throw new Error('No library configured for ' + facet);
-                }
-
-                return apiPost('Scryer/Requests', {
-                    LibraryId: lib.id,
-                    Facet: facet,
-                    Title: item.displayTitle || item.name,
-                    Year: item.year || null,
-                    ExternalIds: externalIdsFor(item)
-                });
-            }).then(function () {
-                button.textContent = 'Requested';
-                messageEl.textContent = 'Request submitted.';
-                messageEl.className = 'scryerModalMessage scryerModalMessage-success';
-            }).catch(function (err) {
-                button.disabled = false;
-                button.textContent = 'Request';
-                messageEl.textContent = err.message;
-                messageEl.className = 'scryerModalMessage scryerModalMessage-error';
-            });
-        }
-
-        function submitAddToCatalog(item, button) {
-            var facet = facetOf(item);
-            var messageEl = modal.querySelector('.scryerModalMessage');
-            var librarySelect = modal.querySelector('.scryerLibrarySelect');
-            var qualitySelect = modal.querySelector('.scryerQualitySelect');
-            var rootFolderSelect = modal.querySelector('.scryerRootFolderSelect');
-            var monitoredCheckbox = modal.querySelector('.scryerMonitoredCheckbox');
-
-            button.disabled = true;
-            button.textContent = 'Adding…';
-            messageEl.textContent = '';
-
-            apiPost('Scryer/Catalog/Add', {
-                Name: item.displayTitle || item.name,
-                Facet: facet,
-                LibraryId: librarySelect.value,
-                Monitored: monitoredCheckbox.checked,
-                ExternalIds: externalIdsFor(item),
-                Year: item.year || null,
-                Overview: item.overview || null,
-                QualityProfileId: qualitySelect.value || null,
-                RootFolderId: rootFolderSelect.value || null
-            }).then(function () {
-                button.textContent = 'Added';
-                messageEl.textContent = 'Added to catalog. Monitored search will find a release automatically.';
-                messageEl.className = 'scryerModalMessage scryerModalMessage-success';
-            }).catch(function (err) {
-                button.disabled = false;
-                button.textContent = 'Add to Catalog';
-                messageEl.textContent = err.message;
-                messageEl.className = 'scryerModalMessage scryerModalMessage-error';
-            });
-        }
-
-        categoriesEl.addEventListener('click', function (e) {
-            var card = e.target.closest('.scryerCard');
+        scope.on(categories, 'click', function (event) {
+            var card = event.target.closest('.scryerCard');
             if (!card) return;
             var item = items[parseInt(card.dataset.index, 10)];
             if (item) openModal(item);
         });
-
-        backdrop.addEventListener('click', closeModal);
-        modal.querySelector('.scryerModalClose').addEventListener('click', closeModal);
-
-        var searchTimer;
-        container.querySelector('.scryerSearchBox').addEventListener('input', function (e) {
-            clearTimeout(searchTimer);
-            var q = e.target.value;
-            if (!q) { loadTrending(); return; }
-
-            searchTimer = setTimeout(function () {
-                categoriesEl.innerHTML = LOADING_HTML;
-                apiGet('Scryer/Discovery/Search?q=' + encodeURIComponent(q) + '&limit=25').then(function (data) {
+        scope.on(facetTabs, 'click', function (event) {
+            var button = event.target.closest('button[data-facet]');
+            if (!button || !latestSearchResults) return;
+            activeFacet = button.dataset.facet;
+            renderCards(latestSearchResults);
+        });
+        scope.on(backdrop, 'click', closeModal);
+        scope.on(modal.querySelector('.scryerModalClose'), 'click', closeModal);
+        scope.on(document, 'keydown', function (event) {
+            if (modal.classList.contains('hide')) return;
+            if (event.key === 'Escape') { event.preventDefault(); closeModal(); return; }
+            if (event.key !== 'Tab') return;
+            var focusable = modal.querySelectorAll('button:not([disabled]), select:not([disabled]), a[href], input:not([disabled])');
+            if (!focusable.length) return;
+            var first = focusable[0];
+            var last = focusable[focusable.length - 1];
+            if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+            if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+        });
+        scope.on(container.querySelector('.scryerSearchBox'), 'input', function (event) {
+            if (searchTimer) window.clearTimeout(searchTimer);
+            var query = event.target.value;
+            var requestGeneration = ++searchGeneration;
+            if (!query) { loadTrending(); return; }
+            searchTimer = window.setTimeout(scope.guard(function () {
+                categories.innerHTML = LOADING_HTML;
+                apiGet('Scryer/Discovery/Search?q=' + encodeURIComponent(query) + '&limit=25').then(scope.guard(function (data) {
+                    if (requestGeneration !== searchGeneration) return;
                     var result = data.searchMetadataMulti || {};
                     var found = [].concat(
-                        (result.movies || []).map(function (i) { return Object.assign({ targetKind: 'MOVIE' }, i); }),
-                        (result.series || []).map(function (i) { return Object.assign({ targetKind: 'SERIES' }, i); }),
-                        (result.anime || []).map(function (i) { return Object.assign({ targetKind: 'ANIME' }, i); })
+                        (result.movies || []).map(function (item) { return Object.assign({ targetKind: 'MOVIE' }, item); }),
+                        (result.series || []).map(function (item) { return Object.assign({ targetKind: 'SERIES' }, item); }),
+                        (result.anime || []).map(function (item) { return Object.assign({ targetKind: 'ANIME' }, item); })
                     );
                     renderCards(found);
-                }).catch(function (err) { categoriesEl.innerHTML = '<p>' + escapeHtml(err.message) + '</p>'; });
-            }, 300);
+                }), scope.guard(function (error) { if (requestGeneration === searchGeneration) categories.innerHTML = '<p role="alert">' + escapeHtml(error.message) + '</p>'; }));
+            }), 300);
         });
-
         loadTrending();
+        return closeModal;
     }
 
-    Scryer.pages.discovery = renderDiscovery;
+    function createModal(scope) {
+        document.querySelectorAll('#scryer-discovery-modal, #scryer-discovery-backdrop').forEach(function (element) { element.remove(); });
+        var backdrop = document.createElement('div');
+        backdrop.id = 'scryer-discovery-backdrop';
+        backdrop.className = 'scryerModalBackdrop dialogBackdrop dialogBackdropOpened hide scryer-runtime-owned';
+        var modal = document.createElement('div');
+        modal.id = 'scryer-discovery-modal';
+        modal.className = 'scryerModal dialog hide scryer-runtime-owned';
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-modal', 'true');
+        modal.setAttribute('aria-label', 'Scryer title details');
+        modal.innerHTML = '<button type="button" class="scryerModalClose" aria-label="Close">&times;</button><div class="scryerModalPoster"></div><div class="scryerModalBody"><h2 class="scryerModalTitle"></h2><div class="scryerModalYear"></div><div class="scryerModalRatings"></div><p class="scryerModalOverview"></p><div class="scryerModalLinks"></div><div class="scryerModalAdminForm hide"></div><div class="scryerModalMessage" role="status" aria-live="polite"></div><button is="emby-button" type="button" class="raised scryerModalRequestBtn">Request</button></div>';
+        backdrop.style.zIndex = '2147483000';
+        modal.style.zIndex = '2147483001';
+        document.body.appendChild(backdrop);
+        document.body.appendChild(modal);
+        scope.own(function () { backdrop.remove(); modal.remove(); });
+        return { backdrop: backdrop, modal: modal };
+    }
+
+    Scryer.lifecycle.registerFeature('discovery', function (container, scope, context) {
+        Scryer.withConnectionGate(container, scope, context.page, renderDiscovery);
+    });
 })();

@@ -11,9 +11,11 @@ namespace Jellyfin.Plugin.Scryer.Api;
 [Route("Scryer/Web")]
 public class WebAssetsController : ControllerBase
 {
-    // Whitelist: only these embedded resources are servable through this route.
+    // Allowlist: only these embedded resources are servable through this route.
     private static readonly HashSet<string> ScriptFiles = new()
     {
+        "scryer-loader.js",
+        "scryer-strings.js",
         "scryer-core.js",
         "scryer-styles.js",
         "scryer-discovery.js",
@@ -45,10 +47,18 @@ public class WebAssetsController : ControllerBase
     public ActionResult<object> GetConfig()
     {
         var config = Plugin.Instance?.Configuration;
-        var imageBaseUrl = string.IsNullOrEmpty(config?.ScryerPublicBaseUrl)
-            ? config?.ScryerApiBaseUrl ?? string.Empty
-            : config.ScryerPublicBaseUrl;
+        var imageBaseUrl = config?.ScryerPublicBaseUrl ?? string.Empty;
         Response.Headers.CacheControl = "no-store";
-        return Ok(new { imageBaseUrl });
+        return Ok(new
+        {
+            imageBaseUrl,
+            features = new
+            {
+                discovery = config?.EnableDiscovery ?? false,
+                requests = config?.EnableRequests ?? false,
+                calendar = config?.EnableCalendar ?? false,
+                downloads = config?.EnableDownloads ?? false
+            }
+        });
     }
 }

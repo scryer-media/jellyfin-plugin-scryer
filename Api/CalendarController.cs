@@ -1,5 +1,5 @@
 using System;
-using System.Linq;
+using System.Collections.Generic;
 using System.Net.Mime;
 using System.Text.Json;
 using System.Threading;
@@ -12,34 +12,36 @@ namespace Jellyfin.Plugin.Scryer.Api;
 
 [ApiController]
 [Authorize]
+[ScryerFeature(ScryerFeature.Calendar)]
 [Route("Scryer/Calendar")]
 [Produces(MediaTypeNames.Application.Json)]
 public class CalendarController : ControllerBase
 {
-    private readonly ScryerApiClient _client;
+    private const int MaximumCalendarDays = 62;
+    private readonly IScryerGraphqlService _graphql;
 
-    public CalendarController(ScryerApiClient client)
+    public CalendarController(IScryerGraphqlService graphql)
     {
-        _client = client;
+        _graphql = graphql;
     }
 
     [HttpGet("Upcoming")]
     public async Task<ActionResult<object>> GetUpcoming(
-        [FromQuery] int days,
+        [FromQuery] int? days,
         CancellationToken cancellationToken)
     {
+        var requestedDays = days ?? 30;
+        if (!TrustedJellyfinActor.TryGetUserId(User, out var jellyfinUserId)) return Unauthorized();
+        if (requestedDays is < 1 or > MaximumCalendarDays)
+        {
+            return ScryerFailureHttpMapper.InvalidClientInput();
+        }
+
         var start = DateOnly.FromDateTime(DateTime.UtcNow);
-        var end = start.AddDays(days <= 0 ? 30 : days);
-        var data = await _client.GetCalendarEpisodesAsync(start, end, cancellationToken).ConfigureAwait(false);
-
-        var episodes = data.GetProperty("calendarEpisodes");
-        var titleIds = episodes.EnumerateArray()
-            .Select(e => e.GetProperty("titleId").GetString()!)
-            .Distinct()
-            .ToArray();
-
-        var posters = await _client.GetTitlePostersAsync(titleIds, cancellationToken).ConfigureAwait(false);
-
-        return Ok(new { calendarEpisodes = episodes, titlePosters = posters });
+        var end = start.AddDays(requestedDays);
+        var result = await _graphql.GetCalendarEpisodesAsync(jellyfinUserId, start, end, cancellationToken).ConfigureAwait(false);
+        return result.IsSuccess
+            ? Ok(new { calendarEpisodes = result.Value!, titlePosters = new Dictionary<string, string?>() })
+            : ScryerFailureHttpMapper.ToActionResult(result.Failure!);
     }
 }
