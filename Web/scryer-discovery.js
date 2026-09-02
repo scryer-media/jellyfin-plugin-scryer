@@ -83,21 +83,90 @@
             renderFacetTabs();
             renderCategories([{ title: 'Results', items: found.filter(function (item) { return activeFacet === 'ALL' || facetOf(item) === activeFacet; }) }]);
         }
+        function recommendationLookups(seed) {
+            var ids = seed.providerIds || {};
+            var lookups = [];
+            function add(source, value) { if (value) lookups.push({ source: source, value: value }); }
+            if (seed.kind === 'MOVIE') {
+                add('tmdb', ids.tmdb); add('tmdb_movie', ids.tmdb);
+                add('imdb', ids.imdb);
+                add('tvdb', ids.tvdb); add('tvdb_movie', ids.tvdb);
+            } else {
+                add('tvdb', ids.tvdb); add('tvdb_series', ids.tvdb); add('tvdb_show', ids.tvdb);
+                add('tmdb', ids.tmdb); add('tmdb_series', ids.tmdb); add('tmdb_tv', ids.tmdb); add('tmdb_show', ids.tmdb);
+                add('imdb', ids.imdb);
+            }
+            return lookups;
+        }
+        function recommendationGroup(seed) {
+            var lookups = recommendationLookups(seed);
+            function tryLookup(index) {
+                if (index >= lookups.length) return Promise.resolve(null);
+                var lookup = lookups[index];
+                return apiGet('Scryer/Discovery/MoreLikeThis?source=' + encodeURIComponent(lookup.source) + '&value=' + encodeURIComponent(lookup.value) + '&limit=20').then(function (data) {
+                    var matches = data.recommendationTitles || [];
+                    if (!matches.length) return tryLookup(index + 1);
+                    var recommendations = matches[0].moreLikeThis || [];
+                    return recommendations.length ? { title: 'More like ' + seed.title, items: recommendations } : null;
+                });
+            }
+            return tryLookup(0);
+        }
+        function recentRecommendationGroups() {
+            return Scryer.getRecentWatchSeeds(5).then(function (seeds) {
+                return Promise.all(seeds.map(recommendationGroup));
+            }).then(function (groups) {
+                return groups.filter(function (group) { return !!group; }).slice(0, 5);
+            }).catch(function () { return []; });
+        }
+        function uniqueGroups(groups) {
+            var seen = {};
+            return groups.map(function (group) {
+                return { title: group.title, items: (group.items || []).filter(function (item) {
+                    var key = item.targetKey || item.id;
+                    if (!key || seen[key]) return false;
+                    seen[key] = true;
+                    return true;
+                }) };
+            }).filter(function (group) { return group.items.length > 0; });
+        }
         function loadTrending() {
             categories.innerHTML = LOADING_HTML;
-            apiGet('Scryer/Discovery/Trending').then(scope.guard(function (data) {
+            var genericGroups = apiGet('Scryer/Discovery/Trending').then(function (data) {
                 var payload = data.discoveryHomeCards || {};
                 var groups = [];
                 (payload.publicSections || []).forEach(function (section) { groups.push({ title: section.title, items: section.items }); });
                 if (payload.canViewPersonalized) (payload.personalizedSections || []).forEach(function (section) { groups.push({ title: section.title, items: section.items }); });
+                return { groups: groups, error: null };
+            }, function (error) { return { groups: [], error: error }; });
+            Promise.all([recentRecommendationGroups(), genericGroups]).then(scope.guard(function (results) {
+                var groups = uniqueGroups(results[0].concat(results[1].groups));
+                if (!groups.length && results[1].error) {
+                    categories.innerHTML = '<p role="alert">' + escapeHtml(results[1].error.message) + '</p>';
+                    return;
+                }
                 renderCategories(groups);
-            }), scope.guard(function (error) { categories.innerHTML = '<p role="alert">' + escapeHtml(error.message) + '</p>'; }));
+            }));
         }
         function externalIdsFor(item) {
-            if (Array.isArray(item.externalIds) && item.externalIds.length) return item.externalIds.map(function (entry) { return { Source: entry.source, Value: String(entry.id || entry.value) }; });
             var ids = [];
-            if (item.tmdbId) ids.push({ Source: 'tmdb', Value: String(item.tmdbId) });
-            if (item.tvdbId) ids.push({ Source: 'tvdb', Value: String(item.tvdbId) });
+            var seen = {};
+            function add(source, value) {
+                source = String(source || '').trim().toLowerCase();
+                value = String(value || '').trim();
+                var key = source + '\u001f' + value;
+                if (!source || !value || seen[key]) return;
+                seen[key] = true;
+                ids.push({ Source: source, Value: value });
+            }
+            (item.externalIds || []).forEach(function (entry) { add(entry.source, entry.id || entry.value); });
+            add('tmdb', item.tmdbId);
+            add('tvdb', item.tvdbId);
+            add('imdb', item.imdbId);
+            if (!ids.length && item.targetKey) {
+                var targetParts = String(item.targetKey).split(':');
+                if (targetParts.length >= 2) add(targetParts[0], targetParts[targetParts.length - 1]);
+            }
             return ids;
         }
         function externalLinkUrl(source, id, facet) {
@@ -180,6 +249,42 @@
                 message.className = 'scryerModalMessage scryerModalMessage-error';
             }));
         }
+        function submitAdd(item, button, choices, isCurrentModal) {
+            if (!isCurrentModal()) return;
+            var facet = facetOf(item);
+            var message = modal.querySelector('.scryerModalMessage');
+            var librarySelect = modal.querySelector('.scryerRequestLibrary');
+            var profileSelect = modal.querySelector('.scryerRequestQuality');
+            var monitorSelect = modal.querySelector('.scryerRequestMonitor');
+            var library = choices.libraries.filter(function (entry) { return entry.id === librarySelect.value; })[0];
+            var externalIds = externalIdsFor(item);
+            if (!library || !library._canManageTitles || !profileSelect.value || !monitorSelect.value || !externalIds.length) {
+                message.textContent = 'Choose a manageable library, quality profile, and monitoring policy.';
+                message.className = 'scryerModalMessage scryerModalMessage-error';
+                return;
+            }
+            button.disabled = true;
+            button.textContent = 'Adding…';
+            message.textContent = '';
+            apiPost('Scryer/Catalog/Titles', {
+                LibraryId: library.id, Facet: facet, Title: item.displayTitle || item.name, Year: item.year || null,
+                ExternalIds: externalIds, Overview: item.overview || null, SortTitle: item.sortTitle || null,
+                Slug: item.slug || null, RuntimeMinutes: item.runtimeMinutes || null, Language: item.language || null,
+                ContentStatus: item.status || null, QualityProfileId: profileSelect.value, MonitorType: monitorSelect.value
+            }).then(scope.guard(function (data) {
+                if (!isCurrentModal()) return;
+                var result = data && data.addTitle;
+                button.textContent = 'Added';
+                message.textContent = result && result.reusedExistingTitle ? 'Already in Scryer.' : 'Added directly to Scryer.';
+                message.className = 'scryerModalMessage scryerModalMessage-success';
+            }), scope.guard(function (error) {
+                if (!isCurrentModal()) return;
+                button.disabled = false;
+                button.textContent = 'Add to Scryer';
+                message.textContent = error.message;
+                message.className = 'scryerModalMessage scryerModalMessage-error';
+            }));
+        }
         function openModal(item) {
             var modalToken = modalGate.begin();
             var isCurrentModal = function () { return scope.isCurrent() && modalGate.isCurrent(modalToken); };
@@ -195,12 +300,13 @@
             request.disabled = false;
             var needsDetail = item.targetKey && !item._detailFetched;
             overview.textContent = needsDetail ? 'Loading…' : (item.overview || '');
+            var detailPromise = Promise.resolve(item);
             if (needsDetail) {
-                apiGet('Scryer/Discovery/Item?targetKey=' + encodeURIComponent(item.targetKey)).then(scope.guard(function (data) {
-                    if (!isCurrentModal()) return;
+                detailPromise = apiGet('Scryer/Discovery/Item?targetKey=' + encodeURIComponent(item.targetKey)).then(scope.guard(function (data) {
+                    if (!isCurrentModal()) return item;
                     var detail = data.discoveryItemDetail;
                     item._detailFetched = true;
-                    if (!detail) return;
+                    if (!detail) return item;
                     item.overview = detail.overview || '';
                     item.externalIds = detail.externalIds || [];
                     item.externalRatings = detail.externalRatings || [];
@@ -208,48 +314,68 @@
                     overview.textContent = item.overview;
                     renderRatings(item);
                     renderLinks(item);
+                    return item;
                 }));
             }
             var requestForm = modal.querySelector('.scryerModalAdminForm');
             requestForm.classList.add('hide');
             requestForm.innerHTML = '';
             request.disabled = true;
-            request.textContent = 'Loading request choices…';
-            Promise.all([apiGet('Scryer/Libraries?facet=' + encodeURIComponent(facetOf(item))), Scryer.getQualityProfiles()]).then(scope.guard(function (results) {
+            request.textContent = 'Loading choices…';
+            var facet = facetOf(item);
+            Promise.all([
+                detailPromise,
+                apiGet('Scryer/Libraries?facet=' + encodeURIComponent(facet)),
+                apiGet('Scryer/Libraries/Manageable?facet=' + encodeURIComponent(facet)),
+                Scryer.getQualityProfiles()
+            ]).then(scope.guard(function (results) {
                 if (!isCurrentModal()) return;
-                var libraries = (results[0].libraries || []).filter(function (library) { return library.facet === facetOf(item); });
+                var byId = {};
+                var libraries = [];
+                function mergeLibraries(entries, permission) {
+                    (entries || []).filter(function (library) { return library.facet === facet; }).forEach(function (library) {
+                        var current = byId[library.id];
+                        if (!current) {
+                            current = byId[library.id] = Object.assign({}, library);
+                            libraries.push(current);
+                        } else {
+                            Object.keys(library).forEach(function (key) { if (library[key] != null) current[key] = library[key]; });
+                        }
+                        current[permission] = true;
+                    });
+                }
+                mergeLibraries(results[2].libraries, '_canManageTitles');
+                mergeLibraries(results[1].libraries, '_canRequest');
                 if (!libraries.length) {
                     request.disabled = true;
-                    request.textContent = 'Request unavailable';
-                    modal.querySelector('.scryerModalMessage').textContent = 'Your Scryer account cannot request this title.';
+                    request.textContent = 'Unavailable';
+                    modal.querySelector('.scryerModalMessage').textContent = 'Your Scryer account cannot add or request this title.';
                     return;
                 }
-                var profiles = results[1] || [];
-                var availableProfiles = Scryer.ui.profilesForLibrary(profiles, libraries[0]);
-                if (!availableProfiles.length) {
-                    request.disabled = true;
-                    request.textContent = 'Request unavailable';
-                    modal.querySelector('.scryerModalMessage').textContent = 'This library has no requestable quality profile.';
-                    return;
-                }
+                var profiles = results[3] || [];
                 requestForm.classList.remove('hide');
-                requestForm.innerHTML = '<label><span class="inputLabel">Library</span><select class="scryerRequestLibrary">' + libraries.map(function (library) { return '<option value="' + escapeHtml(library.id) + '">' + escapeHtml(library.name || library.slug || library.id) + '</option>'; }).join('') + '</select></label><label><span class="inputLabel">Quality profile</span><select class="scryerRequestQuality">' + profilesHtml(availableProfiles, libraries[0].qualityProfileId) + '</select></label><label><span class="inputLabel">Monitoring</span><select class="scryerRequestMonitor">' + monitorOptionsHtml('MONITORED') + '</select></label>';
+                requestForm.innerHTML = '<label><span class="inputLabel">Library</span><select class="scryerRequestLibrary">' + libraries.map(function (library) { return '<option value="' + escapeHtml(library.id) + '">' + escapeHtml(library.name || library.slug || library.id) + ' — ' + (library._canManageTitles ? 'Add' : 'Request') + '</option>'; }).join('') + '</select></label><label><span class="inputLabel">Quality profile</span><select class="scryerRequestQuality"></select></label><label><span class="inputLabel">Monitoring</span><select class="scryerRequestMonitor">' + monitorOptionsHtml('MONITORED') + '</select></label>';
                 var librarySelect = requestForm.querySelector('.scryerRequestLibrary');
                 var qualitySelect = requestForm.querySelector('.scryerRequestQuality');
-                scope.on(librarySelect, 'change', function () {
+                function updateAction() {
                     if (!isCurrentModal()) return;
                     var selected = libraries.filter(function (library) { return library.id === librarySelect.value; })[0];
-                    var choices = Scryer.ui.profilesForLibrary(profiles, selected);
-                    qualitySelect.innerHTML = profilesHtml(choices, selected && selected.qualityProfileId);
-                    request.disabled = !choices.length;
-                });
-                request.disabled = false;
-                request.textContent = 'Request';
-                request.onclick = scope.guard(function () { submitRequest(item, request, { libraries: libraries }, isCurrentModal); });
+                    var choices = selected && selected._canManageTitles ? profiles : Scryer.ui.profilesForLibrary(profiles, selected);
+                    qualitySelect.innerHTML = profilesHtml(choices, selected && (selected.qualityProfileId || selected.requestQualityProfileDefaultId));
+                    request.disabled = !selected || !choices.length || !externalIdsFor(item).length;
+                    request.textContent = selected && selected._canManageTitles ? 'Add to Scryer' : 'Request';
+                    request.onclick = scope.guard(function () {
+                        if (selected && selected._canManageTitles) submitAdd(item, request, { libraries: libraries }, isCurrentModal);
+                        else submitRequest(item, request, { libraries: libraries }, isCurrentModal);
+                    });
+                    if (!externalIdsFor(item).length) modal.querySelector('.scryerModalMessage').textContent = 'This title has no supported external identifier.';
+                }
+                scope.on(librarySelect, 'change', updateAction);
+                updateAction();
             }), scope.guard(function (error) {
                 if (!isCurrentModal()) return;
                 request.disabled = true;
-                request.textContent = 'Request unavailable';
+                request.textContent = 'Unavailable';
                 modal.querySelector('.scryerModalMessage').textContent = error.message;
             }));
             lastFocused = document.activeElement;

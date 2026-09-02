@@ -17,6 +17,12 @@ public class DiscoveryController : ControllerBase
 {
     private const int MaximumSearchLength = 256;
     private const int MaximumTargetKeyLength = 256;
+    private const int MaximumExternalIdLength = 64;
+    private static readonly HashSet<string> RecommendationExternalIdSources = new(StringComparer.Ordinal)
+    {
+        "imdb", "tmdb", "tmdb_movie", "tmdb_series", "tmdb_show", "tmdb_tv",
+        "tvdb", "tvdb_movie", "tvdb_series", "tvdb_show",
+    };
     private readonly IScryerGraphqlService _graphql;
 
     public DiscoveryController(IScryerGraphqlService graphql)
@@ -31,6 +37,32 @@ public class DiscoveryController : ControllerBase
         var result = await _graphql.GetDiscoveryHomeCardsAsync(jellyfinUserId, cancellationToken).ConfigureAwait(false);
         return result.IsSuccess
             ? Ok(new { discoveryHomeCards = result.Value! })
+            : ScryerFailureHttpMapper.ToActionResult(result.Failure!);
+    }
+
+    [HttpGet("MoreLikeThis")]
+    public async Task<ActionResult<JsonElement>> GetMoreLikeThis(
+        [FromQuery] string? source,
+        [FromQuery] string? value,
+        [FromQuery] int? limit,
+        CancellationToken cancellationToken)
+    {
+        var normalizedSource = source?.Trim().ToLowerInvariant();
+        var normalizedValue = value?.Trim();
+        var requestedLimit = limit ?? 20;
+        if (!TrustedJellyfinActor.TryGetUserId(User, out var jellyfinUserId)) return Unauthorized();
+        if (normalizedSource is null
+            || !RecommendationExternalIdSources.Contains(normalizedSource)
+            || string.IsNullOrWhiteSpace(normalizedValue)
+            || normalizedValue.Length > MaximumExternalIdLength
+            || requestedLimit is < 1 or > 30)
+        {
+            return ScryerFailureHttpMapper.InvalidClientInput();
+        }
+
+        var result = await _graphql.GetTitleRecommendationsAsync(jellyfinUserId, normalizedSource, normalizedValue, requestedLimit, cancellationToken).ConfigureAwait(false);
+        return result.IsSuccess
+            ? Ok(new { recommendationTitles = result.Value! })
             : ScryerFailureHttpMapper.ToActionResult(result.Failure!);
     }
 

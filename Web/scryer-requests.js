@@ -74,7 +74,7 @@
             if (!requests.length) { list.innerHTML = '<p role="status">No requests for this filter.</p>'; return; }
             requests.forEach(function (request) {
                 var row = document.createElement('div');
-                row.className = 'scryerRow';
+                row.className = 'scryerRequestRow';
                 row.innerHTML = '<span><strong>' + escapeHtml(request.title) + '</strong><br><small>' + escapeHtml(label(request.facet)) + ' · ' + escapeHtml(request.libraryId) + '</small></span><span class="scryerStatus-' + escapeHtml(request.status) + '">' + escapeHtml(label(request.status)) + '</span><span>' + (state.view === 'mine' ? ownActions(request) : managerActions(request)) + '</span>';
                 list.appendChild(row);
             });
@@ -124,7 +124,7 @@
             var button = event.target.closest('button[data-action]');
             if (!button) return;
             var id = button.dataset.id;
-            var row = button.closest('.scryerRow');
+            var row = button.closest('.scryerRequestRow');
             if (!row) return;
             if (button.dataset.action === 'update-own') {
                 var quality = row.querySelector('select[data-own-quality]');

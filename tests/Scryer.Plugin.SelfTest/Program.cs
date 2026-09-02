@@ -34,6 +34,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("disabled feature filters reject direct endpoints", DisabledFeatureAsync),
     ("GraphQL normalizes upstream protocol failures", GraphqlProtocolFailuresAsync),
     ("GraphQL maps bounded Scryer capabilities", CapabilityMappingAsync),
+    ("watch-history recommendations use fixed bounded GraphQL", TitleRecommendationsAsync),
+    ("manageable libraries and direct title adds use fixed GraphQL", DirectCatalogAddAsync),
     ("detached revoke journal survives restart discovery, promotion, and cleanup", DetachedRevokeJournalAsync),
     ("retiring a detached issued family preserves the current family", DetachedRetirementPreservesCurrentAsync),
     ("detached revoke deletion failure retains its tombstone", DetachedDeletionFailureAsync),
@@ -151,7 +153,7 @@ static Task WebInjectionPreservesBytesAsync()
     Assert.True(result.Injected);
     Assert.True(result.Content.AsSpan(0, prefix.Length).SequenceEqual(prefix));
     Assert.True(result.Content.AsSpan(result.Content.Length - suffix.Length).SequenceEqual(suffix));
-    Assert.Contains("data-scryer-loader=\"153.10\"", Encoding.ASCII.GetString(result.Content));
+    Assert.Contains("data-scryer-loader=\"153.12\"", Encoding.ASCII.GetString(result.Content));
 
     var secondPass = HtmlScriptInjector.Inject(result.Content);
     Assert.True(secondPass.AlreadyPresent);
@@ -276,6 +278,7 @@ static async Task ControllerInputBoundsAsync()
     var actor = Principal("01234567-89ab-cdef-0123-456789abcdef", "false");
 
     var search = await Controller(new DiscoveryController(service), actor).Search(new string('x', 257), 51, CancellationToken.None);
+    var recommendations = await Controller(new DiscoveryController(service), actor).GetMoreLikeThis("unsupported", "1", 20, CancellationToken.None);
     var calendarTooShort = await Controller(new CalendarController(service), actor).GetUpcoming(0, CancellationToken.None);
     var calendarTooLong = await Controller(new CalendarController(service), actor).GetUpcoming(63, CancellationToken.None);
     var downloadsTooEarly = await Controller(new DownloadsController(service), actor).GetQueue(-1, CancellationToken.None);
@@ -287,13 +290,22 @@ static async Task ControllerInputBoundsAsync()
         ExternalIds = [new ExternalIdDto { Source = "tmdb", Value = "1" }],
         Year = 1799,
     }, CancellationToken.None);
+    var add = await Controller(new CatalogController(service), actor).AddTitle(new AddTitleDto
+    {
+        LibraryId = "library",
+        Title = "Title",
+        ExternalIds = [new ExternalIdDto { Source = "tmdb", Value = "1" }],
+        Year = 1799,
+    }, CancellationToken.None);
 
     Assert.Equal(400, Assert.IsType<ObjectResult>(search.Result).StatusCode);
+    Assert.Equal(400, Assert.IsType<ObjectResult>(recommendations.Result).StatusCode);
     Assert.Equal(400, Assert.IsType<ObjectResult>(calendarTooShort.Result).StatusCode);
     Assert.Equal(400, Assert.IsType<ObjectResult>(calendarTooLong.Result).StatusCode);
     Assert.Equal(400, Assert.IsType<ObjectResult>(downloadsTooEarly.Result).StatusCode);
     Assert.Equal(400, Assert.IsType<ObjectResult>(downloadsTooLate.Result).StatusCode);
     Assert.Equal(400, Assert.IsType<ObjectResult>(request.Result).StatusCode);
+    Assert.Equal(400, Assert.IsType<ObjectResult>(add.Result).StatusCode);
     Assert.Equal(0, handler.Requests.Count);
 }
 
@@ -346,6 +358,59 @@ static async Task CapabilityMappingAsync()
     Assert.Equal("library-b", result.Value.Libraries[1].LibraryId);
     Assert.True(result.Value.Libraries[1].CanView);
     Assert.False(result.Value.Libraries[1].CanRequest);
+}
+
+static async Task TitleRecommendationsAsync()
+{
+    var handler = new RecordingHandler(_ => JsonResponse("""{"data":{"titlesByExternalIds":[{"id":"title-1","name":"Watched","moreLikeThis":[{"id":"item-1","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Similar","year":2026,"posterUrl":"/images/media/poster/w250"}]}]}}"""));
+    var service = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), handler);
+
+    var result = await service.GetTitleRecommendationsAsync("0123456789abcdef0123456789abcdef", "tmdb_movie", "1", 20, CancellationToken.None);
+
+    Assert.True(result.IsSuccess, result.Failure?.Code.ToString());
+    Assert.Equal("Watched", result.Value![0].GetProperty("name").GetString());
+    using var request = JsonDocument.Parse(handler.Requests.Single().Content!);
+    Assert.Equal("ScryerTitleRecommendations", request.RootElement.GetProperty("operationName").GetString());
+    Assert.Equal("tmdb_movie", request.RootElement.GetProperty("variables").GetProperty("source").GetString());
+    Assert.Equal("1", request.RootElement.GetProperty("variables").GetProperty("values")[0].GetString());
+    Assert.Equal(20, request.RootElement.GetProperty("variables").GetProperty("limit").GetInt32());
+    Assert.Contains("moreLikeThis(limit: $limit)", request.RootElement.GetProperty("query").GetString()!);
+}
+
+static async Task DirectCatalogAddAsync()
+{
+    var libraryHandler = new RecordingHandler(_ => JsonResponse("""{"data":{"libraries":[{"id":"library-1","facet":"MOVIE","name":"Movies","slug":"movies","isDefault":true,"qualityProfileId":"profile-1","roots":[{"id":"root-1","path":"/movies","isDefault":true}]}]}}"""));
+    var libraryService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), libraryHandler);
+    var libraries = await libraryService.GetManageableLibrariesAsync("0123456789abcdef0123456789abcdef", "MOVIE", CancellationToken.None);
+    Assert.True(libraries.IsSuccess, libraries.Failure?.Code.ToString());
+    using (var request = JsonDocument.Parse(libraryHandler.Requests.Single().Content!))
+    {
+        Assert.Equal("ScryerManageableLibraries", request.RootElement.GetProperty("operationName").GetString());
+        Assert.Equal("MOVIE", request.RootElement.GetProperty("variables").GetProperty("facet").GetString());
+        Assert.Contains("permission: MANAGE_TITLES", request.RootElement.GetProperty("query").GetString()!);
+    }
+
+    var addHandler = new RecordingHandler(_ => JsonResponse("""{"data":{"addTitle":{"title":{"id":"title-1","name":"Added","libraryId":"library-1","facet":"MOVIE","monitored":true},"metadataHydrationState":"PENDING","reusedExistingTitle":false}}}"""));
+    var addService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), addHandler);
+    var result = await Controller(new CatalogController(addService), Principal("01234567-89ab-cdef-0123-456789abcdef", "false")).AddTitle(new AddTitleDto
+    {
+        LibraryId = "library-1",
+        Facet = "MOVIE",
+        Title = "Added",
+        ExternalIds = [new ExternalIdDto { Source = "tmdb", Value = "42" }],
+        Year = 2026,
+        QualityProfileId = "profile-1",
+        MonitorType = "MONITORED",
+    }, CancellationToken.None);
+    Assert.IsType<OkObjectResult>(result.Result);
+    using var addRequest = JsonDocument.Parse(addHandler.Requests.Single().Content!);
+    Assert.Equal("ScryerAddTitle", addRequest.RootElement.GetProperty("operationName").GetString());
+    Assert.Contains("addTitle(input: $input)", addRequest.RootElement.GetProperty("query").GetString()!);
+    var input = addRequest.RootElement.GetProperty("variables").GetProperty("input");
+    Assert.Equal("library-1", input.GetProperty("libraryId").GetString());
+    Assert.True(input.GetProperty("monitored").GetBoolean());
+    Assert.Equal("tmdb", input.GetProperty("externalIds")[0].GetProperty("source").GetString());
+    Assert.Equal("profile-1", input.GetProperty("options").GetProperty("qualityProfileId").GetString());
 }
 
 static async Task DetachedRevokeJournalAsync()

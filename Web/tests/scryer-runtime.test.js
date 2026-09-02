@@ -9,7 +9,7 @@ const webRoot = path.resolve(__dirname, '..');
 function loadCore(apiClient) {
     const listeners = new Map();
     const window = {
-        ScryerRuntime153: { version: '153.10', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.12', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         ApiClient: apiClient,
         addEventListener(name, listener) { listeners.set(name, listener); },
         removeEventListener(name) { listeners.delete(name); },
@@ -123,10 +123,47 @@ test('relative Scryer image routes resolve from the public origin, not its OAuth
     );
 });
 
-test('anonymous OAuth status has dedicated connected copy', () => {
+test('recent watch seeds preserve Jellyfin history order and resolve episode parents', async () => {
+    const calls = [];
+    const client = {
+        getUrl(pathName) { return 'https://jellyfin.test/' + pathName; },
+        serverAddress() { return 'https://jellyfin.test'; },
+        getCurrentUserId() { return 'alice'; },
+        getCurrentUser() { return Promise.resolve({ Id: 'alice' }); },
+        getItems(userId, options) {
+            calls.push({ userId, options });
+            if (calls.length === 1) return Promise.resolve({ Items: [
+                { Type: 'Episode', SeriesId: 'series-1', SeriesName: 'First Show' },
+                { Type: 'Episode', SeriesId: 'series-1', SeriesName: 'First Show' },
+                { Type: 'Movie', Id: 'movie-1', Name: 'A Movie', ProviderIds: { Tmdb: '42' } },
+                { Type: 'Episode', SeriesId: 'series-2', SeriesName: 'Second Show' }
+            ] });
+            return Promise.resolve({ Items: [
+                { Id: 'series-1', Name: 'First Show', ProviderIds: { Tvdb: '100' } },
+                { Id: 'series-2', Name: 'Second Show', ProviderIds: { Imdb: 'tt200' } }
+            ] });
+        }
+    };
+    const Scryer = loadCore(client);
+    const seeds = await Scryer.getRecentWatchSeeds(3);
+    assert.equal(JSON.stringify(seeds), JSON.stringify([
+        { entityId: 'series-1', title: 'First Show', kind: 'SERIES', providerIds: { tvdb: '100' } },
+        { entityId: 'movie-1', title: 'A Movie', kind: 'MOVIE', providerIds: { tmdb: '42' } },
+        { entityId: 'series-2', title: 'Second Show', kind: 'SERIES', providerIds: { imdb: 'tt200' } }
+    ]));
+    assert.equal(calls[0].options.SortBy, 'DatePlayed');
+    assert.equal(calls[0].options.IncludeItemTypes, 'Movie,Episode');
+    assert.equal(calls[0].options.Filters, 'IsPlayed');
+    assert.equal(calls[1].options.Ids, 'series-1,series-2');
+});
+
+test('connected states render feature content without status or disconnect banners', () => {
     const source = fs.readFileSync(path.join(webRoot, 'scryer-core.js'), 'utf8');
     assert.match(source, /status\.accountLinked === false/);
-    assert.match(source, /Scryer connected as Anonymous\. Account linking is unavailable\./);
+    assert.match(source, /kind === 'connected' \|\| kind === 'anonymous' \|\| kind === 'limited'/);
+    assert.match(source, /container\.innerHTML = '<div class="scryerFeatureBody"><\/div>'/);
+    assert.doesNotMatch(source, /Scryer connected\./);
+    assert.doesNotMatch(source, /disconnect\.textContent/);
 });
 
 test('an unlinked configured user is prompted to connect', () => {
@@ -150,6 +187,7 @@ test('generation gates reject callbacks from a closed or replaced UI operation',
 test('page capability gates distinguish discovery, requests, and view-only pages', () => {
     const Scryer = loadCore();
     assert.equal(Scryer.ui.hasPageCapability('discovery', [{ canView: false, canRequest: true, canManageTitles: false }]), true);
+    assert.equal(Scryer.ui.hasPageCapability('discovery', [{ canView: false, canRequest: false, canManageTitles: true }]), true);
     assert.equal(Scryer.ui.hasPageCapability('requests', [{ canView: true, canRequest: false, canManageTitles: false }]), false);
     assert.equal(Scryer.ui.hasPageCapability('requests', [{ canView: false, canRequest: false, canManageTitles: true }]), true);
     assert.equal(Scryer.ui.hasPageCapability('calendar', [{ canView: false, canRequest: true, canManageTitles: true }]), false);

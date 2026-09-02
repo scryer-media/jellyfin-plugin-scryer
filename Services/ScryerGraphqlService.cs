@@ -20,13 +20,16 @@ public interface IScryerGraphqlService
 {
     Task<ScryerResult<ScryerCapabilitySnapshot>> GetCapabilitySnapshotAsync(string jellyfinUserId, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetRequestLibrariesAsync(string jellyfinUserId, string? facet, CancellationToken cancellationToken);
+    Task<ScryerResult<JsonElement>> GetManageableLibrariesAsync(string jellyfinUserId, string? facet, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetQualityProfilesAsync(string jellyfinUserId, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetDiscoveryHomeCardsAsync(string jellyfinUserId, CancellationToken cancellationToken);
+    Task<ScryerResult<JsonElement>> GetTitleRecommendationsAsync(string jellyfinUserId, string source, string value, int limit, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> SearchMetadataMultiAsync(string jellyfinUserId, string query, int limit, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetDiscoveryItemDetailAsync(string jellyfinUserId, string targetKey, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetMyMediaRequestsAsync(string jellyfinUserId, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetManageableMediaRequestsAsync(string jellyfinUserId, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> SubmitMediaRequestAsync(string jellyfinUserId, JsonElement input, CancellationToken cancellationToken);
+    Task<ScryerResult<JsonElement>> AddTitleAsync(string jellyfinUserId, JsonElement input, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> ApproveMediaRequestAsync(string jellyfinUserId, string requestId, string qualityProfileId, string? monitorType, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> DismissMediaRequestAsync(string jellyfinUserId, string requestId, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> UpdateMyMediaRequestAsync(string jellyfinUserId, JsonElement input, CancellationToken cancellationToken);
@@ -46,17 +49,25 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
     private const int MaximumSearchLength = 256;
     private const int MaximumPageOffset = 10_000;
     private const int MaximumCalendarRangeDays = 62;
+    private static readonly HashSet<string> RecommendationExternalIdSources = new(StringComparer.Ordinal)
+    {
+        "imdb", "tmdb", "tmdb_movie", "tmdb_series", "tmdb_show", "tmdb_tv",
+        "tvdb", "tvdb_movie", "tvdb_series", "tvdb_show",
+    };
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(10);
 
     private const string CapabilityBootstrapQuery = """query ScryerCapabilityBootstrap { me { id username appPermissions libraryPermissions { libraryId permissions } } }""";
     private const string RequestLibrariesQuery = """query ScryerRequestLibraries($facet: MediaFacetValue) { libraries(facet: $facet, permission: REQUEST) { id facet name slug isDefault requestQualityProfileIds requestQualityProfileDefaultId roots { id path isDefault } } }""";
+    private const string ManageableLibrariesQuery = """query ScryerManageableLibraries($facet: MediaFacetValue) { libraries(facet: $facet, permission: MANAGE_TITLES) { id facet name slug isDefault qualityProfileId roots { id path isDefault } } }""";
     private const string QualityProfilesQuery = """query ScryerQualityProfiles { qualityProfileSettings { profiles { id name } } }""";
     private const string DiscoveryHomeCardsQuery = """query ScryerDiscoveryHomeCards { discoveryHomeCards { canViewPersonalized heroItem { id targetKey targetKind displayTitle year posterUrl } publicSections { sectionId title items { id targetKey targetKind displayTitle year posterUrl } } personalizedSections { sectionId title items { id targetKey targetKind displayTitle year posterUrl } } } }""";
+    private const string TitleRecommendationsQuery = """query ScryerTitleRecommendations($source: String!, $values: [String!]!, $limit: Int!) { titlesByExternalIds(source: $source, values: $values) { id name moreLikeThis(limit: $limit) { id targetKey targetKind displayTitle year posterUrl } } }""";
     private const string SearchMetadataMultiQuery = """query ScryerSearchMetadataMulti($query: String!, $limit: Int, $language: String! = "eng") { searchMetadataMulti(query: $query, limit: $limit, language: $language) { movies { tvdbId smgId tmdbId imdbId name slug type year status overview posterUrl language runtimeMinutes sortTitle externalIds { source value } } series { tvdbId smgId tmdbId imdbId name slug type year status overview posterUrl language runtimeMinutes sortTitle externalIds { source value } } anime { tvdbId smgId tmdbId imdbId name slug type year status overview posterUrl language runtimeMinutes sortTitle externalIds { source value } } } }""";
     private const string DiscoveryItemDetailQuery = """query ScryerDiscoveryItemDetail($input: DiscoveryItemDetailInput!) { discoveryItemDetail(input: $input) { targetKey targetKind displayTitle year posterUrl overview rating ratingSources externalRatings { source value score normalized votes url } externalIds { source id } } }""";
     private const string MyMediaRequestsQuery = """query ScryerMyMediaRequests { myMediaRequests { id libraryId facet status identityFingerprint title sortTitle slug posterUrl year overview runtimeMinutes language contentStatus requestedQualityProfileId requestedQualityProfileName requestedMonitorType resolvedByUserId resolvedAt createdTitleId approvedQualityProfileId approvedQualityProfileName externalIds { source value } requesters { userId username avatarUrl } } }""";
     private const string ManageableMediaRequestsQuery = """query ScryerManageableMediaRequests { mediaRequests { id libraryId facet status identityFingerprint title sortTitle slug posterUrl year overview runtimeMinutes language contentStatus requestedQualityProfileId requestedQualityProfileName requestedMonitorType resolvedByUserId resolvedAt createdTitleId approvedQualityProfileId approvedQualityProfileName externalIds { source value } requesters { userId username avatarUrl requestedAt } createdByUserId createdAt updatedAt } }""";
     private const string SubmitMediaRequestMutation = """mutation ScryerSubmitMediaRequest($input: SubmitMediaRequestInput!) { submitMediaRequest(input: $input) { requestId } }""";
+    private const string AddTitleMutation = """mutation ScryerAddTitle($input: AddTitleInput!) { addTitle(input: $input) { title { id name libraryId facet monitored } metadataHydrationState reusedExistingTitle } }""";
     private const string ApproveMediaRequestMutation = """mutation ScryerApproveMediaRequest($input: ApproveMediaRequestInput!) { approveMediaRequest(input: $input) { titleId wantedSearch { queuedCount skippedInProgressCount } searchError } }""";
     private const string DismissMediaRequestMutation = """mutation ScryerDismissMediaRequest($requestId: ID!) { dismissMediaRequest(requestId: $requestId) { requestId } }""";
     private const string UpdateMyMediaRequestMutation = """mutation ScryerUpdateMyMediaRequest($input: UpdateMediaRequestInput!) { updateMyMediaRequest(input: $input) { id libraryId facet status identityFingerprint title requestedQualityProfileId requestedQualityProfileName requestedMonitorType updatedAt } }""";
@@ -101,11 +112,21 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             : ScryerResult<JsonElement>.Fail(libraries.Failure!);
     }
 
+    public Task<ScryerResult<JsonElement>> GetManageableLibrariesAsync(string jellyfinUserId, string? facet, CancellationToken cancellationToken) =>
+        ExecuteOperationAsync(jellyfinUserId, "ScryerManageableLibraries", ManageableLibrariesQuery, new { facet = NormalizeFacet(facet) }, "libraries", cancellationToken);
+
     public Task<ScryerResult<JsonElement>> GetQualityProfilesAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
         ExecuteOperationAsync(jellyfinUserId, "ScryerQualityProfiles", QualityProfilesQuery, new { }, "qualityProfileSettings", cancellationToken);
 
     public Task<ScryerResult<JsonElement>> GetDiscoveryHomeCardsAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
         ExecuteOperationAsync(jellyfinUserId, "ScryerDiscoveryHomeCards", DiscoveryHomeCardsQuery, new { }, "discoveryHomeCards", cancellationToken);
+
+    public Task<ScryerResult<JsonElement>> GetTitleRecommendationsAsync(string jellyfinUserId, string source, string value, int limit, CancellationToken cancellationToken) =>
+        RecommendationExternalIdSources.Contains(source)
+        && IsBoundedIdentifier(value)
+        && limit is >= 1 and <= 30
+            ? ExecuteOperationAsync(jellyfinUserId, "ScryerTitleRecommendations", TitleRecommendationsQuery, new { source, values = new[] { value.Trim() }, limit }, "titlesByExternalIds", cancellationToken)
+            : Task.FromResult(ScryerResult<JsonElement>.Fail(ScryerFailure.InvalidResponse));
 
     public Task<ScryerResult<JsonElement>> SearchMetadataMultiAsync(string jellyfinUserId, string query, int limit, CancellationToken cancellationToken) =>
         string.IsNullOrWhiteSpace(query) || query.Trim().Length > MaximumSearchLength
@@ -126,6 +147,11 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
     public Task<ScryerResult<JsonElement>> SubmitMediaRequestAsync(string jellyfinUserId, JsonElement input, CancellationToken cancellationToken) =>
         input.ValueKind == JsonValueKind.Object
             ? ExecuteOperationAsync(jellyfinUserId, "ScryerSubmitMediaRequest", SubmitMediaRequestMutation, new { input }, "submitMediaRequest", cancellationToken)
+            : Task.FromResult(ScryerResult<JsonElement>.Fail(ScryerFailure.InvalidResponse));
+
+    public Task<ScryerResult<JsonElement>> AddTitleAsync(string jellyfinUserId, JsonElement input, CancellationToken cancellationToken) =>
+        input.ValueKind == JsonValueKind.Object
+            ? ExecuteOperationAsync(jellyfinUserId, "ScryerAddTitle", AddTitleMutation, new { input }, "addTitle", cancellationToken)
             : Task.FromResult(ScryerResult<JsonElement>.Fail(ScryerFailure.InvalidResponse));
 
     public Task<ScryerResult<JsonElement>> ApproveMediaRequestAsync(string jellyfinUserId, string requestId, string qualityProfileId, string? monitorType, CancellationToken cancellationToken) =>

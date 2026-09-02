@@ -17,7 +17,7 @@ function createCoreHarness(apiClient) {
     const diagnostics = [];
     let nextHandle = 1;
     const window = {
-        ScryerRuntime153: { version: '153.10', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.12', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         ScryerStrings: { pages: {}, states: { requestConflict: 'This request conflicts with its current Scryer state.', internalError: 'The Scryer request could not be completed.' } },
         ApiClient: apiClient,
         addEventListener(name, listener) { listeners.set(name, listener); },
@@ -290,7 +290,7 @@ test('disabled feature navigation, API capability gates, and browser credential 
     const runtimeAssets = ['scryer-loader.js', 'scryer-core.js', 'scryer-discovery.js', 'scryer-calendar.js', 'scryer-requests.js', 'scryer-downloads.js'];
 
     assert.match(core, /PAGES = PAGE_DEFINITIONS\.filter\(function \(page\) \{ return features\[page\.feature\] === true; \}\);/);
-    assert.match(core, /if \(pageId === 'discovery'\) return library\.canView \|\| library\.canRequest;/);
+    assert.match(core, /if \(pageId === 'discovery'\) return library\.canView \|\| library\.canRequest \|\| library\.canManageTitles;/);
     assert.match(core, /if \(pageId === 'requests'\) return library\.canRequest \|\| library\.canManageTitles;/);
     assert.match(core, /if \(pageId === 'calendar' \|\| pageId === 'download'\) return library\.canView;/);
     assert.match(core, /event\.stopImmediatePropagation\(\);[\s\S]*?showPage\(page\.id\);[\s\S]*?\}, true\);/);
@@ -331,6 +331,37 @@ test('custom pages use Jellyfin library page spacing below the fixed header', ()
     assert.equal(styles.includes('.scryerPageActive .skinHeader .material-icons.menu:before{content:"\\\\e5d2"!important}'), true);
     assert.equal(styles.includes('.scryerPageActive .skinHeader .material-icons.search:before{content:"\\\\e8b6"!important}'), true);
     assert.doesNotMatch(styles, /[\uE000-\uF8FF]/);
+});
+
+test('discovery prepends at most five watch-history recommendation rails', () => {
+    const discovery = readWebAsset('scryer-discovery.js');
+
+    assert.match(discovery, /Scryer\.getRecentWatchSeeds\(5\)/);
+    assert.match(discovery, /Scryer\/Discovery\/MoreLikeThis\?source=/);
+    assert.match(discovery, /groups\.filter\(function \(group\) \{ return !!group; \}\)\.slice\(0, 5\)/);
+    assert.match(discovery, /results\[0\]\.concat\(results\[1\]\.groups\)/);
+});
+
+test('discovery offers direct catalog adds only through manageable libraries', () => {
+    const discovery = readWebAsset('scryer-discovery.js');
+
+    assert.match(discovery, /Scryer\/Libraries\/Manageable\?facet=/);
+    assert.match(discovery, /apiPost\('Scryer\/Catalog\/Titles'/);
+    assert.match(discovery, /selected && selected\._canManageTitles \? 'Add to Scryer' : 'Request'/);
+    assert.match(discovery, /if \(selected && selected\._canManageTitles\) submitAdd/);
+    assert.match(discovery, /else submitRequest/);
+});
+
+test('discovery cards render as a clean poster wall without button slabs', () => {
+    const styles = readWebAsset('scryer-styles.js');
+    const requests = readWebAsset('scryer-requests.js');
+
+    assert.match(styles, /\.scryerCard\{[^}]*background:transparent!important/);
+    assert.match(styles, /\.scryerCardPoster\{[^}]*aspect-ratio:2\/3/);
+    assert.match(styles, /\.scryerCard:hover \.scryerCardPoster/);
+    assert.equal((styles.match(/'\.scryerRow\{/g) || []).length, 1);
+    assert.match(styles, /\.scryerRequestRow\{/);
+    assert.match(requests, /row\.className = 'scryerRequestRow'/);
 });
 
 test('OAuth finalization failures remain visible instead of falling back to Connect', () => {

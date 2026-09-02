@@ -2,7 +2,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '153.10';
+    var VERSION = '153.12';
     var runtime = window.ScryerRuntime153;
     if (!runtime || runtime.version !== VERSION) throw new Error('Scryer loader must run before core.');
     if (window.Scryer && window.Scryer.version === VERSION && window.Scryer._rfc153Installed) {
@@ -336,6 +336,69 @@
     Scryer.apiPost = apiPost;
     Scryer.apiPut = apiPut;
 
+    function jellyfinItems(response) {
+        return response && (response.Items || response.items) || [];
+    }
+    function jellyfinProviderIds(item) {
+        var raw = item && (item.ProviderIds || item.providerIds) || {};
+        var ids = {};
+        Object.keys(raw).forEach(function (key) {
+            var normalized = key.toLowerCase();
+            if ((normalized === 'tmdb' || normalized === 'tvdb' || normalized === 'imdb') && raw[key] != null && String(raw[key]).trim()) {
+                ids[normalized] = String(raw[key]).trim();
+            }
+        });
+        return ids;
+    }
+    function getRecentWatchSeeds(limit) {
+        var requestedLimit = Math.max(1, Math.min(Number(limit) || 5, 5));
+        return getCurrentJellyfinContext().then(function (context) {
+            if (!context.user || !context.userId || !context.client.getItems) return [];
+            return Promise.resolve(context.client.getItems(context.userId, {
+                SortBy: 'DatePlayed', SortOrder: 'Descending', IncludeItemTypes: 'Movie,Episode',
+                Recursive: true, Fields: 'ProviderIds', Filters: 'IsPlayed',
+                Limit: Math.max(25, requestedLimit * 5), EnableTotalRecordCount: false
+            })).then(function (response) {
+                requireCurrentContext(context, response);
+                var candidates = [];
+                var seen = {};
+                jellyfinItems(response).some(function (item) {
+                    var type = String(item.Type || item.type || '').toLowerCase();
+                    var entityId = type === 'episode' ? item.SeriesId || item.seriesId : item.Id || item.id;
+                    if ((type !== 'movie' && type !== 'episode') || !entityId || seen[entityId]) return false;
+                    seen[entityId] = true;
+                    candidates.push({
+                        entityId: String(entityId),
+                        title: String(type === 'episode' ? item.SeriesName || item.seriesName || item.Name || item.name || 'Series' : item.Name || item.name || 'Movie'),
+                        kind: type === 'episode' ? 'SERIES' : 'MOVIE',
+                        providerIds: type === 'movie' ? jellyfinProviderIds(item) : {}
+                    });
+                    return candidates.length >= requestedLimit * 2;
+                });
+                var seriesIds = candidates.filter(function (candidate) { return candidate.kind === 'SERIES'; }).map(function (candidate) { return candidate.entityId; });
+                if (!seriesIds.length) return candidates;
+                return Promise.resolve(context.client.getItems(context.userId, {
+                    Ids: seriesIds.join(','), Fields: 'ProviderIds', Limit: seriesIds.length, EnableTotalRecordCount: false
+                })).then(function (seriesResponse) {
+                    requireCurrentContext(context, seriesResponse);
+                    var seriesById = {};
+                    jellyfinItems(seriesResponse).forEach(function (item) { seriesById[String(item.Id || item.id)] = item; });
+                    candidates.forEach(function (candidate) {
+                        if (candidate.kind !== 'SERIES' || !seriesById[candidate.entityId]) return;
+                        candidate.providerIds = jellyfinProviderIds(seriesById[candidate.entityId]);
+                        candidate.title = String(seriesById[candidate.entityId].Name || seriesById[candidate.entityId].name || candidate.title);
+                    });
+                    return candidates;
+                });
+            }).then(function (candidates) {
+                return requireCurrentContext(context, candidates.filter(function (candidate) {
+                    return Object.keys(candidate.providerIds).length > 0;
+                }).slice(0, requestedLimit));
+            });
+        });
+    }
+    Scryer.getRecentWatchSeeds = getRecentWatchSeeds;
+
     function getWebConfiguration() {
         return getCurrentJellyfinContext().then(function (context) {
             if (!webConfigPromise || webConfigKey !== context.key) {
@@ -477,7 +540,7 @@
     };
     function hasPageCapability(pageId, libraries) {
         return (libraries || []).some(function (library) {
-            if (pageId === 'discovery') return library.canView || library.canRequest;
+            if (pageId === 'discovery') return library.canView || library.canRequest || library.canManageTitles;
             if (pageId === 'requests') return library.canRequest || library.canManageTitles;
             if (pageId === 'calendar' || pageId === 'download') return library.canView;
             return false;
@@ -520,12 +583,14 @@
     function renderConnectionState(container, kind, scope, page, detail) {
         var messages = {
             unconfigured: Strings.states.notConfigured || 'Scryer is not configured.', connect: Strings.states.notConnected || 'Connect your Scryer account to continue.',
-            connecting: 'Connecting Scryer…', connected: 'Scryer connected.', anonymous: 'Scryer connected as Anonymous. Account linking is unavailable.', limited: 'Scryer connected with limited permissions.',
+            connecting: 'Connecting Scryer…',
             expired: Strings.states.authorizationExpired || 'Your Scryer connection expired. Connect again.', offline: Strings.states.offline || 'Scryer is currently unreachable.',
             incompatible: Strings.states.incompatible || 'This Scryer server is incompatible.'
         };
         var message = escapeHtml(detail || messages[kind] || messages.offline);
-        if (kind === 'connect' || kind === 'expired') {
+        if (kind === 'connected' || kind === 'anonymous' || kind === 'limited') {
+            container.innerHTML = '<div class="scryerFeatureBody"></div>';
+        } else if (kind === 'connect' || kind === 'expired') {
             container.innerHTML = '<div class="scryerConnectCard" role="status" aria-live="polite">' +
                 '<div class="scryerConnectBrands">' +
                     '<img class="scryerConnectLogo scryerConnectScryerLogo" src="/Scryer/Web/scryer-logo.svg" alt="Scryer">' +
@@ -549,17 +614,6 @@
                 startConnection(page.route).catch(scope.guard(function (error) { renderConnectionState(container, 'offline', scope, page, error.message); }));
             });
             actions.appendChild(connect);
-        } else if (kind === 'connected' || kind === 'anonymous' || kind === 'limited') {
-            var disconnect = document.createElement('button');
-            disconnect.type = 'button'; disconnect.className = 'emby-button'; disconnect.textContent = 'Disconnect';
-            scope.on(disconnect, 'click', function () {
-                disconnect.disabled = true;
-                Scryer.disconnect().then(scope.guard(function () { refreshVisiblePage(); }), scope.guard(function (error) {
-                    disconnect.disabled = false;
-                    renderConnectionState(container, 'offline', scope, page, error.message);
-                }));
-            });
-            actions.appendChild(disconnect);
         }
         return container.querySelector('.scryerFeatureBody');
     }
