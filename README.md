@@ -1,91 +1,228 @@
-# Jellyfin Plugin Scryer
+<table align="center">
+  <tr>
+    <td align="center" width="240">
+      <img src="https://raw.githubusercontent.com/scryer-media/scryer/main/apps/scryer-web/public/scryer-logo.svg" alt="Scryer logo" width="180" />
+    </td>
+    <td align="center" width="100">
+      <h1>+</h1>
+    </td>
+    <td align="center" width="240">
+      <img src="https://raw.githubusercontent.com/jellyfin/jellyfin-ux/master/logos/SVG/jellyfin-icon--color-on-light.svg" alt="Jellyfin logo" width="180" />
+    </td>
+  </tr>
+</table>
 
-Scryer is a GPL-3.0-only Jellyfin companion for Scryer. Alpha work follows
-[RFC 153](https://github.com/scryer-media/scryer-docs/blob/main/plans/153-jellyfin-plugin-scryer-alpha-rfc.md).
+<h1 align="center">Scryer for Jellyfin</h1>
 
-## Supported contract
+<p align="center">
+  Scryer-powered discovery, requests, calendar, and download status inside Jellyfin.
+</p>
 
-- **Jellyfin:** 10.11.x web and embedded-web clients. Native TV clients and unrelated
-  third-party UIs are outside Alpha.
-- **Scryer:** 0.19.6, with OAuth Authorization Code + S256 PKCE, rotating refresh-token
-  grants, the separately consented `library jellyfin-link` scope pair, OAuth-bound Jellyfin
-  account linking, and the explicit GraphQL operations recorded in RFC 153.
-- **License:** GPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
+Scryer for Jellyfin adds Scryer features directly to the Jellyfin web interface. Each
+Jellyfin user connects their own Scryer account through OAuth; the plugin does not use a
+shared Scryer identity or ask users for their Jellyfin password.
 
-## Security architecture
+This project is currently Alpha software. Its behavior and security contract are defined
+by [RFC 153](https://github.com/scryer-media/scryer-docs/blob/main/plans/153-jellyfin-plugin-scryer-alpha-rfc.md).
 
-Jellyfin administrator status only controls plugin configuration. It never grants a
-person Scryer media, request, or moderation authority. OAuth stores one protected grant
-per Jellyfin user, while access tokens remain memory-only. Authorization Code + S256 PKCE
-flows are one-time, browser-bound, and expire after ten minutes. The browser receives only
-bounded plugin DTOs and connection state, never Scryer bearer tokens, refresh tokens,
-authorization codes, or PKCE verifiers.
+## What it provides
 
-The inherited shared API-key transport has been removed from normal operation. Every enabled
-feature endpoint resolves the authenticated Jellyfin user's own protected Scryer grant. Do not
-restore a shared server key as a workaround.
+- Discovery and search backed by Scryer's catalog.
+- Movie, series, and anime request workflows governed by Scryer permissions.
+- A calendar of upcoming media.
+- Read-only active-download and download-history views.
+- Per-user OAuth connections with S256 PKCE and rotating refresh grants.
+- Jellyfin theme and custom-CSS compatibility through the retained
+  `Web/scryer-styles.js` runtime layer.
 
-## Administrator setup
+Scryer remains the authority for library visibility, request permissions, approval, and
+title management. Being a Jellyfin administrator only grants access to plugin
+configuration; it does not grant Scryer permissions.
 
-1. Configure the **Internal Scryer URL**, reachable by the Jellyfin server.
-   HTTPS is required unless the URL is loopback. Cleartext HTTP to another private-network
-   address requires the explicit insecure opt-in and exposes OAuth material in transit.
-2. Configure the browser-visible **Public Scryer URL**.
-3. In Scryer, open **Security > OAuth applications** and use **Jellyfin plugin OAuth**.
-   Enter the browser-visible public Jellyfin URL. This standalone setup does not require
-   a Scryer media-server connection or an existing account link. If exactly one eligible
-   Jellyfin connection already has that external URL, Scryer may prefill it as a convenience.
-4. Copy the generated public **Scryer OAuth Client ID** into the plugin. There is no client
-   secret. Configure the same browser-visible **Public Jellyfin URL** in the plugin.
-5. Confirm that Scryer and the plugin display the same exact callback URI:
+## Requirements
+
+- Jellyfin 10.11.x with the bundled Jellyfin web client.
+- Scryer 0.19.7 with manual custom OAuth application registration.
+- Browser-reachable HTTPS URLs for Scryer and Jellyfin. Plain HTTP is accepted only for
+  loopback development; private-network HTTP for the internal Scryer connection requires
+  an explicit insecure opt-in.
+- A separate Scryer account for each person who will use the plugin.
+
+Native television clients and unrelated third-party Jellyfin interfaces are not part of
+the Alpha support target.
+
+## Install the plugin
+
+### From the Jellyfin plugin catalog
+
+In Jellyfin, open **Dashboard > Plugins > Repositories**, add a repository named
+`Scryer`, and use this manifest URL:
+
+```text
+https://raw.githubusercontent.com/scryer-media/jellyfin-plugin-scryer/main/manifest.json
+```
+
+Open **Catalog**, install **Scryer**, and restart Jellyfin. The repository manifest
+describes the currently published packages; unreleased source changes are not included.
+
+### From a release archive or local build
+
+Download the plugin archive from the repository's Releases page and extract its DLL into
+a dedicated Scryer directory beneath Jellyfin's plugin directory, then restart Jellyfin.
+The exact plugin directory is installation-specific; Docker installations normally
+persist it beneath the container's `/config/plugins` mount.
+
+To build the current checkout instead:
+
+```sh
+dotnet build -c Release --no-restore
+```
+
+Copy `bin/Release/net9.0/Jellyfin.Plugin.Scryer.dll` into the same dedicated plugin
+directory and restart Jellyfin. The browser assets are embedded in the DLL; do not copy
+the `Web` directory separately.
+
+## Set up Scryer OAuth
+
+Scryer 0.19.7 uses manual custom OAuth application registration. Its setup does not
+prefill values from a Jellyfin media-server connection and does not automatically link a
+Jellyfin identity to a Scryer account.
+
+The plugin uses a public OAuth client with a client ID and no client secret:
+
+1. Determine the browser-visible public Jellyfin URL. The required callback is exactly:
 
    ```text
    <public-jellyfin-url>/Scryer/Auth/Callback
    ```
 
-   Both configuration surfaces compute and display the normalized exact value. Public URLs
-   must use HTTPS except for loopback development. All URLs must be absolute HTTP(S) URLs
-   without credentials, query strings, or fragments.
-6. Save, then use **Run diagnostics**. It performs bounded, read-only OAuth metadata
-   and GraphQL reachability checks and shows injection status. It never displays
-   credentials, OAuth material, response bodies, or linked-user identities.
+2. In Scryer, open **Settings > Security > OAuth applications** and select
+   **Register an application**.
+3. Enter a descriptive application name such as `Scryer for Jellyfin`.
+4. Enter the exact callback in **HTTPS callback URLs**. Scryer 0.19.7 accepts one exact
+   HTTPS callback URL per line.
+5. Create the application and copy its OAuth client ID into the Jellyfin plugin settings.
 
-OAuth sign-in works with the standalone client. Automatic durable Jellyfin-account linking
-additionally requires exactly one matching Scryer Jellyfin connection that is enabled,
-linking-enabled, and credentialed so Scryer can independently verify the Jellyfin user.
+A Scryer Jellyfin media-server connection is not required for this manual OAuth client
+registration.
 
-## Alpha scope
+## Configure the plugin in Jellyfin
 
-The planned product surface is discovery/search, request submission and management,
-calendar, and read-only downloads, all gated by the connected Scryer account's library
-permissions. Disabled features must ultimately be hidden from navigation and reject
-direct server calls. Direct Radarr/Sonarr integration, global-search injection, queue
-mutation, native-TV support, and browser-held credentials are out of scope.
+Open **Dashboard > Plugins > Scryer** and enter:
+
+1. **Internal Scryer URL** — the address the Jellyfin server can reach. In a macOS or
+   Windows Docker development setup this may resemble
+   `http://host.docker.internal:18480`; enable insecure internal HTTP only on an
+   isolated, trusted development network.
+2. **Public Scryer URL** — the Scryer address users' browsers can reach for OAuth
+   authorization, normally an HTTPS URL such as `https://scryer.example.com`.
+3. **Scryer OAuth Client ID** — the public client ID created in Scryer. This is not a
+   secret.
+4. **Public Jellyfin URL** — the exact browser-visible Jellyfin base URL, normally an
+   HTTPS URL such as `https://jellyfin.example.com`.
+5. Enable the desired Discovery, Requests, Calendar, and Downloads pages.
+6. Save the configuration.
+
+The plugin derives this callback from the public Jellyfin URL:
+
+```text
+<public-jellyfin-url>/Scryer/Auth/Callback
+```
+
+The callback displayed by Jellyfin must exactly match the callback displayed by the
+Scryer OAuth client. URLs must be absolute HTTP(S) URLs without credentials, query
+strings, or fragments.
+
+After saving, select **Run diagnostics**. A healthy result confirms configuration, OAuth
+metadata, the required GraphQL contract, and Jellyfin web injection. Diagnostics are
+read-only and intentionally omit credentials, OAuth material, response bodies, and
+linked-user identities.
+
+## Connect a user
+
+Each person completes these steps independently:
+
+1. Sign in to Jellyfin with their own Jellyfin account.
+2. Open **Scryer > Discover**, **Calendar**, **Requests**, or **Downloads** in the
+   Jellyfin sidebar.
+3. Select **Connect Scryer**.
+4. Sign in to Scryer and approve the requested access.
+5. Return to Jellyfin and confirm that the page reports **Scryer connected**.
+
+The browser never receives the stored Scryer refresh grant. Switching Jellyfin users
+changes the active plugin identity, cache, permissions, and Scryer grant. Do not share a
+Jellyfin login between people who need separate Scryer identities.
+
+## Permissions and feature flags
+
+Pages and actions follow the connected Scryer user's library grants:
+
+- `VIEW` permits visible library data, calendar, and read-only downloads.
+- `REQUEST` permits request submission.
+- `AUTO_APPROVE_REQUESTS` controls automatic approval in Scryer.
+- `MANAGE_TITLES` permits supported request and title-management actions.
+
+Disabling a feature in the plugin removes its capability and causes its direct plugin
+endpoint to reject use. It is not merely a cosmetic navigation setting.
+
+## Troubleshooting
+
+- **Scryer pages do not appear:** confirm the plugin is enabled, restart Jellyfin after
+  installation, use the bundled Jellyfin web client, and run plugin diagnostics.
+- **Callback mismatch:** copy the exact calculated callback; check scheme, hostname,
+  port, path prefix, and reverse-proxy configuration on both sides.
+- **OAuth opens but cannot return:** verify that the browser can reach both public URLs
+  and that the public Jellyfin URL is the same origin the user opened.
+- **Diagnostics cannot reach Scryer:** verify the internal URL from the Jellyfin server
+  or container, not only from the browser. Do not substitute the public URL unless it is
+  also reachable from Jellyfin.
+- **Permission denied or pages are missing:** inspect the connected Scryer user's library
+  grants. Jellyfin administrator status does not add Scryer permissions.
+- **Posters or links use the wrong host:** verify the public Scryer URL separately from
+  the internal server-to-server URL.
+
+## Security model
+
+The inherited shared API-key transport is intentionally not used for normal plugin
+operation. Each feature request resolves the currently authenticated Jellyfin user's own
+protected Scryer grant. Authorization Code with S256 PKCE is one-time, browser-bound, and
+short-lived; access tokens remain memory-only and refresh grants are stored server-side
+in protected form.
+
+Do not restore a shared Scryer API key as a troubleshooting workaround. Do not expose the
+internal Scryer URL, Jellyfin administrator API key, OAuth grants, or plugin data directory
+to untrusted clients.
 
 ## Theme compatibility
 
-`Web/scryer-styles.js` is an intentional compatibility layer and remains part of the
-supported browser runtime. It supplies idempotent, minimal layout rules while relying on
-Jellyfin's own component classes so active themes and server custom CSS continue to shape
-the UI. Browser-runtime refactors must keep this script in the ordered injection path,
-preserve the single `scryer-style` installation guard, and include a materially different
-community theme in visual smoke testing.
+`Web/scryer-styles.js` is an intentional compatibility layer, not a generated artifact.
+It installs minimal, idempotent layout rules while relying on Jellyfin component classes
+so active themes and server custom CSS continue to shape the UI. Browser-runtime changes
+must retain it in the ordered injection path and preserve the single `scryer-style`
+installation guard.
 
-## Validation
+## Development and validation
 
-No dependencies are installed by this repository. With the existing SDK and package
-cache available, run:
+No dependencies are installed by this repository. With the required .NET SDK and existing
+package cache available, build with:
 
 ```sh
 dotnet build --no-restore
+node --test Web/tests/scryer-browser-lifecycle.test.js Web/tests/scryer-runtime.test.js
 ```
 
-Before a real-instance smoke test, verify the Scryer OAuth client registration matches
-the displayed callback URI and use two distinct Jellyfin/Scryer identities. Do not test
-against production without separately authorized environment access.
+Real-instance validation should use multiple Jellyfin users mapped to distinct Scryer
+users with different permissions. Do not test against production without separate,
+explicit environment authorization.
 
-## Third-party source adaptations
+## License and source adaptations
+
+The plugin is GPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
+
+The Jellyfin mark shown above is the official SVG from the
+[Jellyfin UX repository](https://github.com/jellyfin/jellyfin-ux/tree/master/logos/SVG);
+Jellyfin is a trademark of its respective owner.
 
 SeerrFin is an MIT-licensed UX oracle and Jellyfin Enhanced is a GPL-3.0 integration
-oracle. Behavioral study does not need a notice. Before copying or substantially
+oracle. Behavioral study does not require a notice. Before copying or substantially
 adapting source from either project, follow [NOTICE.md](NOTICE.md) in the same change.
