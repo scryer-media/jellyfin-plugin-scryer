@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/scryer-media/jellyfin-plugin-scryer/main/artwork/scryer-plugin.png",
     "versions": [
       {
+        "version": "0.1.7.0",
+        "changelog": "",
+        "targetAbi": "10.11.0.0",
+        "sourceUrl": "https://github.com/scryer-media/jellyfin-plugin-scryer/releases/download/v0.1.7.0/Jellyfin.Plugin.Scryer_0.1.7.0.zip",
+        "checksum": "4cd5df14624f4eb4546681978a52f2c1",
+        "timestamp": "2026-09-02T14:06:09Z"
+      },
+      {
         "version": "0.1.6.0",
         "changelog": "",
         "targetAbi": "10.11.0.0",
