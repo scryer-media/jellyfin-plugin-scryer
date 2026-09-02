@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -38,6 +39,8 @@ public interface IScryerGraphqlService
     Task<ScryerResult<IReadOnlyDictionary<string, string?>>> GetTitlePostersAsync(string jellyfinUserId, IReadOnlyList<string> titleIds, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetDownloadQueuePageAsync(string jellyfinUserId, int offset, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetDownloadHistoryPageAsync(string jellyfinUserId, int offset, CancellationToken cancellationToken);
+    Task<ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>> GetAndroidTvDiscoveryAsync(string jellyfinUserId, IReadOnlyList<ScryerRecommendationSeed> recentSeeds, CancellationToken cancellationToken);
+    Task<ScryerResult<ScryerTvActionResult>> ResolveDefaultTvActionAndExecuteAsync(string jellyfinUserId, string targetKey, string targetKind, CancellationToken cancellationToken);
 }
 
 public sealed class ScryerGraphqlService : IScryerGraphqlService
@@ -234,6 +237,474 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
 
     public Task<ScryerResult<JsonElement>> GetDownloadHistoryPageAsync(string jellyfinUserId, int offset, CancellationToken cancellationToken) =>
         ExecuteOperationAsync(jellyfinUserId, "ScryerDownloadHistoryPage", DownloadHistoryPageQuery, new { offset = Math.Clamp(offset, 0, MaximumPageOffset) }, "downloadHistory", cancellationToken);
+
+    public async Task<ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>> GetAndroidTvDiscoveryAsync(
+        string jellyfinUserId,
+        IReadOnlyList<ScryerRecommendationSeed> recentSeeds,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(recentSeeds);
+        var configuration = _configurationProvider.GetConfiguration();
+        if (!configuration.IsSuccess)
+        {
+            return ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>.Fail(configuration.Failure!);
+        }
+
+        var publicAuthority = configuration.Value!.PublicAuthority;
+        var rails = new List<ScryerTvDiscoveryRail>();
+        var seenTargets = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var seed in recentSeeds.Take(5))
+        {
+            foreach (var lookup in RecommendationLookups(seed))
+            {
+                var recommendation = await GetTitleRecommendationsAsync(jellyfinUserId, lookup.Source, lookup.Value, 20, cancellationToken).ConfigureAwait(false);
+                if (!recommendation.IsSuccess || !TryParseRecommendationItems(recommendation.Value!, out var items))
+                {
+                    continue;
+                }
+
+                if (!TryResolvePosterUrls(items, publicAuthority, out var resolvedItems))
+                {
+                    continue;
+                }
+
+                var unique = Deduplicate(resolvedItems, seenTargets);
+                if (unique.Count > 0)
+                {
+                    rails.Add(new ScryerTvDiscoveryRail($"recent:{rails.Count}:{seed.Title}", $"More like {seed.Title}", unique));
+                    break;
+                }
+            }
+        }
+
+        var home = await GetDiscoveryHomeCardsAsync(jellyfinUserId, cancellationToken).ConfigureAwait(false);
+        if (!home.IsSuccess)
+        {
+            return ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>.Fail(home.Failure!);
+        }
+
+        if (home.Value!.ValueKind != JsonValueKind.Object ||
+            !home.Value.TryGetProperty("canViewPersonalized", out var canViewPersonalized) ||
+            canViewPersonalized.ValueKind is not (JsonValueKind.True or JsonValueKind.False) ||
+            (canViewPersonalized.GetBoolean() && !TryAppendDiscoverySections(home.Value, "personalizedSections", publicAuthority, seenTargets, rails)) ||
+            !TryAppendDiscoverySections(home.Value, "publicSections", publicAuthority, seenTargets, rails))
+        {
+            return ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>.Fail(ScryerFailure.InvalidResponse);
+        }
+
+        return ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>.Success(rails);
+    }
+
+    public async Task<ScryerResult<ScryerTvActionResult>> ResolveDefaultTvActionAndExecuteAsync(
+        string jellyfinUserId,
+        string targetKey,
+        string targetKind,
+        CancellationToken cancellationToken)
+    {
+        var facet = NormalizeFacet(targetKind);
+        if (!IsBoundedIdentifier(targetKey) || facet is null)
+        {
+            return TvActionFailure("This discovery item is no longer valid.");
+        }
+
+        var manageable = await GetManageableLibrariesAsync(jellyfinUserId, facet, cancellationToken).ConfigureAwait(false);
+        if (!manageable.IsSuccess)
+        {
+            return ScryerResult<ScryerTvActionResult>.Fail(manageable.Failure!);
+        }
+
+        if (!TryReadTvLibraries(manageable.Value!, request: false, facet, out var manageableLibraries))
+        {
+            return ScryerResult<ScryerTvActionResult>.Fail(ScryerFailure.InvalidResponse);
+        }
+
+        var useManage = manageableLibraries.Count > 0;
+        IReadOnlyList<ScryerTvLibrary> libraries = manageableLibraries;
+        if (!useManage)
+        {
+            var requestable = await GetRequestLibrariesAsync(jellyfinUserId, facet, cancellationToken).ConfigureAwait(false);
+            if (!requestable.IsSuccess)
+            {
+                return ScryerResult<ScryerTvActionResult>.Fail(requestable.Failure!);
+            }
+
+            if (!TryReadTvLibraries(requestable.Value!, request: true, facet, out libraries))
+            {
+                return ScryerResult<ScryerTvActionResult>.Fail(ScryerFailure.InvalidResponse);
+            }
+        }
+
+        if (libraries.Count == 0)
+        {
+            return ScryerResult<ScryerTvActionResult>.Fail(new ScryerFailure(
+                ScryerFailureCode.PermissionDenied,
+                "Your Scryer account cannot add or request this kind of title."));
+        }
+
+        var defaults = libraries.Where(library => library.IsDefault).ToArray();
+        if (defaults.Length != 1)
+        {
+            return TvActionFailure("Configure exactly one default Scryer library for this media type.");
+        }
+
+        var destination = defaults[0];
+        if (string.IsNullOrWhiteSpace(destination.QualityProfileId))
+        {
+            return TvActionFailure("Configure a default quality profile on the default Scryer library.");
+        }
+
+        var detail = await GetDiscoveryItemDetailAsync(jellyfinUserId, targetKey, cancellationToken).ConfigureAwait(false);
+        if (!detail.IsSuccess)
+        {
+            return ScryerResult<ScryerTvActionResult>.Fail(detail.Failure!);
+        }
+
+        if (!TryReadTvActionDetail(detail.Value!, targetKey, facet, out var actionDetail))
+        {
+            return TvActionFailure("This title has no supported external identifier.");
+        }
+
+        var manageOptions = new Dictionary<string, object?>
+        {
+            ["qualityProfileId"] = destination.QualityProfileId,
+            ["monitorType"] = "MONITORED"
+        };
+        if (facet is not "MOVIE")
+        {
+            manageOptions["useSeasonFolders"] = true;
+        }
+
+        var input = useManage
+            ? JsonSerializer.SerializeToElement(new
+            {
+                name = actionDetail.Title,
+                libraryId = destination.Id,
+                facet,
+                monitored = true,
+                tags = Array.Empty<string>(),
+                options = manageOptions,
+                externalIds = actionDetail.ExternalIds.Select(id => new { source = id.Source, value = id.Value }).ToArray(),
+                year = actionDetail.Year,
+                overview = actionDetail.Overview
+            })
+            : JsonSerializer.SerializeToElement(new
+            {
+                libraryId = destination.Id,
+                facet,
+                title = actionDetail.Title,
+                externalIds = actionDetail.ExternalIds.Select(id => new { source = id.Source, value = id.Value }).ToArray(),
+                year = actionDetail.Year,
+                overview = actionDetail.Overview,
+                requestedQualityProfileId = destination.QualityProfileId,
+                requestedMonitorType = "MONITORED"
+            });
+
+        if (!useManage)
+        {
+            var requested = await SubmitMediaRequestAsync(jellyfinUserId, input, cancellationToken).ConfigureAwait(false);
+            return requested.IsSuccess && requested.Value!.ValueKind == JsonValueKind.Object && TryReadBoundedString(requested.Value!, "requestId", out _)
+                ? ScryerResult<ScryerTvActionResult>.Success(new ScryerTvActionResult(ScryerTvActionKind.Requested, destination.Name))
+                : ScryerResult<ScryerTvActionResult>.Fail(requested.Failure ?? ScryerFailure.InvalidResponse);
+        }
+
+        var added = await AddTitleAsync(jellyfinUserId, input, cancellationToken).ConfigureAwait(false);
+        if (!added.IsSuccess)
+        {
+            return ScryerResult<ScryerTvActionResult>.Fail(added.Failure!);
+        }
+
+        if (added.Value!.ValueKind != JsonValueKind.Object ||
+            !added.Value!.TryGetProperty("reusedExistingTitle", out var reused) ||
+            reused.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+        {
+            return ScryerResult<ScryerTvActionResult>.Fail(ScryerFailure.InvalidResponse);
+        }
+
+        return ScryerResult<ScryerTvActionResult>.Success(new ScryerTvActionResult(
+            reused.GetBoolean() ? ScryerTvActionKind.AlreadyPresent : ScryerTvActionKind.Added,
+            destination.Name));
+    }
+
+    private static IEnumerable<(string Source, string Value)> RecommendationLookups(ScryerRecommendationSeed seed)
+    {
+        var movie = string.Equals(NormalizeFacet(seed.Facet), "MOVIE", StringComparison.Ordinal);
+        foreach (var source in movie
+            ? new[] { "tmdb", "tmdb_movie", "imdb", "tvdb", "tvdb_movie" }
+            : new[] { "tvdb", "tvdb_series", "tvdb_show", "tmdb", "tmdb_series", "tmdb_tv", "tmdb_show", "imdb" })
+        {
+            var baseSource = source.Split('_', 2)[0];
+            var value = seed.ProviderIds.FirstOrDefault(pair => string.Equals(pair.Key, baseSource, StringComparison.OrdinalIgnoreCase)).Value;
+            if (IsBoundedIdentifier(value))
+            {
+                yield return (source, value.Trim());
+            }
+        }
+    }
+
+    private static bool TryParseRecommendationItems(JsonElement titles, out IReadOnlyList<ScryerTvDiscoveryItem> items)
+    {
+        items = Array.Empty<ScryerTvDiscoveryItem>();
+        if (titles.ValueKind != JsonValueKind.Array || titles.GetArrayLength() > 8)
+        {
+            return false;
+        }
+
+        foreach (var title in titles.EnumerateArray())
+        {
+            if (title.ValueKind != JsonValueKind.Object || !title.TryGetProperty("moreLikeThis", out var recommendations))
+            {
+                return false;
+            }
+
+            if (TryReadDiscoveryItems(recommendations, out items) && items.Count > 0)
+            {
+                return true;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool TryAppendDiscoverySections(
+        JsonElement home,
+        string propertyName,
+        Uri publicAuthority,
+        HashSet<string> seenTargets,
+        List<ScryerTvDiscoveryRail> rails)
+    {
+        if (home.ValueKind != JsonValueKind.Object || !home.TryGetProperty(propertyName, out var sections) ||
+            sections.ValueKind != JsonValueKind.Array || sections.GetArrayLength() > 64)
+        {
+            return false;
+        }
+
+        foreach (var section in sections.EnumerateArray())
+        {
+            if (section.ValueKind != JsonValueKind.Object ||
+                !TryReadBoundedString(section, "sectionId", out var sectionId) ||
+                !TryReadBoundedString(section, "title", out var title) ||
+                !section.TryGetProperty("items", out var sectionItems) ||
+                !TryReadDiscoveryItems(sectionItems, out var items))
+            {
+                return false;
+            }
+
+            if (!TryResolvePosterUrls(items, publicAuthority, out var resolvedItems))
+            {
+                return false;
+            }
+
+            var unique = Deduplicate(resolvedItems, seenTargets);
+            if (unique.Count > 0)
+            {
+                rails.Add(new ScryerTvDiscoveryRail($"{propertyName}:{sectionId}", title, unique));
+            }
+        }
+
+        return true;
+    }
+
+    private static bool TryReadDiscoveryItems(JsonElement value, out IReadOnlyList<ScryerTvDiscoveryItem> items)
+    {
+        items = Array.Empty<ScryerTvDiscoveryItem>();
+        if (value.ValueKind != JsonValueKind.Array || value.GetArrayLength() > 30)
+        {
+            return false;
+        }
+
+        var parsed = new List<ScryerTvDiscoveryItem>();
+        foreach (var item in value.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object ||
+                !TryReadBoundedString(item, "targetKey", out var targetKey) ||
+                !TryReadBoundedString(item, "targetKind", out var targetKind) ||
+                NormalizeFacet(targetKind) is null ||
+                !TryReadBoundedString(item, "displayTitle", out var displayTitle))
+            {
+                return false;
+            }
+
+            int? year = null;
+            if (item.TryGetProperty("year", out var yearElement) && yearElement.ValueKind != JsonValueKind.Null)
+            {
+                if (yearElement.ValueKind != JsonValueKind.Number || !yearElement.TryGetInt32(out var parsedYear) || parsedYear is < 1800 or > 2100)
+                {
+                    return false;
+                }
+
+                year = parsedYear;
+            }
+
+            string? posterUrl = null;
+            if (item.TryGetProperty("posterUrl", out var posterElement) && posterElement.ValueKind != JsonValueKind.Null)
+            {
+                posterUrl = posterElement.ValueKind == JsonValueKind.String ? posterElement.GetString()?.Trim() : null;
+                if (string.IsNullOrEmpty(posterUrl) || posterUrl.Length > 4096 || posterUrl.StartsWith("//", StringComparison.Ordinal) ||
+                    (!posterUrl.StartsWith("/", StringComparison.Ordinal) &&
+                     (!Uri.TryCreate(posterUrl, UriKind.Absolute, out var posterUri) ||
+                      (posterUri.Scheme != Uri.UriSchemeHttps && posterUri.Scheme != Uri.UriSchemeHttp))))
+                {
+                    return false;
+                }
+            }
+
+            parsed.Add(new ScryerTvDiscoveryItem(targetKey, NormalizeFacet(targetKind)!, displayTitle, year, posterUrl, null));
+        }
+
+        items = parsed;
+        return true;
+    }
+
+    private static IReadOnlyList<ScryerTvDiscoveryItem> Deduplicate(
+        IReadOnlyList<ScryerTvDiscoveryItem> items,
+        HashSet<string> seenTargets)
+    {
+        var unique = new List<ScryerTvDiscoveryItem>(items.Count);
+        foreach (var item in items)
+        {
+            if (seenTargets.Add(item.TargetKey))
+            {
+                unique.Add(item);
+            }
+        }
+
+        return unique;
+    }
+
+    private static bool TryResolvePosterUrls(
+        IReadOnlyList<ScryerTvDiscoveryItem> items,
+        Uri publicAuthority,
+        out IReadOnlyList<ScryerTvDiscoveryItem> resolved)
+    {
+        var result = new List<ScryerTvDiscoveryItem>(items.Count);
+        foreach (var item in items)
+        {
+            if (item.PosterUrl is null)
+            {
+                result.Add(item);
+                continue;
+            }
+
+            if (!Uri.TryCreate(publicAuthority, item.PosterUrl, out var posterUri) ||
+                (posterUri.Scheme != Uri.UriSchemeHttps && posterUri.Scheme != Uri.UriSchemeHttp) ||
+                !string.IsNullOrEmpty(posterUri.UserInfo))
+            {
+                resolved = Array.Empty<ScryerTvDiscoveryItem>();
+                return false;
+            }
+
+            result.Add(item with { PosterUrl = posterUri.AbsoluteUri });
+        }
+
+        resolved = result;
+        return true;
+    }
+
+    private static bool TryReadTvLibraries(JsonElement value, bool request, string expectedFacet, out IReadOnlyList<ScryerTvLibrary> libraries)
+    {
+        libraries = Array.Empty<ScryerTvLibrary>();
+        if (value.ValueKind != JsonValueKind.Array || value.GetArrayLength() > MaximumLibraryGrants)
+        {
+            return false;
+        }
+
+        var parsed = new List<ScryerTvLibrary>();
+        foreach (var library in value.EnumerateArray())
+        {
+            if (library.ValueKind != JsonValueKind.Object ||
+                !TryReadBoundedString(library, "id", out var id) ||
+                !TryReadBoundedString(library, "name", out var name) ||
+                !TryReadBoundedString(library, "facet", out var facet) ||
+                !string.Equals(NormalizeFacet(facet), expectedFacet, StringComparison.Ordinal) ||
+                !library.TryGetProperty("isDefault", out var isDefault) ||
+                isDefault.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            {
+                return false;
+            }
+
+            var profileProperty = request ? "requestQualityProfileDefaultId" : "qualityProfileId";
+            string? profileId = null;
+            if (library.TryGetProperty(profileProperty, out var profile) && profile.ValueKind != JsonValueKind.Null)
+            {
+                profileId = profile.ValueKind == JsonValueKind.String ? profile.GetString()?.Trim() : null;
+                if (!IsBoundedIdentifier(profileId ?? string.Empty))
+                {
+                    return false;
+                }
+            }
+
+            parsed.Add(new ScryerTvLibrary(id, name, isDefault.GetBoolean(), profileId));
+        }
+
+        libraries = parsed;
+        return true;
+    }
+
+    private static bool TryReadTvActionDetail(JsonElement value, string expectedTargetKey, string expectedFacet, out ScryerTvActionDetail detail)
+    {
+        detail = default!;
+        if (value.ValueKind != JsonValueKind.Object ||
+            !TryReadBoundedString(value, "targetKey", out var targetKey) ||
+            !string.Equals(targetKey, expectedTargetKey.Trim(), StringComparison.Ordinal) ||
+            !TryReadBoundedString(value, "targetKind", out var targetKind) ||
+            !string.Equals(NormalizeFacet(targetKind), expectedFacet, StringComparison.Ordinal) ||
+            !TryReadBoundedString(value, "displayTitle", out var title) ||
+            !value.TryGetProperty("externalIds", out var externalIds) ||
+            externalIds.ValueKind != JsonValueKind.Array || externalIds.GetArrayLength() is < 1 or > 16)
+        {
+            return false;
+        }
+
+        var ids = new List<ScryerTvExternalId>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var externalId in externalIds.EnumerateArray())
+        {
+            if (externalId.ValueKind != JsonValueKind.Object ||
+                !TryReadBoundedString(externalId, "source", out var source) || source.Length > 64 ||
+                !TryReadBoundedString(externalId, "id", out var id))
+            {
+                return false;
+            }
+
+            source = source.ToLowerInvariant();
+            if (seen.Add(source + "\u001f" + id))
+            {
+                ids.Add(new ScryerTvExternalId(source, id));
+            }
+        }
+
+        int? year = null;
+        if (value.TryGetProperty("year", out var yearElement) && yearElement.ValueKind != JsonValueKind.Null)
+        {
+            if (yearElement.ValueKind != JsonValueKind.Number || !yearElement.TryGetInt32(out var parsedYear) || parsedYear is < 1800 or > 2100)
+            {
+                return false;
+            }
+
+            year = parsedYear;
+        }
+
+        string? overview = null;
+        if (value.TryGetProperty("overview", out var overviewElement) && overviewElement.ValueKind != JsonValueKind.Null)
+        {
+            overview = overviewElement.ValueKind == JsonValueKind.String ? overviewElement.GetString()?.Trim() : null;
+            if (overview is null || overview.Length > 8192)
+            {
+                return false;
+            }
+        }
+
+        detail = new ScryerTvActionDetail(title, year, overview, ids);
+        return true;
+    }
+
+    private static ScryerResult<ScryerTvActionResult> TvActionFailure(string message) =>
+        ScryerResult<ScryerTvActionResult>.Fail(new ScryerFailure(ScryerFailureCode.InvalidResponse, message));
+
+    private sealed record ScryerTvLibrary(string Id, string Name, bool IsDefault, string? QualityProfileId);
+    private sealed record ScryerTvExternalId(string Source, string Value);
+    private sealed record ScryerTvActionDetail(string Title, int? Year, string? Overview, IReadOnlyList<ScryerTvExternalId> ExternalIds);
 
     private Task<ScryerResult<JsonElement>> ExecuteIdentifierMutationAsync(string jellyfinUserId, string operationName, string document, string rootField, string requestId, CancellationToken cancellationToken) =>
         IsBoundedIdentifier(requestId)

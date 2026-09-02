@@ -5,12 +5,25 @@ using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Plugin.Scryer;
+using Jellyfin.Plugin.Scryer.AndroidTv;
 using Jellyfin.Plugin.Scryer.Api;
 using Jellyfin.Plugin.Scryer.Configuration;
 using Jellyfin.Plugin.Scryer.OAuth;
 using Jellyfin.Plugin.Scryer.Services;
 using Jellyfin.Plugin.Scryer.WebInjection;
 using MediaBrowser.Common.Configuration;
+using MediaBrowser.Controller;
+using MediaBrowser.Controller.Channels;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.TV;
+using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.Session;
+using MediaBrowser.Model.Channels;
+using MediaBrowser.Model.Drawing;
+using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.Session;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -18,6 +31,8 @@ using Microsoft.AspNetCore.Mvc.Abstractions;
 using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 
 var tests = new (string Name, Func<Task> Run)[]
 {
@@ -37,6 +52,11 @@ var tests = new (string Name, Func<Task> Run)[]
     ("watch-history recommendations use fixed bounded GraphQL", TitleRecommendationsAsync),
     ("manageable libraries and direct title adds use fixed GraphQL", DirectCatalogAddAsync),
     ("calendar title posters use fixed bounded GraphQL batches", CalendarTitlePostersAsync),
+    ("Android TV discovery rails are typed, ordered, and globally deduplicated", AndroidTvDiscoveryAsync),
+    ("Android TV default actions prefer direct add and support request-only users", AndroidTvActionsAsync),
+    ("Android TV channel uses isolated stable IDs, hourly cache keys, and non-playable stubs", AndroidTvChannelAsync),
+    ("Android TV action journal is durable, bounded, and isolated by Jellyfin user", AndroidTvActionJournalAsync),
+    ("Android TV favorite worker retains success, rolls back failure, and suppresses duplicates", AndroidTvFavoriteWorkerAsync),
     ("detached revoke journal survives restart discovery, promotion, and cleanup", DetachedRevokeJournalAsync),
     ("retiring a detached issued family preserves the current family", DetachedRetirementPreservesCurrentAsync),
     ("detached revoke deletion failure retains its tombstone", DetachedDeletionFailureAsync),
@@ -433,6 +453,265 @@ static async Task CalendarTitlePostersAsync()
     Assert.Equal("title-2", request.RootElement.GetProperty("variables").GetProperty("id1").GetString());
     Assert.Equal("title-1", request.RootElement.GetProperty("variables").GetProperty("id2").GetString());
     Assert.Contains("t15: title(id: $id15)", request.RootElement.GetProperty("query").GetString()!);
+}
+
+static async Task AndroidTvDiscoveryAsync()
+{
+    var responses = new Queue<string>(new[]
+    {
+        """{"data":{"titlesByExternalIds":[{"id":"seed","name":"Watched","moreLikeThis":[{"id":"one","targetKey":"tmdb:movie:1","targetKind":"MOVIE","displayTitle":"First","year":2026,"posterUrl":"https://scryer.example.test/first.avif"},{"id":"duplicate","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Duplicate","year":2025,"posterUrl":null}]}]}}""",
+        """{"data":{"discoveryHomeCards":{"canViewPersonalized":true,"heroItem":null,"publicSections":[{"sectionId":"public","title":"Public","items":[{"id":"duplicate","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Duplicate","year":2025,"posterUrl":null},{"id":"three","targetKey":"tvdb:series:3","targetKind":"SERIES","displayTitle":"Third","year":2024,"posterUrl":null}]}],"personalizedSections":[{"sectionId":"personal","title":"For You","items":[{"id":"four","targetKey":"tmdb:movie:4","targetKind":"MOVIE","displayTitle":"Fourth","year":2023,"posterUrl":"/images/four.avif"}]}]}}}"""
+    });
+    var handler = new RecordingHandler(_ => JsonResponse(responses.Dequeue()));
+    var service = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), handler);
+    var seeds = new[]
+    {
+        new ScryerRecommendationSeed("Watched", "MOVIE", new Dictionary<string, string> { ["tmdb"] = "99" })
+    };
+
+    var result = await service.GetAndroidTvDiscoveryAsync("0123456789abcdef0123456789abcdef", seeds, CancellationToken.None);
+
+    Assert.True(result.IsSuccess, result.Failure?.Message);
+    Assert.True(result.Value!.Select(rail => rail.Title).SequenceEqual(new[] { "More like Watched", "For You", "Public" }));
+    Assert.True(result.Value!.SelectMany(rail => rail.Items).Select(item => item.TargetKey)
+        .SequenceEqual(new[] { "tmdb:movie:1", "tmdb:movie:2", "tmdb:movie:4", "tvdb:series:3" }));
+    Assert.Equal("https://scryer.example.test/images/four.avif", result.Value![1].Items[0].PosterUrl);
+    Assert.Equal(2, handler.Requests.Count);
+}
+
+static async Task AndroidTvActionsAsync()
+{
+    const string userId = "0123456789abcdef0123456789abcdef";
+    var manageResponses = new Queue<string>(new[]
+    {
+        """{"data":{"libraries":[{"id":"movies","facet":"MOVIE","name":"Movies","slug":"movies","isDefault":true,"qualityProfileId":"profile-hd","roots":[]}]}}""",
+        """{"data":{"discoveryItemDetail":{"targetKey":"tmdb:movie:42","targetKind":"MOVIE","displayTitle":"Answer","year":2026,"posterUrl":null,"overview":"Overview","rating":null,"ratingSources":[],"externalRatings":[],"externalIds":[{"source":"tmdb","id":"42"}]}}}""",
+        """{"data":{"addTitle":{"title":{"id":"title","name":"Answer","libraryId":"movies","facet":"MOVIE","monitored":true},"metadataHydrationState":"READY","reusedExistingTitle":false}}}"""
+    });
+    var manageHandler = new RecordingHandler(_ => JsonResponse(manageResponses.Dequeue()));
+    var manageService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), manageHandler);
+    var managed = await manageService.ResolveDefaultTvActionAndExecuteAsync(userId, "tmdb:movie:42", "MOVIE", CancellationToken.None);
+    Assert.True(managed.IsSuccess, managed.Failure?.Message);
+    Assert.Equal(ScryerTvActionKind.Added, managed.Value!.Kind);
+    Assert.Equal("Movies", managed.Value.LibraryName);
+    using (var addRequest = JsonDocument.Parse(manageHandler.Requests[2].Content!))
+    {
+        var input = addRequest.RootElement.GetProperty("variables").GetProperty("input");
+        Assert.Equal("Answer", input.GetProperty("name").GetString());
+        Assert.True(input.GetProperty("monitored").GetBoolean());
+        Assert.Equal("MONITORED", input.GetProperty("options").GetProperty("monitorType").GetString());
+        Assert.Equal("profile-hd", input.GetProperty("options").GetProperty("qualityProfileId").GetString());
+    }
+
+    var requestResponses = new Queue<string>(new[]
+    {
+        """{"data":{"libraries":[]}}""",
+        """{"data":{"libraries":[{"id":"shows","facet":"SERIES","name":"Shows","slug":"shows","isDefault":true,"requestQualityProfileIds":["profile-tv"],"requestQualityProfileDefaultId":"profile-tv","roots":[]}]}}""",
+        """{"data":{"discoveryItemDetail":{"targetKey":"tvdb:series:7","targetKind":"SERIES","displayTitle":"Seven","year":2024,"posterUrl":null,"overview":null,"rating":null,"ratingSources":[],"externalRatings":[],"externalIds":[{"source":"tvdb","id":"7"}]}}}""",
+        """{"data":{"submitMediaRequest":{"requestId":"request-1"}}}"""
+    });
+    var requestHandler = new RecordingHandler(_ => JsonResponse(requestResponses.Dequeue()));
+    var requestService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), requestHandler);
+    var requested = await requestService.ResolveDefaultTvActionAndExecuteAsync(userId, "tvdb:series:7", "SERIES", CancellationToken.None);
+    Assert.True(requested.IsSuccess, requested.Failure?.Message);
+    Assert.Equal(ScryerTvActionKind.Requested, requested.Value!.Kind);
+    using (var request = JsonDocument.Parse(requestHandler.Requests[3].Content!))
+    {
+        var input = request.RootElement.GetProperty("variables").GetProperty("input");
+        Assert.Equal("MONITORED", input.GetProperty("requestedMonitorType").GetString());
+        Assert.Equal("profile-tv", input.GetProperty("requestedQualityProfileId").GetString());
+    }
+
+    var ambiguousHandler = new RecordingHandler(_ => JsonResponse("""{"data":{"libraries":[{"id":"one","facet":"MOVIE","name":"One","slug":"one","isDefault":true,"qualityProfileId":"p1","roots":[]},{"id":"two","facet":"MOVIE","name":"Two","slug":"two","isDefault":true,"qualityProfileId":"p2","roots":[]}]}}"""));
+    var ambiguousService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), ambiguousHandler);
+    var ambiguous = await ambiguousService.ResolveDefaultTvActionAndExecuteAsync(userId, "tmdb:movie:42", "MOVIE", CancellationToken.None);
+    Assert.False(ambiguous.IsSuccess);
+    Assert.Equal("Configure exactly one default Scryer library for this media type.", ambiguous.Failure!.Message);
+    Assert.Equal(1, ambiguousHandler.Requests.Count);
+}
+
+static async Task AndroidTvChannelAsync()
+{
+    const string userId = "0123456789abcdef0123456789abcdef";
+    var handler = new RecordingHandler(_ => JsonResponse("""{"data":{"discoveryHomeCards":{"canViewPersonalized":true,"heroItem":null,"publicSections":[],"personalizedSections":[{"sectionId":"personal","title":"For You","items":[{"id":"one","targetKey":"tmdb:movie:1","targetKind":"MOVIE","displayTitle":"First","year":2026,"posterUrl":"https://scryer.example.test/first.avif"}]}]}}}"""));
+    var graphql = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), handler);
+    var time = new ManualTimeProvider(new DateTimeOffset(2026, 9, 2, 12, 15, 0, TimeSpan.Zero));
+    var channel = new ScryerDiscoveryChannel(
+        new TokenSession(),
+        graphql,
+        InterfaceProxy.Create<ILibraryManager>(),
+        InterfaceProxy.Create<IUserManager>(),
+        time);
+    var query = new InternalChannelItemQuery { UserId = Guid.ParseExact(userId, "N") };
+
+    var cacheKey = channel.GetCacheKey(userId);
+    time.Advance(TimeSpan.FromMinutes(30));
+    Assert.Equal(cacheKey, channel.GetCacheKey(userId));
+    time.Advance(TimeSpan.FromMinutes(30));
+    Assert.False(string.Equals(cacheKey, channel.GetCacheKey(userId), StringComparison.Ordinal));
+    Assert.False(string.Equals(
+        ScryerDiscoveryChannel.StableId(userId, "title", "tmdb:movie:1"),
+        ScryerDiscoveryChannel.StableId("11111111111111111111111111111111", "title", "tmdb:movie:1"),
+        StringComparison.Ordinal));
+
+    var root = await channel.GetChannelItems(query, CancellationToken.None);
+    Assert.Equal(1, root.TotalRecordCount);
+    Assert.Equal(ChannelItemType.Folder, root.Items[0].Type);
+    query.FolderId = root.Items[0].Id;
+    var titles = await channel.GetChannelItems(query, CancellationToken.None);
+    Assert.Equal(1, titles.TotalRecordCount);
+    var title = titles.Items[0];
+    Assert.Equal(ChannelItemType.Folder, title.Type);
+    Assert.Equal(ChannelFolderType.Series, title.FolderType);
+    Assert.Equal("tmdb:movie:1", title.ProviderIds[ScryerDiscoveryChannel.TargetProviderId]);
+    Assert.Equal("MOVIE", title.ProviderIds[ScryerDiscoveryChannel.KindProviderId]);
+    Assert.Equal("https://scryer.example.test/first.avif", title.ImageUrl);
+    var channelImage = await channel.GetChannelImage(ImageType.Primary, CancellationToken.None);
+    Assert.True(channelImage.HasImage);
+    Assert.Equal(ImageFormat.Png, channelImage.Format);
+    Assert.True(channelImage.Stream is not null);
+    channelImage.Stream?.Dispose();
+
+    var services = new ServiceCollection();
+    new PluginServiceRegistrator().RegisterServices(services, InterfaceProxy.Create<IServerApplicationHost>());
+    Assert.True(services.Any(descriptor => descriptor.ServiceType == typeof(IChannel)));
+
+    var unlinked = new ScryerDiscoveryChannel(
+        new UnlinkedSession(),
+        graphql,
+        InterfaceProxy.Create<ILibraryManager>(),
+        InterfaceProxy.Create<IUserManager>(),
+        time);
+    var instruction = await unlinked.GetChannelItems(new InternalChannelItemQuery { UserId = Guid.ParseExact(userId, "N") }, CancellationToken.None);
+    Assert.Equal("Connect Scryer in Jellyfin Web", instruction.Items.Single().Name);
+    Assert.Equal(0, instruction.Items.Single().ProviderIds.Count);
+}
+
+static async Task AndroidTvActionJournalAsync()
+{
+    const string userOne = "0123456789abcdef0123456789abcdef";
+    const string userTwo = "11111111111111111111111111111111";
+    var directory = Path.Combine(Path.GetTempPath(), "scryer-tv-journal-selftest-" + Guid.NewGuid().ToString("N"));
+    var path = Path.Combine(directory, "journal.json");
+    try
+    {
+        var time = new ManualTimeProvider(new DateTimeOffset(2026, 9, 2, 12, 0, 0, TimeSpan.Zero));
+        var journal = new ScryerTvActionJournal(path, time);
+        var first = new ScryerTvJournalEntry(userOne, "tmdb:movie:1", "MOVIE", Guid.NewGuid(), ScryerTvJournalState.Pending, time.GetUtcNow());
+        Assert.Equal(ScryerTvJournalBeginResult.Started, await journal.BeginAsync(first, CancellationToken.None));
+        Assert.Equal(ScryerTvJournalBeginResult.Pending, await journal.BeginAsync(first, CancellationToken.None));
+        Assert.True(await journal.CompleteAsync(userOne, first.TargetKey, CancellationToken.None));
+
+        var restarted = new ScryerTvActionJournal(path, time);
+        Assert.Equal(ScryerTvJournalBeginResult.Completed, await restarted.BeginAsync(first, CancellationToken.None));
+        Assert.True(await restarted.RearmAsync(userOne, first.TargetKey, CancellationToken.None));
+        Assert.Equal(ScryerTvJournalBeginResult.Started, await restarted.BeginAsync(first, CancellationToken.None));
+
+        var second = first with { JellyfinUserId = userTwo, JellyfinItemId = Guid.NewGuid() };
+        Assert.Equal(ScryerTvJournalBeginResult.Started, await restarted.BeginAsync(second, CancellationToken.None));
+        var pending = await new ScryerTvActionJournal(path, time).GetPendingAsync(CancellationToken.None);
+        Assert.Equal(2, pending.Count);
+        Assert.True(pending.Select(entry => entry.JellyfinUserId).OrderBy(value => value).SequenceEqual(new[] { userOne, userTwo }));
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+    }
+}
+
+static async Task AndroidTvFavoriteWorkerAsync()
+{
+    var userId = Guid.ParseExact("0123456789abcdef0123456789abcdef", "N");
+    var user = new User("tv-user", "test-auth", "test-reset") { Id = userId };
+    var successItem = TvChannelItem(Guid.NewGuid(), "tmdb:movie:42", "MOVIE");
+    var failureItem = TvChannelItem(Guid.NewGuid(), "tmdb:movie:43", "MOVIE");
+    var userDataManager = UserDataManagerHarness.Create();
+    var libraryManager = LibraryManagerHarness.Create(successItem, failureItem);
+    var userManager = UserManagerHarness.Create(user);
+    var sessionManager = SessionManagerHarness.Create();
+    var responses = new Queue<string>(new[]
+    {
+        """{"data":{"libraries":[{"id":"movies","facet":"MOVIE","name":"Movies","slug":"movies","isDefault":true,"qualityProfileId":"profile-hd","roots":[]}]}}""",
+        """{"data":{"discoveryItemDetail":{"targetKey":"tmdb:movie:42","targetKind":"MOVIE","displayTitle":"Answer","year":2026,"posterUrl":null,"overview":null,"rating":null,"ratingSources":[],"externalRatings":[],"externalIds":[{"source":"tmdb","id":"42"}]}}}""",
+        """{"data":{"addTitle":{"title":{"id":"title","name":"Answer","libraryId":"movies","facet":"MOVIE","monitored":true},"metadataHydrationState":"READY","reusedExistingTitle":false}}}""",
+        """{"data":{"libraries":[{"id":"one","facet":"MOVIE","name":"One","slug":"one","isDefault":true,"qualityProfileId":"p1","roots":[]},{"id":"two","facet":"MOVIE","name":"Two","slug":"two","isDefault":true,"qualityProfileId":"p2","roots":[]}]}}"""
+    });
+    var handler = new RecordingHandler(_ => JsonResponse(responses.Dequeue()));
+    var graphql = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), handler);
+    var directory = Path.Combine(Path.GetTempPath(), "scryer-tv-worker-selftest-" + Guid.NewGuid().ToString("N"));
+    var journalPath = Path.Combine(directory, "journal.json");
+    var initialJournal = new ScryerTvActionJournal(journalPath, TimeProvider.System);
+    userDataManager.Get(successItem).IsFavorite = true;
+    Assert.Equal(
+        ScryerTvJournalBeginResult.Started,
+        await initialJournal.BeginAsync(new ScryerTvJournalEntry(
+            userId.ToString("N"),
+            "tmdb:movie:42",
+            "MOVIE",
+            successItem.Id,
+            ScryerTvJournalState.Pending,
+            DateTimeOffset.UtcNow), CancellationToken.None));
+    var journal = new ScryerTvActionJournal(journalPath, TimeProvider.System);
+    var worker = new ScryerTvFavoriteService(
+        userDataManager.Contract,
+        userManager.Contract,
+        libraryManager.Contract,
+        sessionManager.Contract,
+        graphql,
+        journal,
+        NullLogger<ScryerTvFavoriteService>.Instance);
+
+    try
+    {
+        await worker.StartAsync(CancellationToken.None);
+        await WaitUntilAsync(() => sessionManager.Messages.Count == 1);
+        userDataManager.Raise(userId, successItem, isFavorite: true);
+        userDataManager.Raise(userId, successItem, isFavorite: true);
+        await Task.Delay(50);
+        Assert.True(userDataManager.Get(successItem).IsFavorite);
+        Assert.Equal(3, handler.Requests.Count);
+        Assert.Equal("Added to Movies.", sessionManager.Messages.Single().Arguments["Text"]);
+
+        userDataManager.Raise(userId, successItem, isFavorite: false);
+        await Task.Delay(50);
+        var rearmed = await journal.BeginAsync(new ScryerTvJournalEntry(
+            userId.ToString("N"), "tmdb:movie:42", "MOVIE", successItem.Id,
+            ScryerTvJournalState.Pending, DateTimeOffset.UtcNow), CancellationToken.None);
+        Assert.Equal(ScryerTvJournalBeginResult.Started, rearmed);
+        Assert.True(await journal.AbandonAsync(userId.ToString("N"), "tmdb:movie:42", CancellationToken.None));
+
+        userDataManager.Raise(userId, failureItem, isFavorite: true);
+        await WaitUntilAsync(() => sessionManager.Messages.Count == 2 && !userDataManager.Get(failureItem).IsFavorite);
+        Assert.Equal(4, handler.Requests.Count);
+        Assert.Equal("Configure exactly one default Scryer library for this media type.", sessionManager.Messages[1].Arguments["Text"]);
+    }
+    finally
+    {
+        await worker.StopAsync(CancellationToken.None);
+        worker.Dispose();
+        if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+    }
+}
+
+static Series TvChannelItem(Guid id, string targetKey, string targetKind) => new()
+{
+    Id = id,
+    ChannelId = Guid.NewGuid(),
+    Name = targetKey,
+    ProviderIds = new Dictionary<string, string>
+    {
+        [ScryerDiscoveryChannel.TargetProviderId] = targetKey,
+        [ScryerDiscoveryChannel.KindProviderId] = targetKind
+    }
+};
+
+static async Task WaitUntilAsync(Func<bool> predicate)
+{
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+    while (!predicate())
+    {
+        await Task.Delay(10, timeout.Token);
+    }
 }
 
 static async Task DetachedRevokeJournalAsync()
@@ -1217,6 +1496,186 @@ sealed class TokenSession : IScryerUserSessionService
 
     public Task<ScryerResult<bool>> DiscardPendingLinkAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
         Task.FromResult(ScryerResult<bool>.Success(true));
+}
+
+sealed class UnlinkedSession : IScryerUserSessionService
+{
+    public Task<ScryerResult<ScryerAccessTokenLease>> GetAccessTokenAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<ScryerAccessTokenLease>.Fail(ScryerFailure.NotConnected));
+
+    public Task<ScryerResult<bool>> ConnectAsync(string jellyfinUserId, ScryerOAuthConfiguration expectedConfiguration, ScryerOAuthTokenSet tokenSet, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Fail(ScryerFailure.NotConnected));
+
+    public Task<ScryerResult<bool>> RetireIssuedRefreshTokenAsync(string jellyfinUserId, ScryerOAuthConfiguration configuration, string refreshToken, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(true));
+
+    public Task<ScryerResult<bool>> DisconnectAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(true));
+
+    public Task<ScryerResult<bool>> HasGrantAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(false));
+
+    public Task<ScryerResult<ScryerGrantStatus>> GetGrantStatusAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<ScryerGrantStatus>.Success(new ScryerGrantStatus(false, false)));
+
+    public Task<ScryerResult<bool>> DiscardPendingLinkAsync(string jellyfinUserId, CancellationToken cancellationToken) =>
+        Task.FromResult(ScryerResult<bool>.Success(true));
+}
+
+static class InterfaceProxy
+{
+    public static T Create<T>() where T : class => DispatchProxy.Create<T, NullInterfaceProxy>();
+
+    private class NullInterfaceProxy : DispatchProxy
+    {
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+        {
+            var returnType = targetMethod?.ReturnType;
+            if (returnType is null || returnType == typeof(void)) return null;
+            if (returnType.IsValueType) return Activator.CreateInstance(returnType);
+            return null;
+        }
+    }
+}
+
+class UserDataManagerHarness : DispatchProxy
+{
+    private readonly Dictionary<Guid, UserItemData> _data = new();
+    private EventHandler<UserDataSaveEventArgs>? _saved;
+
+    public IUserDataManager Contract { get; private set; } = null!;
+
+    public static UserDataManagerHarness Create()
+    {
+        var contract = DispatchProxy.Create<IUserDataManager, UserDataManagerHarness>();
+        var harness = (UserDataManagerHarness)(object)contract;
+        harness.Contract = contract;
+        return harness;
+    }
+
+    public UserItemData Get(BaseItem item) => _data.TryGetValue(item.Id, out var data)
+        ? data
+        : _data[item.Id] = new UserItemData { Key = item.Id.ToString("N") };
+
+    public void Raise(Guid userId, BaseItem item, bool isFavorite)
+    {
+        var data = Get(item);
+        data.IsFavorite = isFavorite;
+        _saved?.Invoke(this, new UserDataSaveEventArgs
+        {
+            UserId = userId,
+            Item = item,
+            UserData = data,
+            SaveReason = UserDataSaveReason.UpdateUserRating,
+            Keys = new List<string> { "IsFavorite" }
+        });
+    }
+
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+    {
+        switch (targetMethod?.Name)
+        {
+            case "add_UserDataSaved":
+                _saved += (EventHandler<UserDataSaveEventArgs>)args![0]!;
+                return null;
+            case "remove_UserDataSaved":
+                _saved -= (EventHandler<UserDataSaveEventArgs>)args![0]!;
+                return null;
+            case "GetUserData":
+                return Get((BaseItem)args![1]!);
+            case "SaveUserData":
+                var item = (BaseItem)args![1]!;
+                var data = (UserItemData)args[2]!;
+                _data[item.Id] = data;
+                Raise(((User)args[0]!).Id, item, data.IsFavorite);
+                return null;
+            default:
+                return ProxyDefaults.Value(targetMethod?.ReturnType);
+        }
+    }
+}
+
+class UserManagerHarness : DispatchProxy
+{
+    private User _user = null!;
+    public IUserManager Contract { get; private set; } = null!;
+
+    public static UserManagerHarness Create(User user)
+    {
+        var contract = DispatchProxy.Create<IUserManager, UserManagerHarness>();
+        var harness = (UserManagerHarness)(object)contract;
+        harness.Contract = contract;
+        harness._user = user;
+        return harness;
+    }
+
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args) =>
+        targetMethod?.Name == "GetUserById" && args![0] is Guid id && id == _user.Id
+            ? _user
+            : ProxyDefaults.Value(targetMethod?.ReturnType);
+}
+
+class LibraryManagerHarness : DispatchProxy
+{
+    private Dictionary<Guid, BaseItem> _items = new();
+    public ILibraryManager Contract { get; private set; } = null!;
+
+    public static LibraryManagerHarness Create(params BaseItem[] items)
+    {
+        var contract = DispatchProxy.Create<ILibraryManager, LibraryManagerHarness>();
+        var harness = (LibraryManagerHarness)(object)contract;
+        harness.Contract = contract;
+        harness._items = items.ToDictionary(item => item.Id);
+        return harness;
+    }
+
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args) =>
+        targetMethod?.Name == "GetItemById" && args![0] is Guid id && _items.TryGetValue(id, out var item)
+            ? item
+            : ProxyDefaults.Value(targetMethod?.ReturnType);
+}
+
+class SessionManagerHarness : DispatchProxy
+{
+    public ISessionManager Contract { get; private set; } = null!;
+    public List<GeneralCommand> Messages { get; } = new();
+
+    public static SessionManagerHarness Create()
+    {
+        var contract = DispatchProxy.Create<ISessionManager, SessionManagerHarness>();
+        var harness = (SessionManagerHarness)(object)contract;
+        harness.Contract = contract;
+        return harness;
+    }
+
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+    {
+        if (targetMethod?.Name == "SendMessageToUserSessions")
+        {
+            if (args![2] is GeneralCommand command) Messages.Add(command);
+            return Task.CompletedTask;
+        }
+
+        if (targetMethod?.Name == "get_Sessions") return Array.Empty<SessionInfo>();
+        return ProxyDefaults.Value(targetMethod?.ReturnType);
+    }
+}
+
+static class ProxyDefaults
+{
+    public static object? Value(Type? type)
+    {
+        if (type is null || type == typeof(void)) return null;
+        if (type == typeof(Task)) return Task.CompletedTask;
+        if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Task<>))
+        {
+            return typeof(Task).GetMethod(nameof(Task.FromResult))!
+                .MakeGenericMethod(type.GenericTypeArguments[0])
+                .Invoke(null, new[] { Value(type.GenericTypeArguments[0]) });
+        }
+
+        return type.IsValueType ? Activator.CreateInstance(type) : null;
+    }
 }
 
 sealed class InMemoryTokenStore : IScryerTokenStore

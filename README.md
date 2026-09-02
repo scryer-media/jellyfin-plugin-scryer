@@ -31,6 +31,7 @@ by [RFC 153](https://github.com/scryer-media/scryer-docs/blob/main/plans/153-jel
 - Movie, series, and anime request workflows governed by Scryer permissions.
 - A calendar of upcoming media.
 - Read-only active-download and download-history views.
+- Native Scryer Discovery browsing and heart-to-add/request on stock Android TV 12+.
 - Per-user OAuth connections with S256 PKCE and rotating refresh grants.
 - Jellyfin theme and custom-CSS compatibility through the retained
   `Web/scryer-styles.js` runtime layer.
@@ -47,9 +48,11 @@ configuration; it does not grant Scryer permissions.
   loopback development; private-network HTTP for the internal Scryer connection requires
   an explicit insecure opt-in.
 - A separate Scryer account for each person who will use the plugin.
+- Android TV discovery requires Android TV 12/API 31 or newer because its stock image
+  decoder supplies the AVIF support used by Scryer posters.
 
-Native television clients and unrelated third-party Jellyfin interfaces are not part of
-the Alpha support target.
+Native clients other than the Android TV surface documented below, and unrelated
+third-party Jellyfin interfaces, are not part of the Alpha support target.
 
 ## Install the plugin
 
@@ -155,6 +158,31 @@ Each person completes these steps independently:
 The browser never receives the stored Scryer refresh grant. Switching Jellyfin users
 changes the active plugin identity, cache, permissions, and Scryer grant. Do not share a
 Jellyfin login between people who need separate Scryer identities.
+
+## Android TV discovery
+
+The unmodified Jellyfin Android TV client exposes **Scryer Discovery** as a channel tile
+under **My Media**. Android TV users must first link the same Jellyfin user to Scryer by
+following **Connect a user** in Jellyfin Web; the television does not run a separate OAuth
+flow.
+
+Open the channel to browse up to five **More like...** rails derived from that Jellyfin
+user's recent watch history, followed by their available Scryer discovery sections.
+Titles intentionally appear as non-playable series-style detail stubs, including movies,
+so the stock client does not offer a broken Play action for media that is not yet present.
+
+Use the standard Favorite heart on a title to send it to Scryer:
+
+- With `MANAGE_TITLES`, the title is added directly to the single compatible default
+  Scryer library.
+- Otherwise, with `REQUEST`, a normal media request is submitted.
+- The default library must have its appropriate default quality profile configured.
+- Successful actions keep the heart selected. Clearing the heart does not remove or
+  cancel anything in Scryer; it only permits a later retry.
+
+The action always uses `MONITORED`. Jellyfin displays a native success or failure message
+on the active user's clients. Scryer AVIF posters are passed through unchanged; Android TV
+versions and devices below API 31 are not supported and may show Jellyfin placeholders.
 
 ## Permissions and feature flags
 

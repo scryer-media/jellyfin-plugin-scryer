@@ -1,3 +1,4 @@
+using Jellyfin.Plugin.Scryer.AndroidTv;
 using Jellyfin.Plugin.Scryer.OAuth;
 using Jellyfin.Plugin.Scryer.Services;
 using Jellyfin.Plugin.Scryer.WebInjection;
@@ -22,6 +23,10 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<IScryerUserSessionService, ScryerUserSessionService>();
         serviceCollection.AddSingleton<IHostedService, ScryerPendingLinkCleanupService>();
         serviceCollection.AddSingleton<IScryerGraphqlService, ScryerGraphqlService>();
+        serviceCollection.AddSingleton<ScryerDiscoveryChannel>();
+        serviceCollection.AddSingleton<MediaBrowser.Controller.Channels.IChannel>(provider => provider.GetRequiredService<ScryerDiscoveryChannel>());
+        serviceCollection.AddSingleton<IScryerTvActionJournal, ScryerTvActionJournal>();
+        serviceCollection.AddSingleton<IHostedService, ScryerTvFavoriteService>();
         serviceCollection.AddSingleton<ScryerOAuthFlowStore>();
         serviceCollection.AddSingleton<IScryerOAuthFlowService, ScryerOAuthFlowService>();
         serviceCollection.AddSingleton<ScryerInjectionStatus>();
