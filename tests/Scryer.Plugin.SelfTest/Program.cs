@@ -151,7 +151,7 @@ static Task WebInjectionPreservesBytesAsync()
     Assert.True(result.Injected);
     Assert.True(result.Content.AsSpan(0, prefix.Length).SequenceEqual(prefix));
     Assert.True(result.Content.AsSpan(result.Content.Length - suffix.Length).SequenceEqual(suffix));
-    Assert.Contains("data-scryer-loader=\"153.9\"", Encoding.ASCII.GetString(result.Content));
+    Assert.Contains("data-scryer-loader=\"153.10\"", Encoding.ASCII.GetString(result.Content));
 
     var secondPass = HtmlScriptInjector.Inject(result.Content);
     Assert.True(secondPass.AlreadyPresent);

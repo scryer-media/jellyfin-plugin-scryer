@@ -21,7 +21,7 @@
         '.scryerCardPoster img{width:100%;border-radius:6px;display:block;aspect-ratio:2/3;object-fit:cover}' +
         '.scryerCardTitle{margin-top:.4em;font-size:.9em}' +
         '.scryerPosterPlaceholder{width:100%;aspect-ratio:2/3;border-radius:6px;background:rgba(255,255,255,.08);display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.35)}' +
-        '.scryerPosterPlaceholder .material-icons{font-size:2.5em}' +
+        '.scryerPlaceholderIcon{display:block;width:2.5em;height:2.5em}' +
         '.scryerRow{display:flex;align-items:center;justify-content:space-between;padding:.6em 0;border-bottom:1px solid rgba(255,255,255,.1)}' +
         '.scryerStatus-PENDING{color:#e5a00d}.scryerStatus-APPROVED{color:#4caf50}' +
         '.scryerStatus-REJECTED{color:#f44336}.scryerStatus-CANCELED{color:#888}' +
@@ -64,6 +64,19 @@
         '.scryerBannerWarning{background:rgba(229,160,13,.15);border:1px solid rgba(229,160,13,.4)}' +
         '.scryerBannerClose{background:none;border:none;color:inherit;font-size:1.3em;cursor:pointer;opacity:.7}' +
         '.scryerBannerClose:hover{opacity:1}' +
+        // Jellyfin 10.11 ships raw private-use characters in its icon CSS. Re-state the
+        // native chrome icons with ASCII escapes so response/theme decoding cannot turn
+        // them into visible mojibake. This remains scoped to active Scryer pages and
+        // keeps Jellyfin's own icon font, sizing, colors, and button behavior.
+        '.scryerPageActive .skinHeader .material-icons.arrow_back:before{content:"\\e5c4"!important}' +
+        '.scryerPageActive .skinHeader .material-icons.chevron_left:before{content:"\\e5cb"!important}' +
+        '.scryerPageActive .skinHeader .material-icons.home:before,.scryerPageActive .mainDrawer .material-icons.home:before{content:"\\e88a"!important}' +
+        '.scryerPageActive .skinHeader .material-icons.menu:before{content:"\\e5d2"!important}' +
+        '.scryerPageActive .skinHeader .material-icons.groups:before{content:"\\f233"!important}' +
+        '.scryerPageActive .skinHeader .material-icons.music_note:before{content:"\\e405"!important}' +
+        '.scryerPageActive .skinHeader .material-icons.cast:before{content:"\\e307"!important}' +
+        '.scryerPageActive .skinHeader .material-icons.search:before{content:"\\e8b6"!important}' +
+        '.scryerPageActive .skinHeader .material-icons.person:before{content:"\\e7fd"!important}' +
         '.scryerPageActive .pageTitle{display:none}' +
         '.scryerConnectCard{box-sizing:border-box;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1.35em;width:min(38em,calc(100% - 2em));min-height:24em;margin:3em auto;padding:2.5em 2em;border:1px solid rgba(255,255,255,.12);border-radius:1.1em;background:rgba(8,14,30,.78);box-shadow:0 1.2em 3em rgba(0,0,0,.35);text-align:center}' +
         '.scryerConnectBrands{display:flex;align-items:center;justify-content:center;gap:1.4em;width:100%}' +

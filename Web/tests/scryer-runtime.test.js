@@ -6,10 +6,11 @@ const vm = require('node:vm');
 
 const webRoot = path.resolve(__dirname, '..');
 
-function loadCore() {
+function loadCore(apiClient) {
     const listeners = new Map();
     const window = {
-        ScryerRuntime153: { version: '153.9', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.10', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ApiClient: apiClient,
         addEventListener(name, listener) { listeners.set(name, listener); },
         removeEventListener(name) { listeners.delete(name); },
         setInterval() { return 1; },
@@ -98,6 +99,27 @@ test('plugin API calls stay on the web-shell origin so callback cookies are sent
     assert.equal(
         Scryer._testing.pluginApiUrl(client, 'Scryer/Auth/Finalize'),
         'https://jellyfin.test/base/Scryer/Auth/Finalize'
+    );
+});
+
+test('relative Scryer image routes resolve from the public origin, not its OAuth path', async () => {
+    const client = {
+        getUrl(pathName) { return 'https://jellyfin.test/' + pathName; },
+        serverAddress() { return 'https://jellyfin.test'; },
+        getCurrentUserId() { return 'alice'; },
+        getCurrentUser() { return Promise.resolve({ Id: 'alice' }); },
+        ajax() {
+            return Promise.resolve({
+                ok: true,
+                status: 200,
+                text() { return Promise.resolve(JSON.stringify({ ImageBaseUrl: 'https://scryer.test/system/users' })); }
+            });
+        }
+    };
+    const Scryer = loadCore(client);
+    assert.equal(
+        await Scryer.resolveImageUrl('/images/media/poster-token/w250'),
+        'https://scryer.test/images/media/poster-token/w250'
     );
 });
 

@@ -22,7 +22,7 @@
         return parts.join('');
     }
     function renderPosterInto(element, url, scope) {
-        element.innerHTML = '<div class="scryerPosterPlaceholder"><span class="material-icons" aria-hidden="true">event</span></div>';
+        element.innerHTML = '<div class="scryerPosterPlaceholder"><svg class="scryerPlaceholderIcon" viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path fill="currentColor" d="M19 4h-1V2h-2v2H8V2H6v2H5c-1.11 0-1.99.9-1.99 2L3 20c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H5V9h14v11z"></path></svg></div>';
         if (!url) return;
         resolveImageUrl(url).then(scope.guard(function (resolved) {
             var image = new Image();

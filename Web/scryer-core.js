@@ -2,7 +2,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '153.9';
+    var VERSION = '153.10';
     var runtime = window.ScryerRuntime153;
     if (!runtime || runtime.version !== VERSION) throw new Error('Scryer loader must run before core.');
     if (window.Scryer && window.Scryer.version === VERSION && window.Scryer._rfc153Installed) {
@@ -17,10 +17,10 @@
     Scryer.modules = {};
 
     var PAGE_DEFINITIONS = [
-        { id: 'discovery', feature: 'discovery', title: Strings.pages.discovery || 'Discover', icon: 'explore', route: '#/scryer-discovery' },
-        { id: 'calendar', feature: 'calendar', title: Strings.pages.calendar || 'Calendar', icon: 'event', route: '#/scryer-calendar' },
-        { id: 'requests', feature: 'requests', title: Strings.pages.requests || 'Requests', icon: 'playlist_add_check', route: '#/scryer-requests' },
-        { id: 'download', feature: 'downloads', title: Strings.pages.downloads || 'Downloads', icon: 'download', route: '#/scryer-download' }
+        { id: 'discovery', feature: 'discovery', title: Strings.pages.discovery || 'Discover', iconPath: 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm3.5 6.5-2.1 4.9-4.9 2.1 2.1-4.9 4.9-2.1z', route: '#/scryer-discovery' },
+        { id: 'calendar', feature: 'calendar', title: Strings.pages.calendar || 'Calendar', iconPath: 'M19 4h-1V2h-2v2H8V2H6v2H5c-1.11 0-1.99.9-1.99 2L3 20c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H5V9h14v11z', route: '#/scryer-calendar' },
+        { id: 'requests', feature: 'requests', title: Strings.pages.requests || 'Requests', iconPath: 'M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-9 14-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z', route: '#/scryer-requests' },
+        { id: 'download', feature: 'downloads', title: Strings.pages.downloads || 'Downloads', iconPath: 'M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z', route: '#/scryer-download' }
     ];
     var PAGES = PAGE_DEFINITIONS.slice();
     var OAUTH_WINDOW_NAME = 'scryer-oauth';
@@ -352,7 +352,7 @@
         if (!url || !url.startsWith('/')) return Promise.resolve(url);
         return getWebConfiguration().then(function (data) {
             var base = data.imageBaseUrl || '';
-            return base ? base.replace(/\/$/, '') + url : url;
+            return base ? new URL(url, base).href : url;
         }).catch(function () { return url; });
     }
     Scryer.resolveImageUrl = resolveImageUrl;
@@ -627,7 +627,7 @@
             if (section.querySelector('.scryer-nav-' + page.id)) return;
             var link = document.createElement('a');
             link.setAttribute('is', 'emby-linkbutton'); link.className = 'navMenuOption lnkMediaFolder emby-button scryer-nav-' + page.id; link.href = page.route;
-            link.innerHTML = '<span class="material-icons navMenuOptionIcon" aria-hidden="true">' + page.icon + '</span><span class="sectionName navMenuOptionText">' + escapeHtml(page.title) + '</span>';
+            link.innerHTML = '<svg class="navMenuOptionIcon scryerNavIcon" viewBox="0 0 24 24" width="24" height="24" focusable="false" aria-hidden="true"><path fill="currentColor" d="' + page.iconPath + '"></path></svg><span class="sectionName navMenuOptionText">' + escapeHtml(page.title) + '</span>';
             link.addEventListener('click', function (event) {
                 event.preventDefault();
                 event.stopImmediatePropagation();

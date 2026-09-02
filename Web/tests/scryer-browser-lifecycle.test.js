@@ -17,7 +17,7 @@ function createCoreHarness(apiClient) {
     const diagnostics = [];
     let nextHandle = 1;
     const window = {
-        ScryerRuntime153: { version: '153.9', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.10', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         ScryerStrings: { pages: {}, states: { requestConflict: 'This request conflicts with its current Scryer state.', internalError: 'The Scryer request could not be completed.' } },
         ApiClient: apiClient,
         addEventListener(name, listener) { listeners.set(name, listener); },
@@ -294,6 +294,10 @@ test('disabled feature navigation, API capability gates, and browser credential 
     assert.match(core, /if \(pageId === 'requests'\) return library\.canRequest \|\| library\.canManageTitles;/);
     assert.match(core, /if \(pageId === 'calendar' \|\| pageId === 'download'\) return library\.canView;/);
     assert.match(core, /event\.stopImmediatePropagation\(\);[\s\S]*?showPage\(page\.id\);[\s\S]*?\}, true\);/);
+    assert.match(core, /<svg class="navMenuOptionIcon scryerNavIcon"/);
+    assert.doesNotMatch(core, /<span class="material-icons navMenuOptionIcon"/);
+    assert.doesNotMatch(readWebAsset('scryer-discovery.js'), /class="material-icons"/);
+    assert.doesNotMatch(readWebAsset('scryer-calendar.js'), /class="material-icons"/);
     ['discovery', 'calendar', 'requests', 'downloads'].forEach((feature) => assert.match(loader, new RegExp("loadScript\\('scryer-" + feature + "\\.js'")));
 
     const combined = runtimeAssets.map(readWebAsset).join('\n');
@@ -323,6 +327,10 @@ test('custom pages use Jellyfin library page spacing below the fixed header', ()
     assert.match(core, /classList\.add\('scryerPageActive'\)/);
     assert.match(core, /classList\.remove\('scryerPageActive'\)/);
     assert.match(styles, /\.scryerPageActive \.pageTitle\{display:none\}/);
+    assert.equal(styles.includes('.scryerPageActive .skinHeader .material-icons.arrow_back:before{content:"\\\\e5c4"!important}'), true);
+    assert.equal(styles.includes('.scryerPageActive .skinHeader .material-icons.menu:before{content:"\\\\e5d2"!important}'), true);
+    assert.equal(styles.includes('.scryerPageActive .skinHeader .material-icons.search:before{content:"\\\\e8b6"!important}'), true);
+    assert.doesNotMatch(styles, /[\uE000-\uF8FF]/);
 });
 
 test('OAuth finalization failures remain visible instead of falling back to Connect', () => {
