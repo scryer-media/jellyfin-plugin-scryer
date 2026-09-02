@@ -17,7 +17,7 @@ function createCoreHarness(apiClient) {
     const diagnostics = [];
     let nextHandle = 1;
     const window = {
-        ScryerRuntime153: { version: '153.4', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.5', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         ScryerStrings: { pages: {}, states: { requestConflict: 'This request conflicts with its current Scryer state.', internalError: 'The Scryer request could not be completed.' } },
         ApiClient: apiClient,
         addEventListener(name, listener) { listeners.set(name, listener); },
@@ -301,4 +301,20 @@ test('disabled feature navigation, API capability gates, and browser credential 
     assert.doesNotMatch(combined, /document\.cookie\b/);
     assert.doesNotMatch(combined, /\bAuthorization\s*:/);
     assert.doesNotMatch(combined, /\bBearer\s+/i);
+});
+
+test('injected and loaded web assets share one cache version', () => {
+    const loader = readWebAsset('scryer-loader.js');
+    const core = readWebAsset('scryer-core.js');
+    const injector = fs.readFileSync(path.resolve(webRoot, '..', 'WebInjection', 'ScriptTagInjectionStartupFilter.cs'), 'utf8');
+    const version = loader.match(/var VERSION = '([^']+)'/)[1];
+
+    assert.match(core, new RegExp("var VERSION = '" + version.replace('.', '\\.') + "'"));
+    assert.equal(injector.includes('scryer-loader.js?v=' + version + '\\" data-scryer-loader=\\"' + version), true);
+});
+
+test('custom pages use Jellyfin library page spacing below the fixed header', () => {
+    const core = readWebAsset('scryer-core.js');
+
+    assert.match(core, /root\.className = 'page type-interior libraryPage mainAnimatedPage hide scryer-runtime-owned';/);
 });

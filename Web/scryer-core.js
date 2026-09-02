@@ -2,7 +2,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '153.4';
+    var VERSION = '153.5';
     var runtime = window.ScryerRuntime153;
     if (!runtime || runtime.version !== VERSION) throw new Error('Scryer loader must run before core.');
     if (window.Scryer && window.Scryer.version === VERSION && window.Scryer._rfc153Installed) {
@@ -555,7 +555,7 @@
         var existing = document.getElementById('scryer-page-' + page.id);
         if (existing) return existing;
         var root = document.createElement('div');
-        root.id = 'scryer-page-' + page.id; root.className = 'page type-interior mainAnimatedPage hide scryer-runtime-owned';
+        root.id = 'scryer-page-' + page.id; root.className = 'page type-interior libraryPage mainAnimatedPage hide scryer-runtime-owned';
         root.setAttribute('data-title', page.title); root.setAttribute('data-backbutton', 'true'); root.setAttribute('data-url', page.route); root.setAttribute('data-type', 'custom');
         root.innerHTML = '<div data-role="content"><div class="content-primary" id="scryer-content-' + page.id + '"></div></div>';
         (document.querySelector('.mainAnimatedPages') || document.body).appendChild(root);

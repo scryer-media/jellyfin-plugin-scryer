@@ -9,7 +9,7 @@ const webRoot = path.resolve(__dirname, '..');
 function loadCore() {
     const listeners = new Map();
     const window = {
-        ScryerRuntime153: { version: '153.4', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.5', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         addEventListener(name, listener) { listeners.set(name, listener); },
         removeEventListener(name) { listeners.delete(name); },
         setInterval() { return 1; },
