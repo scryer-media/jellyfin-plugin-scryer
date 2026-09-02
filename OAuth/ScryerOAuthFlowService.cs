@@ -155,10 +155,10 @@ public sealed class ScryerOAuthFlowService : IScryerOAuthFlowService
             return ScryerAuthStatusDto.Failed(configured.Failure!);
         }
 
-        var connection = await _sessionService.HasGrantAsync(jellyfinUserId, cancellationToken).ConfigureAwait(false);
+        var connection = await _sessionService.GetGrantStatusAsync(jellyfinUserId, cancellationToken).ConfigureAwait(false);
         return connection.IsSuccess
-            ? new ScryerAuthStatusDto(true, connection.Value == true, null)
-            : new ScryerAuthStatusDto(true, false, ScryerAuthFailureDto.From(connection.Failure!));
+            ? new ScryerAuthStatusDto(true, connection.Value!.Connected, connection.Value.AccountLinked, null)
+            : new ScryerAuthStatusDto(true, false, false, ScryerAuthFailureDto.From(connection.Failure!));
     }
 
     public async Task<ScryerResult<bool>> DisconnectAsync(string jellyfinUserId, CancellationToken cancellationToken)
@@ -418,9 +418,9 @@ public sealed record ScryerOAuthCallbackResult(bool Success, string ReturnPage, 
 }
 
 /// <summary>Browser-safe status: configuration and connection flags plus a stable failure code.</summary>
-public sealed record ScryerAuthStatusDto(bool Configured, bool Connected, ScryerAuthFailureDto? Failure)
+public sealed record ScryerAuthStatusDto(bool Configured, bool Connected, bool AccountLinked, ScryerAuthFailureDto? Failure)
 {
-    public static ScryerAuthStatusDto Failed(ScryerFailure failure) => new(false, false, ScryerAuthFailureDto.From(failure));
+    public static ScryerAuthStatusDto Failed(ScryerFailure failure) => new(false, false, false, ScryerAuthFailureDto.From(failure));
 }
 
 public sealed record ScryerAuthFailureDto(string Code)

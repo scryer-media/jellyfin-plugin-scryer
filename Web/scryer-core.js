@@ -454,7 +454,7 @@
     function renderConnectionState(container, kind, scope, page, detail) {
         var messages = {
             unconfigured: Strings.states.notConfigured || 'Scryer is not configured.', connect: Strings.states.notConnected || 'Connect your Scryer account to continue.',
-            connecting: 'Connecting Scryer…', connected: 'Scryer connected.', limited: 'Scryer connected with limited permissions.',
+            connecting: 'Connecting Scryer…', connected: 'Scryer connected.', anonymous: 'Scryer connected as Anonymous. Account linking is unavailable.', limited: 'Scryer connected with limited permissions.',
             expired: Strings.states.authorizationExpired || 'Your Scryer connection expired. Connect again.', offline: Strings.states.offline || 'Scryer is currently unreachable.',
             incompatible: Strings.states.incompatible || 'This Scryer server is incompatible.'
         };
@@ -469,7 +469,7 @@
                 startConnection(page.route).catch(scope.guard(function (error) { renderConnectionState(container, 'offline', scope, page, error.message); }));
             });
             actions.appendChild(connect);
-        } else if (kind === 'connected' || kind === 'limited') {
+        } else if (kind === 'connected' || kind === 'anonymous' || kind === 'limited') {
             var disconnect = document.createElement('button');
             disconnect.type = 'button'; disconnect.className = 'emby-button'; disconnect.textContent = 'Disconnect';
             scope.on(disconnect, 'click', function () {
@@ -496,6 +496,11 @@
         getConnectionStatus().then(scope.guard(function (status) {
             if (!status || !status.configured) { renderConnectionState(container, codeToConnectionState(status && status.failure && status.failure.code), scope, page); return; }
             if (!status.connected) { renderConnectionState(container, codeToConnectionState(status.failure && status.failure.code), scope, page); return; }
+            if (status.accountLinked === false) {
+                var anonymousBody = renderConnectionState(container, 'anonymous', scope, page);
+                scope.own(renderFeature(anonymousBody, scope));
+                return;
+            }
             var finish = function (limited) {
                 var body = renderConnectionState(container, limited ? 'limited' : 'connected', scope, page);
                 if (limited) {

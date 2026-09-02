@@ -300,7 +300,7 @@ public sealed class ScryerOAuthMetadataClient
             !string.Equals(tokenType, "bearer", StringComparison.OrdinalIgnoreCase) ||
             !root.TryGetProperty("expires_in", out var expiresInProperty) ||
             !expiresInProperty.TryGetInt64(out var expiresIn) || expiresIn <= 0 || expiresIn > 31_536_000 ||
-            !TryReadNonEmptyString(root, "scope", out var scope) || !HasExactRequiredScopes(scope))
+            !TryReadNonEmptyString(root, "scope", out var scope) || !ScryerOAuthScopes.TryNormalizeExact(scope, out var normalizedScope))
         {
             return ScryerResult<ScryerOAuthTokenSet>.Fail(ScryerFailure.InvalidResponse);
         }
@@ -309,13 +309,7 @@ public sealed class ScryerOAuthMetadataClient
             accessToken,
             refreshToken,
             DateTimeOffset.UtcNow.AddSeconds(expiresIn),
-            scope));
-    }
-
-    private static bool HasExactRequiredScopes(string scope)
-    {
-        var values = scope.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        return values.Length == 2 && values.Contains("library", StringComparer.Ordinal) && values.Contains("jellyfin-link", StringComparer.Ordinal);
+            normalizedScope));
     }
 
     private static bool TryReadEndpoint(JsonElement root, string propertyName, out Uri endpoint)

@@ -160,7 +160,8 @@ public sealed class ScryerRefreshGrant
         DateTimeOffset updatedAt,
         ScryerGrantLinkState linkState = ScryerGrantLinkState.Active,
         string? linkIdempotencyKey = null,
-        int linkAttempts = 0)
+        int linkAttempts = 0,
+        string grantedScope = ScryerOAuthScopes.Linked)
     {
         Key = key;
         RefreshToken = refreshToken;
@@ -168,6 +169,7 @@ public sealed class ScryerRefreshGrant
         LinkState = linkState;
         LinkIdempotencyKey = linkIdempotencyKey;
         LinkAttempts = linkAttempts;
+        GrantedScope = grantedScope;
     }
 
     public ScryerGrantKey Key { get; }
@@ -178,8 +180,38 @@ public sealed class ScryerRefreshGrant
     [JsonIgnore]
     public string? LinkIdempotencyKey { get; }
     public int LinkAttempts { get; }
+    public string GrantedScope { get; }
 
     public override string ToString() => nameof(ScryerRefreshGrant) + " [redacted]";
+}
+
+public static class ScryerOAuthScopes
+{
+    public const string Library = "library";
+    public const string Linked = "library jellyfin-link";
+
+    public static bool TryNormalizeExact(string? scope, out string normalized)
+    {
+        normalized = string.Empty;
+        if (string.IsNullOrWhiteSpace(scope)) return false;
+        var values = scope.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (values.Length == 1 && string.Equals(values[0], Library, StringComparison.Ordinal))
+        {
+            normalized = Library;
+            return true;
+        }
+
+        if (values.Length == 2 && values.Contains(Library, StringComparer.Ordinal) &&
+            values.Contains("jellyfin-link", StringComparer.Ordinal))
+        {
+            normalized = Linked;
+            return true;
+        }
+
+        return false;
+    }
+
+    public static bool IsLinked(string scope) => string.Equals(scope, Linked, StringComparison.Ordinal);
 }
 
 /// <summary>Only an active grant may be used by normal Scryer feature operations.</summary>

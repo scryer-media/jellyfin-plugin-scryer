@@ -81,13 +81,21 @@ test('Jellyfin DTO responses normalize to the browser field contract', () => {
     const normalized = Scryer._testing.normalizeApiPayload({
         Configured: true,
         Connected: true,
+        AccountLinked: false,
         capabilities: { ScryerUserId: 'user-c', Libraries: [{ LibraryId: 'view', CanView: true }] }
     });
     assert.equal(JSON.stringify(normalized), JSON.stringify({
         configured: true,
         connected: true,
+        accountLinked: false,
         capabilities: { scryerUserId: 'user-c', libraries: [{ libraryId: 'view', canView: true }] }
     }));
+});
+
+test('anonymous OAuth status has dedicated connected copy', () => {
+    const source = fs.readFileSync(path.join(webRoot, 'scryer-core.js'), 'utf8');
+    assert.match(source, /status\.accountLinked === false/);
+    assert.match(source, /Scryer connected as Anonymous\. Account linking is unavailable\./);
 });
 
 test('generation gates reject callbacks from a closed or replaced UI operation', () => {

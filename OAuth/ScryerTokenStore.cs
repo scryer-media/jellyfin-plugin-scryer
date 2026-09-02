@@ -106,14 +106,21 @@ public sealed class ScryerTokenStore : IScryerTokenStore
                 return new ScryerGrantReadResult(ScryerGrantReadState.Legacy, new ScryerRefreshGrant(key, record.RefreshToken, record.UpdatedAt));
             }
 
-            if (record.Version != 2 || !Enum.TryParse<ScryerGrantLinkState>(record.LinkState, ignoreCase: false, out var linkState) ||
+            if ((record.Version != 2 && record.Version != 3) ||
+                !Enum.TryParse<ScryerGrantLinkState>(record.LinkState, ignoreCase: false, out var linkState) ||
                 record.LinkIdempotencyKey is not null || record.LinkAttempts is < 0 or > 3)
             {
                 return await CorruptResultAsync(path, hasJournal ? journalPath : null, cancellationToken).ConfigureAwait(false);
             }
 
+            var grantedScope = record.Version == 2 ? ScryerOAuthScopes.Linked : record.GrantedScope;
+            if (!ScryerOAuthScopes.TryNormalizeExact(grantedScope, out var normalizedScope))
+            {
+                return await CorruptResultAsync(path, hasJournal ? journalPath : null, cancellationToken).ConfigureAwait(false);
+            }
+
             return new ScryerGrantReadResult(ScryerGrantReadState.Found,
-                new ScryerRefreshGrant(key, record.RefreshToken, record.UpdatedAt, linkState, record.LinkIdempotencyKey, record.LinkAttempts));
+                new ScryerRefreshGrant(key, record.RefreshToken, record.UpdatedAt, linkState, record.LinkIdempotencyKey, record.LinkAttempts, normalizedScope));
         }
         catch (CryptographicException)
         {
@@ -199,7 +206,12 @@ public sealed class ScryerTokenStore : IScryerTokenStore
             }
             if (record.JellyfinUserId == jellyfinUserId)
             {
-                grants.Add(new ScryerRefreshGrant(new ScryerGrantKey(record.JellyfinUserId, record.Authority, record.ClientId), record.RefreshToken, record.UpdatedAt, ScryerGrantLinkState.PendingRevoke, record.LinkIdempotencyKey, record.LinkAttempts));
+                var grantedScope = record.Version == 2 ? ScryerOAuthScopes.Linked : record.GrantedScope;
+                if (!ScryerOAuthScopes.TryNormalizeExact(grantedScope, out var normalizedScope))
+                {
+                    throw new InvalidDataException("A detached revocation record has an invalid scope.");
+                }
+                grants.Add(new ScryerRefreshGrant(new ScryerGrantKey(record.JellyfinUserId, record.Authority, record.ClientId), record.RefreshToken, record.UpdatedAt, ScryerGrantLinkState.PendingRevoke, record.LinkIdempotencyKey, record.LinkAttempts, normalizedScope));
             }
         }
         return grants;
@@ -228,7 +240,9 @@ public sealed class ScryerTokenStore : IScryerTokenStore
     {
         ArgumentNullException.ThrowIfNull(grant);
         if (string.IsNullOrWhiteSpace(grant.RefreshToken) ||
-            grant.LinkIdempotencyKey is not null || grant.LinkAttempts is < 0 or > 3)
+            grant.LinkIdempotencyKey is not null || grant.LinkAttempts is < 0 or > 3 ||
+            !ScryerOAuthScopes.TryNormalizeExact(grant.GrantedScope, out var normalizedScope) ||
+            !string.Equals(normalizedScope, grant.GrantedScope, StringComparison.Ordinal))
         {
             return false;
         }
@@ -240,7 +254,7 @@ public sealed class ScryerTokenStore : IScryerTokenStore
         {
             Directory.CreateDirectory(_directory);
             var record = new StoredGrant(
-                2,
+                3,
                 grant.Key.JellyfinUserId,
                 grant.Key.Authority,
                 grant.Key.ClientId,
@@ -248,7 +262,8 @@ public sealed class ScryerTokenStore : IScryerTokenStore
                 grant.UpdatedAt,
                 grant.LinkState.ToString(),
                 grant.LinkIdempotencyKey,
-                grant.LinkAttempts);
+                grant.LinkAttempts,
+                grant.GrantedScope);
             var protectedBytes = _protector.Protect(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(record)));
 
             await using (var stream = new FileStream(
@@ -311,7 +326,11 @@ public sealed class ScryerTokenStore : IScryerTokenStore
         if (current.State != ScryerGrantReadState.Found || current.Grant is null ||
             current.Grant.LinkState != ScryerGrantLinkState.PendingLink ||
             !SameGrant(current.Grant, pendingGrant)) return false;
-        return await SaveAsync(new ScryerRefreshGrant(pendingGrant.Key, pendingGrant.RefreshToken, DateTimeOffset.UtcNow), cancellationToken).ConfigureAwait(false);
+        return await SaveAsync(new ScryerRefreshGrant(
+            pendingGrant.Key,
+            pendingGrant.RefreshToken,
+            DateTimeOffset.UtcNow,
+            grantedScope: pendingGrant.GrantedScope), cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<string>> GetPendingUserIdsAsync(int maximumCount, string? afterUserId, CancellationToken cancellationToken)
@@ -501,14 +520,15 @@ public sealed class ScryerTokenStore : IScryerTokenStore
 
             var json = Encoding.UTF8.GetString(_protector.Unprotect(protectedBytes));
             var record = JsonSerializer.Deserialize<StoredGrant>(json);
-            return record is not null && record.Version == 2 &&
+            return record is not null && record.Version == 3 &&
                 FixedTimeEquals(record.JellyfinUserId, expected.Key.JellyfinUserId) &&
                 FixedTimeEquals(record.Authority, expected.Key.Authority) &&
                 FixedTimeEquals(record.ClientId, expected.Key.ClientId) &&
                 FixedTimeEquals(record.RefreshToken, expected.RefreshToken) &&
                 string.Equals(record.LinkState, expected.LinkState.ToString(), StringComparison.Ordinal) &&
                 string.Equals(record.LinkIdempotencyKey, expected.LinkIdempotencyKey, StringComparison.Ordinal) &&
-                record.LinkAttempts == expected.LinkAttempts;
+                record.LinkAttempts == expected.LinkAttempts &&
+                string.Equals(record.GrantedScope, expected.GrantedScope, StringComparison.Ordinal);
         }
         catch (CryptographicException)
         {
@@ -543,7 +563,7 @@ public sealed class ScryerTokenStore : IScryerTokenStore
         string.Equals(parsed.ToString("N"), value, StringComparison.Ordinal);
 
     private static bool IsCountableStoredGrant(StoredGrant? record) => record is not null &&
-        record.Version == 2 &&
+        (record.Version == 2 || record.Version == 3) &&
         (record.LinkState == ScryerGrantLinkState.Active.ToString() ||
          record.LinkState == ScryerGrantLinkState.PendingLink.ToString() ||
          record.LinkState == ScryerGrantLinkState.PendingRevoke.ToString()) &&
@@ -552,11 +572,13 @@ public sealed class ScryerTokenStore : IScryerTokenStore
         !string.IsNullOrWhiteSpace(record.RefreshToken) &&
         IsValidStoredUserId(record.JellyfinUserId) &&
         IsValidStoredAuthority(record.Authority) &&
-        !string.IsNullOrWhiteSpace(record.ClientId);
+        !string.IsNullOrWhiteSpace(record.ClientId) &&
+        (record.Version == 2 || string.Equals(record.GrantedScope, ScryerOAuthScopes.Linked, StringComparison.Ordinal));
 
     private static bool SameGrant(ScryerRefreshGrant left, ScryerRefreshGrant right) => SameBinding(left.Key, right.Key) &&
         FixedTimeEquals(left.RefreshToken, right.RefreshToken) && string.Equals(left.LinkIdempotencyKey, right.LinkIdempotencyKey, StringComparison.Ordinal) &&
-        left.LinkState == right.LinkState && left.LinkAttempts == right.LinkAttempts;
+        left.LinkState == right.LinkState && left.LinkAttempts == right.LinkAttempts &&
+        string.Equals(left.GrantedScope, right.GrantedScope, StringComparison.Ordinal);
 
     private static string CreateTemporarySuffix()
     {
@@ -681,7 +703,8 @@ public sealed class ScryerTokenStore : IScryerTokenStore
         DateTimeOffset UpdatedAt,
         string? LinkState = null,
         string? LinkIdempotencyKey = null,
-        int LinkAttempts = 0);
+        int LinkAttempts = 0,
+        string? GrantedScope = null);
 }
 
 /// <summary>Identity-free, bounded diagnostic count of active locally stored OAuth grants.</summary>

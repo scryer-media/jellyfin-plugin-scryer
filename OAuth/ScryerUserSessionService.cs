@@ -22,8 +22,11 @@ public interface IScryerUserSessionService
         CancellationToken cancellationToken);
     Task<ScryerResult<bool>> DisconnectAsync(string jellyfinUserId, CancellationToken cancellationToken);
     Task<ScryerResult<bool>> HasGrantAsync(string jellyfinUserId, CancellationToken cancellationToken);
+    Task<ScryerResult<ScryerGrantStatus>> GetGrantStatusAsync(string jellyfinUserId, CancellationToken cancellationToken);
     Task<ScryerResult<bool>> DiscardPendingLinkAsync(string jellyfinUserId, CancellationToken cancellationToken);
 }
+
+public sealed record ScryerGrantStatus(bool Connected, bool AccountLinked);
 
 /// <summary>
 /// Holds access tokens in process memory only. Refresh-token rotation and grant replacement are
@@ -149,28 +152,34 @@ public sealed class ScryerUserSessionService : IScryerUserSessionService
             }
 
             var tokenSet = refreshed.Value!;
-            if (!HasRequiredScopes(tokenSet.Scope))
+            if (!ScryerOAuthScopes.TryNormalizeExact(tokenSet.Scope, out var refreshedScope) ||
+                !string.Equals(refreshedScope, stored.Grant.GrantedScope, StringComparison.Ordinal))
             {
-                await RetireRotatedGrantAsync(key, tokenSet.RefreshToken).ConfigureAwait(false);
+                await RetireRotatedGrantAsync(key, tokenSet.RefreshToken, stored.Grant.GrantedScope).ConfigureAwait(false);
                 return ScryerResult<ScryerAccessTokenLease>.Fail(ScryerFailure.AuthorizationExpired);
             }
             bool persisted;
             try
             {
                 persisted = await _tokenStore.SaveAsync(
-                new ScryerRefreshGrant(key, tokenSet.RefreshToken, DateTimeOffset.UtcNow, ScryerGrantLinkState.Active),
+                new ScryerRefreshGrant(
+                    key,
+                    tokenSet.RefreshToken,
+                    DateTimeOffset.UtcNow,
+                    ScryerGrantLinkState.Active,
+                    grantedScope: stored.Grant.GrantedScope),
                     CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception)
             {
-                await RetireRotatedGrantAsync(key, tokenSet.RefreshToken).ConfigureAwait(false);
+                await RetireRotatedGrantAsync(key, tokenSet.RefreshToken, stored.Grant.GrantedScope).ConfigureAwait(false);
                 return ScryerResult<ScryerAccessTokenLease>.Fail(ScryerFailure.AuthorizationExpired);
             }
 
             if (!persisted)
             {
                 // The previous token may already be spent. Never retry it after a failed rotation write.
-                await RetireRotatedGrantAsync(key, tokenSet.RefreshToken).ConfigureAwait(false);
+                await RetireRotatedGrantAsync(key, tokenSet.RefreshToken, stored.Grant.GrantedScope).ConfigureAwait(false);
                 return ScryerResult<ScryerAccessTokenLease>.Fail(ScryerFailure.AuthorizationExpired);
             }
 
@@ -194,7 +203,7 @@ public sealed class ScryerUserSessionService : IScryerUserSessionService
         ArgumentNullException.ThrowIfNull(tokenSet);
         if (string.IsNullOrWhiteSpace(tokenSet.AccessToken) || string.IsNullOrWhiteSpace(tokenSet.RefreshToken) ||
             tokenSet.AccessTokenExpiresAt <= DateTimeOffset.UtcNow || string.IsNullOrWhiteSpace(tokenSet.Scope) ||
-            !HasRequiredScopes(tokenSet.Scope))
+            !ScryerOAuthScopes.TryNormalizeExact(tokenSet.Scope, out var grantedScope))
         {
             return ScryerResult<bool>.Fail(ScryerFailure.InvalidResponse);
         }
@@ -266,7 +275,13 @@ public sealed class ScryerUserSessionService : IScryerUserSessionService
                 }
             }
 
-            var pending = new ScryerRefreshGrant(key, tokenSet.RefreshToken, DateTimeOffset.UtcNow, ScryerGrantLinkState.PendingLink);
+            var requiresLink = ScryerOAuthScopes.IsLinked(grantedScope);
+            var pending = new ScryerRefreshGrant(
+                key,
+                tokenSet.RefreshToken,
+                DateTimeOffset.UtcNow,
+                requiresLink ? ScryerGrantLinkState.PendingLink : ScryerGrantLinkState.Active,
+                grantedScope: grantedScope);
             bool persisted;
             try
             {
@@ -278,18 +293,24 @@ public sealed class ScryerUserSessionService : IScryerUserSessionService
             }
             catch (Exception)
             {
-                await RetireRotatedGrantAsync(key, tokenSet.RefreshToken).ConfigureAwait(false);
+                await RetireRotatedGrantAsync(key, tokenSet.RefreshToken, grantedScope).ConfigureAwait(false);
                 return ScryerResult<bool>.Fail(ScryerFailure.AuthorizationExpired);
             }
 
             if (!persisted)
             {
-                await RetireRotatedGrantAsync(key, tokenSet.RefreshToken).ConfigureAwait(false);
+                await RetireRotatedGrantAsync(key, tokenSet.RefreshToken, grantedScope).ConfigureAwait(false);
                 return ScryerResult<bool>.Fail(ScryerFailure.AuthorizationExpired);
             }
 
             ClearUserCache(jellyfinUserId);
             _invalidatedUsers.TryRemove(jellyfinUserId, out _);
+            if (!requiresLink)
+            {
+                _accessTokens[key.CacheIdentity] = new ScryerAccessTokenLease(tokenSet.AccessToken, tokenSet.AccessTokenExpiresAt);
+                return ScryerResult<bool>.Success(true);
+            }
+
             var linked = await LinkPendingAsync(expectedConfiguration, pending, new ScryerAccessTokenLease(tokenSet.AccessToken, tokenSet.AccessTokenExpiresAt), CancellationToken.None).ConfigureAwait(false);
             return linked;
         }
@@ -490,6 +511,36 @@ public sealed class ScryerUserSessionService : IScryerUserSessionService
         }
     }
 
+    public async Task<ScryerResult<ScryerGrantStatus>> GetGrantStatusAsync(string jellyfinUserId, CancellationToken cancellationToken)
+    {
+        var connected = await HasGrantAsync(jellyfinUserId, cancellationToken).ConfigureAwait(false);
+        if (!connected.IsSuccess)
+        {
+            return ScryerResult<ScryerGrantStatus>.Fail(connected.Failure!);
+        }
+
+        if (connected.Value != true)
+        {
+            return ScryerResult<ScryerGrantStatus>.Success(new ScryerGrantStatus(false, false));
+        }
+
+        var resolved = ResolveKey(jellyfinUserId);
+        if (!resolved.IsSuccess)
+        {
+            return ScryerResult<ScryerGrantStatus>.Fail(resolved.Failure!);
+        }
+
+        var stored = await _tokenStore.ReadAsync(resolved.Value!.Key, cancellationToken).ConfigureAwait(false);
+        if (stored.State != ScryerGrantReadState.Found || stored.Grant?.LinkState != ScryerGrantLinkState.Active)
+        {
+            return ScryerResult<ScryerGrantStatus>.Success(new ScryerGrantStatus(false, false));
+        }
+
+        return ScryerResult<ScryerGrantStatus>.Success(new ScryerGrantStatus(
+            true,
+            ScryerOAuthScopes.IsLinked(stored.Grant.GrantedScope)));
+    }
+
     public async Task<ScryerResult<bool>> DiscardPendingLinkAsync(string jellyfinUserId, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(jellyfinUserId)) return ScryerResult<bool>.Fail(ScryerFailure.NotConnected);
@@ -611,7 +662,8 @@ public sealed class ScryerUserSessionService : IScryerUserSessionService
                     grant.RefreshToken,
                     DateTimeOffset.UtcNow,
                     ScryerGrantLinkState.PendingRevoke,
-                    linkAttempts: attempts),
+                    linkAttempts: attempts,
+                    grantedScope: grant.GrantedScope),
                 CancellationToken.None).ConfigureAwait(false);
             if (!quarantined)
             {
@@ -655,7 +707,8 @@ public sealed class ScryerUserSessionService : IScryerUserSessionService
             grant.RefreshToken,
             DateTimeOffset.UtcNow,
             ScryerGrantLinkState.PendingRevoke,
-            linkAttempts: Math.Min(MaximumRevocationCleanupAttempts, grant.LinkAttempts + 1));
+            linkAttempts: Math.Min(MaximumRevocationCleanupAttempts, grant.LinkAttempts + 1),
+            grantedScope: grant.GrantedScope);
         try
         {
             if (!await _tokenStore.QuarantineDetachedAsync(tombstone, CancellationToken.None).ConfigureAwait(false))
@@ -691,9 +744,14 @@ public sealed class ScryerUserSessionService : IScryerUserSessionService
         return false;
     }
 
-    private Task RetireRotatedGrantAsync(ScryerGrantKey key, string refreshToken) =>
+    private Task RetireRotatedGrantAsync(ScryerGrantKey key, string refreshToken, string grantedScope) =>
         RetireGrantAsync(
-            new ScryerRefreshGrant(key, refreshToken, DateTimeOffset.UtcNow, ScryerGrantLinkState.Active),
+            new ScryerRefreshGrant(
+                key,
+                refreshToken,
+                DateTimeOffset.UtcNow,
+                ScryerGrantLinkState.Active,
+                grantedScope: grantedScope),
             key.JellyfinUserId);
 
     private SemaphoreSlim GetUserGate(string jellyfinUserId) =>
@@ -721,14 +779,6 @@ public sealed class ScryerUserSessionService : IScryerUserSessionService
 
     private static bool MayHaveSpentRefreshToken(ScryerFailure failure) =>
         failure.Code is ScryerFailureCode.AuthorizationExpired or ScryerFailureCode.ScryerOffline or ScryerFailureCode.InvalidResponse or ScryerFailureCode.InternalError;
-
-    private static bool HasRequiredScopes(string scope)
-    {
-        var scopes = scope.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        return scopes.Length == 2 && scopes.Contains("library", StringComparer.Ordinal) &&
-            scopes.Contains("jellyfin-link", StringComparer.Ordinal);
-    }
-
 
     private static bool SameBinding(ScryerGrantKey left, ScryerGrantKey right) =>
         string.Equals(left.JellyfinUserId, right.JellyfinUserId, StringComparison.Ordinal) &&

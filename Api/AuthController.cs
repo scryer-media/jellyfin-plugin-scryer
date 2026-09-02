@@ -86,8 +86,12 @@ public sealed class AuthController : ControllerBase
         {
             Response.Cookies.Append(staged.FinalizeCookieName!, staged.FinalizeCookieValue!, new CookieOptions
             {
-                HttpOnly = true, IsEssential = true, SameSite = SameSiteMode.Lax, Secure = staged.FinalizeCookieSecure,
-                Path = staged.FinalizeCookiePath, Expires = staged.ExpiresAt
+                HttpOnly = true,
+                IsEssential = true,
+                SameSite = SameSiteMode.Lax,
+                Secure = staged.FinalizeCookieSecure,
+                Path = staged.FinalizeCookiePath,
+                Expires = staged.ExpiresAt
             });
             if (staged.RedirectUri is not null) return Redirect(staged.RedirectUri.AbsoluteUri);
         }
@@ -110,7 +114,11 @@ public sealed class AuthController : ControllerBase
         {
             result = await _flowService.FinalizeAsync(jellyfinUserId, cookie.Value, cancellationToken).ConfigureAwait(false);
             Response.Cookies.Delete(cookie.Key, new CookieOptions { Path = Request.PathBase.Value + Request.Path.Value });
-            if (result.IsSuccess) return Ok(new ScryerAuthStatusDto(true, true, null));
+            if (result.IsSuccess)
+            {
+                var status = await _flowService.GetStatusAsync(jellyfinUserId, CancellationToken.None).ConfigureAwait(false);
+                return Ok(status);
+            }
         }
         return Failure(result?.Failure ?? ScryerFailure.AuthorizationExpired);
     }
@@ -142,7 +150,7 @@ public sealed class AuthController : ControllerBase
             return Failure(disconnected.Failure!);
         }
 
-        return Ok(new ScryerAuthStatusDto(true, false, null));
+        return Ok(new ScryerAuthStatusDto(true, false, false, null));
     }
 
     private IActionResult Failure(ScryerFailure failure) => ScryerFailureHttpMapper.ToActionResult(failure);
