@@ -35,6 +35,7 @@ public interface IScryerGraphqlService
     Task<ScryerResult<JsonElement>> UpdateMyMediaRequestAsync(string jellyfinUserId, JsonElement input, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> CancelMyMediaRequestAsync(string jellyfinUserId, string requestId, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetCalendarEpisodesAsync(string jellyfinUserId, DateOnly startDate, DateOnly endDate, CancellationToken cancellationToken);
+    Task<ScryerResult<IReadOnlyDictionary<string, string?>>> GetTitlePostersAsync(string jellyfinUserId, IReadOnlyList<string> titleIds, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetDownloadQueuePageAsync(string jellyfinUserId, int offset, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetDownloadHistoryPageAsync(string jellyfinUserId, int offset, CancellationToken cancellationToken);
 }
@@ -49,6 +50,8 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
     private const int MaximumSearchLength = 256;
     private const int MaximumPageOffset = 10_000;
     private const int MaximumCalendarRangeDays = 62;
+    private const int TitlePosterBatchSize = 16;
+    private const int MaximumCalendarTitles = 64;
     private static readonly HashSet<string> RecommendationExternalIdSources = new(StringComparer.Ordinal)
     {
         "imdb", "tmdb", "tmdb_movie", "tmdb_series", "tmdb_show", "tmdb_tv",
@@ -73,6 +76,7 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
     private const string UpdateMyMediaRequestMutation = """mutation ScryerUpdateMyMediaRequest($input: UpdateMediaRequestInput!) { updateMyMediaRequest(input: $input) { id libraryId facet status identityFingerprint title requestedQualityProfileId requestedQualityProfileName requestedMonitorType updatedAt } }""";
     private const string CancelMyMediaRequestMutation = """mutation ScryerCancelMyMediaRequest($requestId: ID!) { cancelMyMediaRequest(requestId: $requestId) { requestId } }""";
     private const string CalendarEpisodesQuery = """query ScryerCalendarEpisodes($startDate: Date!, $endDate: Date!) { calendarEpisodes(startDate: $startDate, endDate: $endDate) { id titleId libraryId libraryName librarySlug titleName titleSlug titleFacet seasonNumber episodeNumber episodeTitle overview imageUrl airDate monitored mediaAvailability { state primaryQualityLabel } } }""";
+    private const string TitlePostersQuery = """query ScryerTitlePosters($id0: ID!, $id1: ID!, $id2: ID!, $id3: ID!, $id4: ID!, $id5: ID!, $id6: ID!, $id7: ID!, $id8: ID!, $id9: ID!, $id10: ID!, $id11: ID!, $id12: ID!, $id13: ID!, $id14: ID!, $id15: ID!) { t0: title(id: $id0) { id posterUrl } t1: title(id: $id1) { id posterUrl } t2: title(id: $id2) { id posterUrl } t3: title(id: $id3) { id posterUrl } t4: title(id: $id4) { id posterUrl } t5: title(id: $id5) { id posterUrl } t6: title(id: $id6) { id posterUrl } t7: title(id: $id7) { id posterUrl } t8: title(id: $id8) { id posterUrl } t9: title(id: $id9) { id posterUrl } t10: title(id: $id10) { id posterUrl } t11: title(id: $id11) { id posterUrl } t12: title(id: $id12) { id posterUrl } t13: title(id: $id13) { id posterUrl } t14: title(id: $id14) { id posterUrl } t15: title(id: $id15) { id posterUrl } }""";
     private const string DownloadQueuePageQuery = """query ScryerDownloadQueuePage($offset: Int!) { downloadQueuePage(limit: 50, offset: $offset, scryerSubmittedOnly: true) { items { id titleId episodeId titleName facet clientId clientName clientType state displayState progressPercent sizeBytes remainingSeconds attentionRequired attentionReason importStatus importErrorMessage importedAt } hasMore totalCount revision updatedAt ready stale } }""";
     private const string DownloadHistoryPageQuery = """query ScryerDownloadHistoryPage($offset: Int!) { downloadHistory(limit: 50, offset: $offset, scryerSubmittedOnly: true) { items { id titleId episodeId titleName facet clientId clientName clientType state displayState progressPercent sizeBytes importStatus importErrorMessage importedAt } hasMore totalCount } }""";
 
@@ -184,6 +188,47 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         }, "calendarEpisodes", cancellationToken);
     }
 
+    public async Task<ScryerResult<IReadOnlyDictionary<string, string?>>> GetTitlePostersAsync(
+        string jellyfinUserId,
+        IReadOnlyList<string> titleIds,
+        CancellationToken cancellationToken)
+    {
+        var uniqueIds = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var rawId in titleIds)
+        {
+            if (uniqueIds.Count == MaximumCalendarTitles) break;
+            if (!IsBoundedIdentifier(rawId)) return ScryerResult<IReadOnlyDictionary<string, string?>>.Fail(ScryerFailure.InvalidResponse);
+            var id = rawId.Trim();
+            if (seen.Add(id)) uniqueIds.Add(id);
+        }
+
+        var posters = new Dictionary<string, string?>(StringComparer.Ordinal);
+        for (var offset = 0; offset < uniqueIds.Count; offset += TitlePosterBatchSize)
+        {
+            var count = Math.Min(TitlePosterBatchSize, uniqueIds.Count - offset);
+            var fallbackId = uniqueIds[offset];
+            var variables = new Dictionary<string, string>(TitlePosterBatchSize, StringComparer.Ordinal);
+            for (var index = 0; index < TitlePosterBatchSize; index++)
+            {
+                variables[$"id{index}"] = index < count ? uniqueIds[offset + index] : fallbackId;
+            }
+
+            var result = await ExecuteOperationAsync(jellyfinUserId, "ScryerTitlePosters", TitlePostersQuery, variables, null, cancellationToken).ConfigureAwait(false);
+            if (!result.IsSuccess) return ScryerResult<IReadOnlyDictionary<string, string?>>.Fail(result.Failure!);
+            foreach (var title in result.Value!.EnumerateObject())
+            {
+                if (title.Value.ValueKind != JsonValueKind.Object || !TryReadBoundedString(title.Value, "id", out var id)) continue;
+                var posterUrl = title.Value.TryGetProperty("posterUrl", out var poster) && poster.ValueKind == JsonValueKind.String
+                    ? poster.GetString()?.Trim()
+                    : null;
+                posters[id] = string.IsNullOrEmpty(posterUrl) || posterUrl.Length > 4096 ? null : posterUrl;
+            }
+        }
+
+        return ScryerResult<IReadOnlyDictionary<string, string?>>.Success(posters);
+    }
+
     public Task<ScryerResult<JsonElement>> GetDownloadQueuePageAsync(string jellyfinUserId, int offset, CancellationToken cancellationToken) =>
         ExecuteOperationAsync(jellyfinUserId, "ScryerDownloadQueuePage", DownloadQueuePageQuery, new { offset = Math.Clamp(offset, 0, MaximumPageOffset) }, "downloadQueuePage", cancellationToken);
 
@@ -195,7 +240,7 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             ? ExecuteOperationAsync(jellyfinUserId, operationName, document, new { requestId = requestId.Trim() }, rootField, cancellationToken)
             : Task.FromResult(ScryerResult<JsonElement>.Fail(ScryerFailure.InvalidResponse));
 
-    private async Task<ScryerResult<JsonElement>> ExecuteOperationAsync(string jellyfinUserId, string operationName, string document, object variables, string rootField, CancellationToken cancellationToken)
+    private async Task<ScryerResult<JsonElement>> ExecuteOperationAsync(string jellyfinUserId, string operationName, string document, object variables, string? rootField, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(jellyfinUserId)) return ScryerResult<JsonElement>.Fail(ScryerFailure.NotConnected);
 
@@ -217,7 +262,7 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         return await PostAndProjectAsync(BuildGraphqlEndpoint(currentConfiguration.Value!.InternalAuthority), lease.Value!, payload, rootField, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task<ScryerResult<JsonElement>> PostAndProjectAsync(Uri endpoint, ScryerAccessTokenLease lease, byte[] payload, string rootField, CancellationToken cancellationToken)
+    private async Task<ScryerResult<JsonElement>> PostAndProjectAsync(Uri endpoint, ScryerAccessTokenLease lease, byte[] payload, string? rootField, CancellationToken cancellationToken)
     {
         try
         {
@@ -306,10 +351,17 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         return value.Length is > 0 and <= MaximumIdentifierLength;
     }
 
-    private static bool TryGetRootField(JsonElement root, string rootField, out JsonElement value)
+    private static bool TryGetRootField(JsonElement root, string? rootField, out JsonElement value)
     {
         value = default;
-        return root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object && data.TryGetProperty(rootField, out value);
+        if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) return false;
+        if (rootField is null)
+        {
+            value = data;
+            return true;
+        }
+
+        return data.TryGetProperty(rootField, out value);
     }
 
     private static ScryerResult<JsonElement> AddRequestQualityProfileCompatibility(JsonElement libraries)

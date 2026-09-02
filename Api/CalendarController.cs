@@ -40,8 +40,26 @@ public class CalendarController : ControllerBase
         var start = DateOnly.FromDateTime(DateTime.UtcNow);
         var end = start.AddDays(requestedDays);
         var result = await _graphql.GetCalendarEpisodesAsync(jellyfinUserId, start, end, cancellationToken).ConfigureAwait(false);
-        return result.IsSuccess
-            ? Ok(new { calendarEpisodes = result.Value!, titlePosters = new Dictionary<string, string?>() })
-            : ScryerFailureHttpMapper.ToActionResult(result.Failure!);
+        if (!result.IsSuccess) return ScryerFailureHttpMapper.ToActionResult(result.Failure!);
+
+        var titleIds = new List<string>();
+        if (result.Value!.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var episode in result.Value.EnumerateArray())
+            {
+                if (episode.ValueKind == JsonValueKind.Object && episode.TryGetProperty("titleId", out var titleId) && titleId.ValueKind == JsonValueKind.String)
+                {
+                    var value = titleId.GetString()?.Trim();
+                    if (!string.IsNullOrEmpty(value)) titleIds.Add(value);
+                }
+            }
+        }
+
+        var posters = await _graphql.GetTitlePostersAsync(jellyfinUserId, titleIds, cancellationToken).ConfigureAwait(false);
+        return Ok(new
+        {
+            calendarEpisodes = result.Value,
+            titlePosters = posters.IsSuccess ? posters.Value! : new Dictionary<string, string?>(),
+        });
     }
 }

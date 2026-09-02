@@ -2,7 +2,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '153.12';
+    var VERSION = '153.13';
     var runtime = window.ScryerRuntime153;
     if (!runtime || runtime.version !== VERSION) throw new Error('Scryer loader must run before core.');
     if (window.Scryer && window.Scryer.version === VERSION && window.Scryer._rfc153Installed) {

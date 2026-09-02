@@ -17,7 +17,7 @@ function createCoreHarness(apiClient) {
     const diagnostics = [];
     let nextHandle = 1;
     const window = {
-        ScryerRuntime153: { version: '153.12', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.13', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         ScryerStrings: { pages: {}, states: { requestConflict: 'This request conflicts with its current Scryer state.', internalError: 'The Scryer request could not be completed.' } },
         ApiClient: apiClient,
         addEventListener(name, listener) { listeners.set(name, listener); },
@@ -362,6 +362,15 @@ test('discovery cards render as a clean poster wall without button slabs', () =>
     assert.equal((styles.match(/'\.scryerRow\{/g) || []).length, 1);
     assert.match(styles, /\.scryerRequestRow\{/);
     assert.match(requests, /row\.className = 'scryerRequestRow'/);
+});
+
+test('calendar retries missing episode artwork with the parent title poster', () => {
+    const calendar = readWebAsset('scryer-calendar.js');
+
+    assert.match(calendar, /var urls = \[episodeUrl, titleUrl\]/);
+    assert.match(calendar, /image\.onerror = scope\.guard\(function \(\) \{ tryImage\(index \+ 1\); \}\)/);
+    assert.match(calendar, /renderPosterInto\(card\.querySelector\('\.scryerCalendarPoster'\), item\.imageUrl, titlePosters\[item\.titleId\], scope\)/);
+    assert.doesNotMatch(calendar, /titlePosters\[item\.titleId\] \|\| item\.imageUrl/);
 });
 
 test('OAuth finalization failures remain visible instead of falling back to Connect', () => {

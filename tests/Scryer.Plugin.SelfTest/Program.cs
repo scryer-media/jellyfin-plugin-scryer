@@ -36,6 +36,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("GraphQL maps bounded Scryer capabilities", CapabilityMappingAsync),
     ("watch-history recommendations use fixed bounded GraphQL", TitleRecommendationsAsync),
     ("manageable libraries and direct title adds use fixed GraphQL", DirectCatalogAddAsync),
+    ("calendar title posters use fixed bounded GraphQL batches", CalendarTitlePostersAsync),
     ("detached revoke journal survives restart discovery, promotion, and cleanup", DetachedRevokeJournalAsync),
     ("retiring a detached issued family preserves the current family", DetachedRetirementPreservesCurrentAsync),
     ("detached revoke deletion failure retains its tombstone", DetachedDeletionFailureAsync),
@@ -153,7 +154,7 @@ static Task WebInjectionPreservesBytesAsync()
     Assert.True(result.Injected);
     Assert.True(result.Content.AsSpan(0, prefix.Length).SequenceEqual(prefix));
     Assert.True(result.Content.AsSpan(result.Content.Length - suffix.Length).SequenceEqual(suffix));
-    Assert.Contains("data-scryer-loader=\"153.12\"", Encoding.ASCII.GetString(result.Content));
+    Assert.Contains("data-scryer-loader=\"153.13\"", Encoding.ASCII.GetString(result.Content));
 
     var secondPass = HtmlScriptInjector.Inject(result.Content);
     Assert.True(secondPass.AlreadyPresent);
@@ -411,6 +412,27 @@ static async Task DirectCatalogAddAsync()
     Assert.True(input.GetProperty("monitored").GetBoolean());
     Assert.Equal("tmdb", input.GetProperty("externalIds")[0].GetProperty("source").GetString());
     Assert.Equal("profile-1", input.GetProperty("options").GetProperty("qualityProfileId").GetString());
+}
+
+static async Task CalendarTitlePostersAsync()
+{
+    var handler = new RecordingHandler(_ => JsonResponse("""{"data":{"t0":{"id":"title-1","posterUrl":"/images/media/title-1/w250"},"t1":{"id":"title-2","posterUrl":null}}}"""));
+    var service = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), handler);
+
+    var result = await service.GetTitlePostersAsync(
+        "0123456789abcdef0123456789abcdef",
+        new[] { "title-1", "title-2", "title-1" },
+        CancellationToken.None);
+
+    Assert.True(result.IsSuccess, result.Failure?.Code.ToString());
+    Assert.Equal("/images/media/title-1/w250", result.Value!["title-1"]);
+    Assert.Equal(null, result.Value["title-2"]);
+    using var request = JsonDocument.Parse(handler.Requests.Single().Content!);
+    Assert.Equal("ScryerTitlePosters", request.RootElement.GetProperty("operationName").GetString());
+    Assert.Equal("title-1", request.RootElement.GetProperty("variables").GetProperty("id0").GetString());
+    Assert.Equal("title-2", request.RootElement.GetProperty("variables").GetProperty("id1").GetString());
+    Assert.Equal("title-1", request.RootElement.GetProperty("variables").GetProperty("id2").GetString());
+    Assert.Contains("t15: title(id: $id15)", request.RootElement.GetProperty("query").GetString()!);
 }
 
 static async Task DetachedRevokeJournalAsync()

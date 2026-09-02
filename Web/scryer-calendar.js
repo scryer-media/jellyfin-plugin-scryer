@@ -21,15 +21,20 @@
         if (item.episodeNumber) parts.push('E' + item.episodeNumber);
         return parts.join('');
     }
-    function renderPosterInto(element, url, scope) {
+    function renderPosterInto(element, episodeUrl, titleUrl, scope) {
         element.innerHTML = '<div class="scryerPosterPlaceholder"><svg class="scryerPlaceholderIcon" viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path fill="currentColor" d="M19 4h-1V2h-2v2H8V2H6v2H5c-1.11 0-1.99.9-1.99 2L3 20c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H5V9h14v11z"></path></svg></div>';
-        if (!url) return;
-        resolveImageUrl(url).then(scope.guard(function (resolved) {
-            var image = new Image();
-            image.alt = '';
-            image.onload = scope.guard(function () { element.innerHTML = ''; element.appendChild(image); });
-            image.src = resolved;
-        }));
+        var urls = [episodeUrl, titleUrl].filter(function (url, index, values) { return !!url && values.indexOf(url) === index; });
+        function tryImage(index) {
+            if (index >= urls.length) return;
+            resolveImageUrl(urls[index]).then(scope.guard(function (resolved) {
+                var image = new Image();
+                image.alt = '';
+                image.onload = scope.guard(function () { element.innerHTML = ''; element.appendChild(image); });
+                image.onerror = scope.guard(function () { tryImage(index + 1); });
+                image.src = resolved;
+            }), scope.guard(function () { tryImage(index + 1); }));
+        }
+        tryImage(0);
     }
     function renderCalendar(container, scope) {
         container.innerHTML = '<h1>Calendar</h1><div class="scryerCalendarGrid">' + LOADING_HTML + '</div>';
@@ -53,7 +58,7 @@
                     card.title = item.overview || '';
                     card.innerHTML = '<div class="scryerCalendarPoster"></div><div class="scryerCalendarCardBody"><div class="scryerCalendarCardTitle">' + escapeHtml(item.titleName || 'Untitled') + '</div><div class="scryerCalendarCardEpisode">' + escapeHtml(episodeLabel(item)) + '</div>' + (label ? '<span class="scryerCalendarBadge scryerCalendarBadge-' + escapeHtml(availability) + '">' + escapeHtml(label) + '</span>' : '') + '</div>';
                     groupGrid.appendChild(card);
-                    renderPosterInto(card.querySelector('.scryerCalendarPoster'), titlePosters[item.titleId] || item.imageUrl, scope);
+                    renderPosterInto(card.querySelector('.scryerCalendarPoster'), item.imageUrl, titlePosters[item.titleId], scope);
                 });
             });
         }), scope.guard(function (error) { grid.innerHTML = '<p role="alert">' + escapeHtml(error.message) + '</p>'; }));

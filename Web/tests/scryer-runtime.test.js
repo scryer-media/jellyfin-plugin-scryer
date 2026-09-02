@@ -9,7 +9,7 @@ const webRoot = path.resolve(__dirname, '..');
 function loadCore(apiClient) {
     const listeners = new Map();
     const window = {
-        ScryerRuntime153: { version: '153.12', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.13', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         ApiClient: apiClient,
         addEventListener(name, listener) { listeners.set(name, listener); },
         removeEventListener(name) { listeners.delete(name); },
