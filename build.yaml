@@ -2,7 +2,7 @@
 name: "Scryer"
 guid: "6a9c9f2e-6b2f-4a1a-9d3d-2c7f2f5b3d10"
 imageUrl: "https://raw.githubusercontent.com/scryer-media/jellyfin-plugin-scryer/main/artwork/scryer-plugin.png"
-version: "0.1.11.0"
+version: "0.1.12.0"
 targetAbi: "10.11.0.0"
 framework: "net9.0"
 overview: "Requests, discovery, and calendar pages for Jellyfin, backed by Scryer."
@@ -15,6 +15,6 @@ owner: "scryer-media"
 artifacts:
   - Jellyfin.Plugin.Scryer.dll
 changelog: >
-  Fixes Scryer poster URLs when the configured public endpoint includes a path,
-  replaces plugin-owned icon-font ligatures with SVGs, and prevents Jellyfin
-  header icons from rendering as encoding-corrupted glyphs on Scryer pages.
+  Personalizes discovery from the current Jellyfin user's recent watch history,
+  adds direct catalog actions for users with manage-titles permission, removes
+  the connected banner, and refreshes discovery with a clean poster-wall layout.
