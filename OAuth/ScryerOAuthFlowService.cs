@@ -22,7 +22,7 @@ public interface IScryerOAuthFlowService
 
 /// <summary>
 /// Owns the browser-bound Authorization Code + PKCE flow. The only browser-held flow state is
-/// an opaque data-protected HttpOnly cookie scoped to the exact callback path.
+/// an opaque data-protected, host-only HttpOnly cookie scoped to the Jellyfin origin.
 /// </summary>
 public sealed class ScryerOAuthFlowService : IScryerOAuthFlowService
 {
@@ -118,7 +118,7 @@ public sealed class ScryerOAuthFlowService : IScryerOAuthFlowService
                 authorizationUri,
                 CookiePrefix + flowId,
                 cookie,
-                configuration.RedirectUri.AbsolutePath,
+                "/",
                 configuration.RedirectUri.Scheme == Uri.UriSchemeHttps,
                 transaction.ExpiresAt));
             started = true;
@@ -177,12 +177,12 @@ public sealed class ScryerOAuthFlowService : IScryerOAuthFlowService
             return false;
         }
 
-        if (!Uri.TryCreate(transaction.RedirectUri, UriKind.Absolute, out var redirectUri))
+        if (!Uri.TryCreate(transaction.RedirectUri, UriKind.Absolute, out _))
         {
             return false;
         }
 
-        cookie = new ScryerOAuthCallbackCookie(CookiePrefix + transaction.FlowId, redirectUri.AbsolutePath);
+        cookie = new ScryerOAuthCallbackCookie(CookiePrefix + transaction.FlowId, "/");
         return true;
     }
 
@@ -227,14 +227,14 @@ public sealed class ScryerOAuthFlowService : IScryerOAuthFlowService
             _flowStore.Remove(transaction.State);
             return ScryerOAuthCallbackStageResult.Failed(ScryerFailure.AuthorizationExpired);
         }
-        var path = GetFinalizePath(configured.Value!.RedirectUri);
-        if (!TryBuildCallbackRedirect(configured.Value.RedirectUri, transaction.ReturnPage, out var redirect))
+        var configuration = configured.Value!;
+        if (!TryBuildCallbackRedirect(configuration.RedirectUri, transaction.ReturnPage, out var redirect))
         {
             _flowStore.Remove(transaction.State);
             return ScryerOAuthCallbackStageResult.Failed(ScryerFailure.AuthorizationExpired);
         }
         return new ScryerOAuthCallbackStageResult(true, transaction.ReturnPage, null, FinalizeCookiePrefix + transaction.FlowId,
-            _cookieProtector.Protect(flowId + ":" + binding), path, configured.Value.RedirectUri.Scheme == Uri.UriSchemeHttps,
+            _cookieProtector.Protect(flowId + ":" + binding), "/", configuration.RedirectUri.Scheme == Uri.UriSchemeHttps,
             transaction.ExpiresAt, redirect);
     }
 
@@ -286,9 +286,6 @@ public sealed class ScryerOAuthFlowService : IScryerOAuthFlowService
 
     private static bool ConfigurationMatches(ScryerOAuthFlowTransaction transaction, ScryerOAuthConfiguration configuration) =>
         FixedTimeEquals(transaction.ConfigurationFingerprint, CreateConfigurationFingerprint(configuration)) && FixedTimeEquals(transaction.RedirectUri, configuration.RedirectUri.AbsoluteUri);
-
-    private static string GetFinalizePath(Uri callback) => callback.AbsolutePath.EndsWith("/Scryer/Auth/Callback", StringComparison.Ordinal)
-        ? callback.AbsolutePath[..^"Callback".Length] + "Finalize" : "/Scryer/Auth/Finalize";
 
     private bool TryUnprotectCookie(string protectedCookie, out string flowId, out string browserBinding)
     {

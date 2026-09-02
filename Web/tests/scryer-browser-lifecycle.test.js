@@ -17,7 +17,7 @@ function createCoreHarness(apiClient) {
     const diagnostics = [];
     let nextHandle = 1;
     const window = {
-        ScryerRuntime153: { version: '153.8', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.9', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         ScryerStrings: { pages: {}, states: { requestConflict: 'This request conflicts with its current Scryer state.', internalError: 'The Scryer request could not be completed.' } },
         ApiClient: apiClient,
         addEventListener(name, listener) { listeners.set(name, listener); },
@@ -297,7 +297,8 @@ test('disabled feature navigation, API capability gates, and browser credential 
     ['discovery', 'calendar', 'requests', 'downloads'].forEach((feature) => assert.match(loader, new RegExp("loadScript\\('scryer-" + feature + "\\.js'")));
 
     const combined = runtimeAssets.map(readWebAsset).join('\n');
-    assert.doesNotMatch(combined, /\b(?:localStorage|sessionStorage|indexedDB)\b/);
+    assert.doesNotMatch(combined, /\b(?:localStorage|indexedDB)\b/);
+    assert.match(core, /sessionStorage\.(?:setItem|removeItem)\(OAUTH_POPUP_MARKER/);
     assert.doesNotMatch(combined, /document\.cookie\b/);
     assert.doesNotMatch(combined, /\bAuthorization\s*:/);
     assert.doesNotMatch(combined, /\bBearer\s+/i);
@@ -329,7 +330,7 @@ test('OAuth finalization failures remain visible instead of falling back to Conn
 
     assert.match(core, /state\.finalizeFailure = error/);
     assert.match(core, /finalizeFailure \? codeToConnectionState\(finalizeFailure\.code\) : connectionState/);
-    assert.doesNotMatch(core, /Scryer\/Auth\/Finalize'\)\.catch\(function \(\) \{ return null; \}\)/);
+    assert.match(core, /Scryer\/Auth\/Finalize'\)\.catch\(function \(\) \{ return null; \}\)/);
 });
 
 test('OAuth uses a centered 800 by 700 popup and refreshes its opener', () => {
@@ -341,8 +342,59 @@ test('OAuth uses a centered 800 by 700 popup and refreshes its opener', () => {
     assert.match(core, /popup\.location\.replace\(data\.authorizationUrl\)/);
     assert.match(core, /window\.opener\.postMessage\(\{/);
     assert.match(core, /window\.close\(\);/);
+    assert.match(core, /pollOAuthCompletion\(popup, OAUTH_POLL_LIMIT\)/);
+    assert.match(core, /if \(status && status\.connected\) \{/);
+    assert.match(core, /if \(error && !openerAvailable\) return false;/);
     assert.match(core, /event\.source !== state\.oauthWindow/);
     assert.match(core, /refreshVisiblePage\(\);/);
+});
+
+test('OAuth completion is finalized and detected by the opener without postMessage', async () => {
+    const calls = [];
+    const client = {
+        getUrl(pathName) { return 'https://jellyfin.test/' + pathName; },
+        serverAddress() { return 'https://jellyfin.test'; },
+        getCurrentUserId() { return 'alice'; },
+        getCurrentUser() { return Promise.resolve({ Id: 'alice' }); },
+        ajax(request) {
+            calls.push(request.url);
+            let payload = null;
+            if (request.url.endsWith('/Scryer/Auth/Start')) payload = { AuthorizationUrl: 'https://scryer.test/oauth/authorize' };
+            if (request.url.endsWith('/Scryer/Auth/Status')) payload = { Configured: true, Connected: true, AccountLinked: true };
+            return Promise.resolve({
+                ok: true,
+                status: payload ? 200 : 204,
+                text() { return Promise.resolve(payload ? JSON.stringify(payload) : ''); }
+            });
+        }
+    };
+    const harness = createCoreHarness(client);
+    const popupStorage = new Map();
+    const popup = {
+        closed: false,
+        focus() {},
+        close() { this.closed = true; },
+        location: { replace(url) { this.url = url; } },
+        sessionStorage: {
+            setItem(key, value) { popupStorage.set(key, value); },
+            removeItem(key) { popupStorage.delete(key); }
+        }
+    };
+    harness.window.open = () => popup;
+
+    await harness.Scryer.startConnection('#/scryer-discovery');
+    for (let attempt = 0; attempt < 20 && calls.length < 3; attempt++) await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(JSON.stringify(calls), JSON.stringify([
+        'https://jellyfin.test/Scryer/Auth/Start',
+        'https://jellyfin.test/Scryer/Auth/Finalize',
+        'https://jellyfin.test/Scryer/Auth/Status'
+    ]));
+    assert.equal(popup.location.url, 'https://scryer.test/oauth/authorize');
+    assert.equal(popupStorage.get('scryer-oauth-popup'), '1');
+    assert.equal(popup.closed, true);
+    assert.equal(harness.timeouts.size, 0);
 });
 
 test('account connection uses the centered SVG brand card', () => {

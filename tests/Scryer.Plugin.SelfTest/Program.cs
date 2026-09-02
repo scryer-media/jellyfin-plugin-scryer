@@ -151,7 +151,7 @@ static Task WebInjectionPreservesBytesAsync()
     Assert.True(result.Injected);
     Assert.True(result.Content.AsSpan(0, prefix.Length).SequenceEqual(prefix));
     Assert.True(result.Content.AsSpan(result.Content.Length - suffix.Length).SequenceEqual(suffix));
-    Assert.Contains("data-scryer-loader=\"153.8\"", Encoding.ASCII.GetString(result.Content));
+    Assert.Contains("data-scryer-loader=\"153.9\"", Encoding.ASCII.GetString(result.Content));
 
     var secondPass = HtmlScriptInjector.Inject(result.Content);
     Assert.True(secondPass.AlreadyPresent);
@@ -531,7 +531,8 @@ static async Task OAuthFlowBindingAsync()
         var secondState = QueryValue(second.Value!.AuthorizationUri, "state");
         Assert.True(flow.TryGetCallbackCookie(firstState, out var callbackCookie));
         Assert.Equal(first.Value.CookieName, callbackCookie.Name);
-        Assert.Equal("/base/Scryer/Auth/Callback", callbackCookie.Path);
+        Assert.Equal("/", first.Value.CookiePath);
+        Assert.Equal("/", callbackCookie.Path);
 
         var wrongBrowser = await flow.StageCallbackAsync(firstState, second.Value!.CookieValue, "first-code", null, CancellationToken.None);
         Assert.False(wrongBrowser.Success);
@@ -539,6 +540,7 @@ static async Task OAuthFlowBindingAsync()
         Assert.True(flow.TryGetCallbackCookie(firstState, out _));
         var firstStage = await flow.StageCallbackAsync(firstState, first.Value.CookieValue, "first-code", null, CancellationToken.None);
         Assert.True(firstStage.Success, firstStage.Failure?.Code.ToString());
+        Assert.Equal("/", firstStage.FinalizeCookiePath);
 
         var staged = await flow.StageCallbackAsync(secondState, second.Value.CookieValue, "second-code", null, CancellationToken.None);
         Assert.True(staged.Success, staged.Failure?.Code.ToString());

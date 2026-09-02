@@ -2,7 +2,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '153.8';
+    var VERSION = '153.9';
     var runtime = window.ScryerRuntime153;
     if (!runtime || runtime.version !== VERSION) throw new Error('Scryer loader must run before core.');
     if (window.Scryer && window.Scryer.version === VERSION && window.Scryer._rfc153Installed) {
@@ -24,6 +24,8 @@
     ];
     var PAGES = PAGE_DEFINITIONS.slice();
     var OAUTH_WINDOW_NAME = 'scryer-oauth';
+    var OAUTH_POPUP_MARKER = 'scryer-oauth-popup';
+    var OAUTH_POLL_LIMIT = 180;
     Scryer.PAGES = PAGES;
     Scryer.LOADING_HTML = '<div class="scryerLoading" role="status" aria-live="polite"><div class="scryerSpinner"></div></div>';
 
@@ -121,7 +123,7 @@
     var state = {
         visibleId: null, previousPage: null, featureConfigReady: false, featureConfigKey: null,
         started: false, disposed: false, navObserver: null, reconcileTimer: null, apiReadyTimer: null,
-        finalizeFailure: null, oauthWindow: null
+        finalizeFailure: null, oauthWindow: null, oauthPollTimer: null
     };
 
     function pageById(id) {
@@ -363,18 +365,59 @@
         var top = Math.max(0, Math.round((window.screenY || window.screenTop || 0) + ((window.outerHeight || height) - height) / 2));
         return window.open('', OAUTH_WINDOW_NAME, 'popup=yes,width=' + width + ',height=' + height + ',left=' + left + ',top=' + top + ',resizable=yes,scrollbars=yes');
     }
+    function clearOAuthPolling() {
+        if (state.oauthPollTimer) window.clearTimeout(state.oauthPollTimer);
+        state.oauthPollTimer = null;
+    }
+    function closeOAuthWindow(popup) {
+        try { if (popup && !popup.closed) popup.close(); } catch (error) {}
+    }
+    function completeOAuthConnection(popup) {
+        clearOAuthPolling();
+        closeOAuthWindow(popup);
+        if (state.oauthWindow === popup) state.oauthWindow = null;
+        state.finalizeFailure = null;
+        refreshVisiblePage();
+    }
+    function pollOAuthCompletion(popup, remaining) {
+        if (state.disposed || state.oauthWindow !== popup) return;
+        apiPost('Scryer/Auth/Finalize').catch(function () { return null; }).then(function () {
+            return getConnectionStatus();
+        }).then(function (status) {
+            if (status && status.connected) {
+                completeOAuthConnection(popup);
+                return;
+            }
+            if (remaining <= 1) {
+                clearOAuthPolling();
+                closeOAuthWindow(popup);
+                if (state.oauthWindow === popup) state.oauthWindow = null;
+                var failure = new Error('Scryer authorization did not complete. Try Connect again.');
+                failure.code = 'authorization_expired';
+                state.finalizeFailure = failure;
+                refreshVisiblePage();
+                return;
+            }
+            state.oauthPollTimer = window.setTimeout(function () { pollOAuthCompletion(popup, remaining - 1); }, 1000);
+        }, function () {
+            state.oauthPollTimer = window.setTimeout(function () { pollOAuthCompletion(popup, remaining - 1); }, 1000);
+        });
+    }
     function startConnection(returnPage) {
         var page = pageByRoute(returnPage || window.location.hash);
         var target = page ? page.route : '#/scryer-discovery';
         var popup = openOAuthWindow();
         if (!popup) return Promise.reject(new Error('Allow pop-ups for Jellyfin, then try Connect again.'));
         state.oauthWindow = popup;
+        try { popup.sessionStorage.setItem(OAUTH_POPUP_MARKER, '1'); } catch (error) {}
         popup.focus();
         return apiPost('Scryer/Auth/Start', { returnPage: target }).then(function (data) {
             if (!data || typeof data.authorizationUrl !== 'string' || data.authorizationUrl.length > 4096) throw new Error('Scryer returned an invalid authorization redirect.');
             popup.location.replace(data.authorizationUrl);
+            pollOAuthCompletion(popup, OAUTH_POLL_LIMIT);
         }).catch(function (error) {
-            if (!popup.closed) popup.close();
+            clearOAuthPolling();
+            closeOAuthWindow(popup);
             if (state.oauthWindow === popup) state.oauthWindow = null;
             throw error;
         });
@@ -667,6 +710,7 @@
     function onNavigation() { handleNavigation(); }
     function onOAuthMessage(event) {
         if (event.origin !== window.location.origin || event.source !== state.oauthWindow || !event.data || event.data.type !== 'scryer-oauth-complete') return;
+        clearOAuthPolling();
         state.oauthWindow = null;
         if (event.data.success) {
             state.finalizeFailure = null;
@@ -677,15 +721,24 @@
         }
         refreshVisiblePage();
     }
+    function isOAuthPopup() {
+        if (window.name === OAUTH_WINDOW_NAME) return true;
+        try { return window.sessionStorage.getItem(OAUTH_POPUP_MARKER) === '1'; } catch (error) { return false; }
+    }
     function finishOAuthPopup(status, error) {
-        if (window.name !== OAUTH_WINDOW_NAME || !window.opener || window.opener.closed) return false;
+        if (!isOAuthPopup()) return false;
         if (!error && !(status && status.connected)) return false;
-        window.opener.postMessage({
-            type: 'scryer-oauth-complete',
-            success: !error,
-            code: error ? knownFailureCode(error.code) : null,
-            message: error && error.message ? error.message : null
-        }, window.location.origin);
+        var openerAvailable = !!(window.opener && !window.opener.closed);
+        if (openerAvailable) {
+            window.opener.postMessage({
+                type: 'scryer-oauth-complete',
+                success: !error,
+                code: error ? knownFailureCode(error.code) : null,
+                message: error && error.message ? error.message : null
+            }, window.location.origin);
+        }
+        if (error && !openerAvailable) return false;
+        try { window.sessionStorage.removeItem(OAUTH_POPUP_MARKER); } catch (storageError) {}
         window.close();
         return true;
     }
@@ -703,6 +756,7 @@
         state.disposed = true;
         if (state.reconcileTimer) window.clearTimeout(state.reconcileTimer);
         if (state.apiReadyTimer) window.clearInterval(state.apiReadyTimer);
+        clearOAuthPolling();
         if (state.navObserver) state.navObserver.disconnect();
         state.navObserver = null;
         window.removeEventListener('hashchange', onNavigation, true);

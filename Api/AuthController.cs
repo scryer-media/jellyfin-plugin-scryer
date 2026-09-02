@@ -113,7 +113,7 @@ public sealed class AuthController : ControllerBase
         foreach (var cookie in cookies)
         {
             result = await _flowService.FinalizeAsync(jellyfinUserId, cookie.Value, cancellationToken).ConfigureAwait(false);
-            Response.Cookies.Delete(cookie.Key, new CookieOptions { Path = Request.PathBase.Value + Request.Path.Value });
+            Response.Cookies.Delete(cookie.Key, new CookieOptions { Path = "/" });
             if (result.IsSuccess)
             {
                 var status = await _flowService.GetStatusAsync(jellyfinUserId, CancellationToken.None).ConfigureAwait(false);
