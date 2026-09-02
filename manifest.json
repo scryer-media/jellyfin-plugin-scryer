@@ -10,7 +10,7 @@
     "versions": [
       {
         "version": "0.1.4.0",
-        "changelog": "",
+        "changelog": "Requires Scryer 0.19.8 and fixes administrator diagnostics so compatibility results and the minimum supported Scryer version render correctly.",
         "targetAbi": "10.11.0.0",
         "sourceUrl": "https://github.com/scryer-media/jellyfin-plugin-scryer/releases/download/v0.1.4.0/Jellyfin.Plugin.Scryer_0.1.4.0.zip",
         "checksum": "98a7e8c7d9dea27998b5b62db20b2159",
