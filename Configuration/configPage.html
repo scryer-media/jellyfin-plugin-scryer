@@ -11,7 +11,7 @@
                 <div class="verticalSection">
                     <h2>Scryer Plugin Settings</h2>
                     <div class="fieldDescription">
-                        This Alpha supports Jellyfin 10.11.x web clients and Scryer 0.19.6.
+                        This Alpha supports Jellyfin 10.11.x web clients and Scryer 0.19.8.
                         Each person connects their own Scryer account; do not enter a shared Scryer API key here.
                     </div>
                 </div>
@@ -132,7 +132,22 @@
             return ApiClient.getJSON(ApiClient.getUrl(path));
         }
 
+        function normalizeApiPayload(value) {
+            if (Array.isArray(value)) return value.map(normalizeApiPayload);
+            if (!value || typeof value !== 'object') return value;
+            var normalized = {};
+            Object.keys(value).forEach(function (sourceKey) {
+                if (sourceKey === '__proto__' || sourceKey === 'constructor' || sourceKey === 'prototype') return;
+                var targetKey = /^[A-Z]/.test(sourceKey)
+                    ? sourceKey.charAt(0).toLowerCase() + sourceKey.slice(1)
+                    : sourceKey;
+                normalized[targetKey] = normalizeApiPayload(value[sourceKey]);
+            });
+            return normalized;
+        }
+
         function displayDiagnostics(diagnostics) {
+            diagnostics = normalizeApiPayload(diagnostics);
             var lines = [];
             lines.push(diagnostics.configurationValid ? 'Configuration: valid.' : 'Configuration: invalid.');
             (diagnostics.configurationErrors || []).forEach(function (error) { lines.push(error); });
