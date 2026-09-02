@@ -491,11 +491,18 @@
         if (code === 'scryer_incompatible') return 'incompatible';
         return 'offline';
     }
+    function connectionStateForStatus(status) {
+        var failureCode = status && status.failure && status.failure.code;
+        if (!status || !status.configured) return codeToConnectionState(failureCode || 'not_configured');
+        if (!status.connected) return codeToConnectionState(failureCode || 'not_connected');
+        return null;
+    }
+    Scryer._testing.connectionStateForStatus = connectionStateForStatus;
     Scryer.withConnectionGate = function (container, scope, page, renderFeature) {
         container.innerHTML = Scryer.LOADING_HTML;
         getConnectionStatus().then(scope.guard(function (status) {
-            if (!status || !status.configured) { renderConnectionState(container, codeToConnectionState(status && status.failure && status.failure.code), scope, page); return; }
-            if (!status.connected) { renderConnectionState(container, codeToConnectionState(status.failure && status.failure.code), scope, page); return; }
+            var connectionState = connectionStateForStatus(status);
+            if (connectionState) { renderConnectionState(container, connectionState, scope, page); return; }
             if (status.accountLinked === false) {
                 var anonymousBody = renderConnectionState(container, 'anonymous', scope, page);
                 scope.own(renderFeature(anonymousBody, scope));

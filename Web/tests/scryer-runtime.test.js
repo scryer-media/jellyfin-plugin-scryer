@@ -98,6 +98,12 @@ test('anonymous OAuth status has dedicated connected copy', () => {
     assert.match(source, /Scryer connected as Anonymous\. Account linking is unavailable\./);
 });
 
+test('an unlinked configured user is prompted to connect', () => {
+    const Scryer = loadCore();
+    assert.equal(Scryer._testing.connectionStateForStatus({ configured: true, connected: false, accountLinked: false }), 'connect');
+    assert.equal(Scryer._testing.connectionStateForStatus({ configured: false, connected: false }), 'unconfigured');
+});
+
 test('generation gates reject callbacks from a closed or replaced UI operation', () => {
     const Scryer = loadCore();
     const gate = Scryer.ui.createGenerationGate();
