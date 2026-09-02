@@ -62,8 +62,11 @@ In Jellyfin, open **Dashboard > Plugins > Repositories**, add a repository named
 https://raw.githubusercontent.com/scryer-media/jellyfin-plugin-scryer/main/manifest.json
 ```
 
-Open **Catalog**, install **Scryer**, and restart Jellyfin. The repository manifest
-describes the currently published packages; unreleased source changes are not included.
+After saving the repository, leave and reopen **Plugins** (or reload the page) so the
+already-open catalog does not keep its previous package list. Install **Scryer**, restart
+Jellyfin, and confirm **Dashboard > Plugins** reports Scryer as **Active**. The
+repository manifest describes the currently published packages; unreleased source changes
+are not included. Use the `main` URL above rather than a feature-branch manifest URL.
 
 ### From a release archive or local build
 
@@ -167,6 +170,10 @@ endpoint to reject use. It is not merely a cosmetic navigation setting.
 
 ## Troubleshooting
 
+- **Scryer is missing from the plugin catalog:** confirm the repository is enabled and
+  uses the exact `main` manifest URL above, then leave and reopen **Plugins** or reload
+  Jellyfin Web. If it is still missing, run **Dashboard > Scheduled Tasks > Update
+  Plugins**, wait for completion, and reload the catalog.
 - **Scryer pages do not appear:** confirm the plugin is enabled, restart Jellyfin after
   installation, use the bundled Jellyfin web client, and run plugin diagnostics.
 - **Callback mismatch:** copy the exact calculated callback; check scheme, hostname,
@@ -210,6 +217,19 @@ package cache available, build with:
 dotnet build --no-restore
 node --test Web/tests/scryer-browser-lifecycle.test.js Web/tests/scryer-runtime.test.js
 ```
+
+To verify the published repository through Jellyfin's real package installer, run the
+Docker smoke test (requires Docker, curl, jq, and Python 3):
+
+```sh
+tests/catalog-install-smoke.sh
+```
+
+The smoke test starts a clean Jellyfin 10.11.11 instance, discovers Scryer through the
+public `main` manifest, installs the archive, restarts Jellyfin, and verifies that the
+plugin is active and serves the current OAuth configuration page rather than the legacy
+API-key page. Pass another manifest URL as the first argument when validating a candidate
+repository.
 
 Real-instance validation should use multiple Jellyfin users mapped to distinct Scryer
 users with different permissions. Do not test against production without separate,

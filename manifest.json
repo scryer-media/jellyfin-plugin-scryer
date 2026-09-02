@@ -4,8 +4,9 @@
     "name": "Scryer",
     "description": "Requests, discovery, and calendar pages for Jellyfin, backed by Scryer.",
     "overview": "Scryer adds Overseerr/Jellyseerr-style request management plus discovery, calendar, and download pages directly into Jellyfin, using Scryer for metadata and images.",
-    "owner": "not-akari",
+    "owner": "scryer-media",
     "category": "General",
+    "imageUrl": "https://raw.githubusercontent.com/scryer-media/jellyfin-plugin-scryer/main/artwork/scryer-plugin.png",
     "versions": [
       {
         "version": "0.1.2.0",
