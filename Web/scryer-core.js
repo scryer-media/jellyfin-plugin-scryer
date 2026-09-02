@@ -2,7 +2,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '153.7';
+    var VERSION = '153.8';
     var runtime = window.ScryerRuntime153;
     if (!runtime || runtime.version !== VERSION) throw new Error('Scryer loader must run before core.');
     if (window.Scryer && window.Scryer.version === VERSION && window.Scryer._rfc153Installed) {
@@ -23,6 +23,7 @@
         { id: 'download', feature: 'downloads', title: Strings.pages.downloads || 'Downloads', icon: 'download', route: '#/scryer-download' }
     ];
     var PAGES = PAGE_DEFINITIONS.slice();
+    var OAUTH_WINDOW_NAME = 'scryer-oauth';
     Scryer.PAGES = PAGES;
     Scryer.LOADING_HTML = '<div class="scryerLoading" role="status" aria-live="polite"><div class="scryerSpinner"></div></div>';
 
@@ -119,7 +120,8 @@
 
     var state = {
         visibleId: null, previousPage: null, featureConfigReady: false, featureConfigKey: null,
-        started: false, disposed: false, navObserver: null, reconcileTimer: null, apiReadyTimer: null
+        started: false, disposed: false, navObserver: null, reconcileTimer: null, apiReadyTimer: null,
+        finalizeFailure: null, oauthWindow: null
     };
 
     function pageById(id) {
@@ -203,6 +205,7 @@
         Scryer.PAGES = PAGES;
         Scryer.lifecycle.disposeAll();
         document.querySelectorAll('.scryerSection, [id^="scryer-page-"], .scryer-runtime-owned').forEach(function (element) { element.remove(); });
+        if (document.body && document.body.classList) document.body.classList.remove('scryerPageActive');
         state.visibleId = null;
         state.previousPage = null;
     }
@@ -301,8 +304,13 @@
         });
     }
 
+    function pluginApiUrl(client, path) {
+        var clientUrl = new URL(client.getUrl(path), window.location.href);
+        return new URL(clientUrl.pathname + clientUrl.search, window.location.origin + '/').href;
+    }
+    Scryer._testing.pluginApiUrl = pluginApiUrl;
     function apiCallForClient(client, method, path, body) {
-        return client.ajax({ type: method, url: client.getUrl(path), data: body ? JSON.stringify(body) : undefined, contentType: body ? 'application/json' : undefined }).then(parseApiResponse, function (error) {
+        return client.ajax({ type: method, url: pluginApiUrl(client, path), data: body ? JSON.stringify(body) : undefined, contentType: body ? 'application/json' : undefined }).then(parseApiResponse, function (error) {
             if (error && typeof error.text === 'function') return parseApiResponse(error);
             throw error;
         });
@@ -348,12 +356,27 @@
     Scryer.resolveImageUrl = resolveImageUrl;
     function getConnectionStatus() { return apiGet('Scryer/Auth/Status'); }
     Scryer.getConnectionStatus = getConnectionStatus;
+    function openOAuthWindow() {
+        var width = 800;
+        var height = 700;
+        var left = Math.max(0, Math.round((window.screenX || window.screenLeft || 0) + ((window.outerWidth || width) - width) / 2));
+        var top = Math.max(0, Math.round((window.screenY || window.screenTop || 0) + ((window.outerHeight || height) - height) / 2));
+        return window.open('', OAUTH_WINDOW_NAME, 'popup=yes,width=' + width + ',height=' + height + ',left=' + left + ',top=' + top + ',resizable=yes,scrollbars=yes');
+    }
     function startConnection(returnPage) {
         var page = pageByRoute(returnPage || window.location.hash);
         var target = page ? page.route : '#/scryer-discovery';
+        var popup = openOAuthWindow();
+        if (!popup) return Promise.reject(new Error('Allow pop-ups for Jellyfin, then try Connect again.'));
+        state.oauthWindow = popup;
+        popup.focus();
         return apiPost('Scryer/Auth/Start', { returnPage: target }).then(function (data) {
             if (!data || typeof data.authorizationUrl !== 'string' || data.authorizationUrl.length > 4096) throw new Error('Scryer returned an invalid authorization redirect.');
-            window.location.assign(data.authorizationUrl);
+            popup.location.replace(data.authorizationUrl);
+        }).catch(function (error) {
+            if (!popup.closed) popup.close();
+            if (state.oauthWindow === popup) state.oauthWindow = null;
+            throw error;
         });
     }
     Scryer.startConnection = startConnection;
@@ -477,6 +500,7 @@
             var connect = document.createElement('button');
             connect.type = 'button'; connect.className = 'raised button-submit scryerConnectButton'; connect.textContent = 'Connect';
             scope.on(connect, 'click', function () {
+                state.finalizeFailure = null;
                 connect.disabled = true;
                 renderConnectionState(container, 'connecting', scope, page);
                 startConnection(page.route).catch(scope.guard(function (error) { renderConnectionState(container, 'offline', scope, page, error.message); }));
@@ -515,7 +539,12 @@
         container.innerHTML = Scryer.LOADING_HTML;
         getConnectionStatus().then(scope.guard(function (status) {
             var connectionState = connectionStateForStatus(status);
-            if (connectionState) { renderConnectionState(container, connectionState, scope, page); return; }
+            if (connectionState) {
+                var finalizeFailure = state.finalizeFailure;
+                renderConnectionState(container, finalizeFailure ? codeToConnectionState(finalizeFailure.code) : connectionState, scope, page, finalizeFailure && finalizeFailure.message);
+                return;
+            }
+            state.finalizeFailure = null;
             if (status.accountLinked === false) {
                 var anonymousBody = renderConnectionState(container, 'anonymous', scope, page);
                 scope.own(renderFeature(anonymousBody, scope));
@@ -591,9 +620,11 @@
         if (force && state.visibleId === id) Scryer.lifecycle.unmount(id);
         var container = getContainer(page);
         container.classList.remove('hide'); state.visibleId = id;
+        if (document.body && document.body.classList) document.body.classList.add('scryerPageActive');
         mountPage(page);
     }
     function hidePage() {
+        if (document.body && document.body.classList) document.body.classList.remove('scryerPageActive');
         if (!state.visibleId) return;
         var element = document.getElementById('scryer-page-' + state.visibleId);
         Scryer.lifecycle.unmount(state.visibleId);
@@ -634,9 +665,34 @@
         }, 80);
     }
     function onNavigation() { handleNavigation(); }
+    function onOAuthMessage(event) {
+        if (event.origin !== window.location.origin || event.source !== state.oauthWindow || !event.data || event.data.type !== 'scryer-oauth-complete') return;
+        state.oauthWindow = null;
+        if (event.data.success) {
+            state.finalizeFailure = null;
+        } else {
+            var failure = new Error(typeof event.data.message === 'string' ? event.data.message : failureMessage(event.data.code));
+            failure.code = knownFailureCode(event.data.code);
+            state.finalizeFailure = failure;
+        }
+        refreshVisiblePage();
+    }
+    function finishOAuthPopup(status, error) {
+        if (window.name !== OAUTH_WINDOW_NAME || !window.opener || window.opener.closed) return false;
+        if (!error && !(status && status.connected)) return false;
+        window.opener.postMessage({
+            type: 'scryer-oauth-complete',
+            success: !error,
+            code: error ? knownFailureCode(error.code) : null,
+            message: error && error.message ? error.message : null
+        }, window.location.origin);
+        window.close();
+        return true;
+    }
     function installGlobalRuntime() {
         window.addEventListener('hashchange', onNavigation, true);
         window.addEventListener('popstate', onNavigation, true);
+        window.addEventListener('message', onOAuthMessage, false);
         state.navObserver = new MutationObserver(function (records) {
             for (var index = 0; index < records.length && index < 64; index++) if (isRuntimeSurface(records[index].target)) { scheduleReconcile(); return; }
         });
@@ -651,15 +707,25 @@
         state.navObserver = null;
         window.removeEventListener('hashchange', onNavigation, true);
         window.removeEventListener('popstate', onNavigation, true);
+        window.removeEventListener('message', onOAuthMessage, false);
         Scryer.lifecycle.disposeAll();
         document.querySelectorAll('.scryerSection, [id^="scryer-page-"], .scryer-runtime-owned').forEach(function (element) { element.remove(); });
+        if (document.body && document.body.classList) document.body.classList.remove('scryerPageActive');
         state.started = false; state.visibleId = null;
     };
     Scryer.startRuntime = function () {
         if (state.started && !state.disposed) return Promise.resolve();
         state.disposed = false; state.started = true;
         installGlobalRuntime();
-        return apiPost('Scryer/Auth/Finalize').catch(function () { return null; }).then(function () { return loadFeatureConfiguration(); }).then(function () {
+        var popupFinished = false;
+        return apiPost('Scryer/Auth/Finalize').then(function (status) {
+            state.finalizeFailure = null;
+            popupFinished = finishOAuthPopup(status, null);
+        }, function (error) {
+            state.finalizeFailure = error;
+            popupFinished = finishOAuthPopup(null, error);
+        }).then(function () { return popupFinished ? null : loadFeatureConfiguration(); }).then(function () {
+            if (popupFinished) return;
             injectNav(); handleNavigation();
         });
     };

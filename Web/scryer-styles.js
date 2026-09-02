@@ -64,6 +64,7 @@
         '.scryerBannerWarning{background:rgba(229,160,13,.15);border:1px solid rgba(229,160,13,.4)}' +
         '.scryerBannerClose{background:none;border:none;color:inherit;font-size:1.3em;cursor:pointer;opacity:.7}' +
         '.scryerBannerClose:hover{opacity:1}' +
+        '.scryerPageActive .pageTitle{display:none}' +
         '.scryerConnectCard{box-sizing:border-box;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1.35em;width:min(38em,calc(100% - 2em));min-height:24em;margin:3em auto;padding:2.5em 2em;border:1px solid rgba(255,255,255,.12);border-radius:1.1em;background:rgba(8,14,30,.78);box-shadow:0 1.2em 3em rgba(0,0,0,.35);text-align:center}' +
         '.scryerConnectBrands{display:flex;align-items:center;justify-content:center;gap:1.4em;width:100%}' +
         '.scryerConnectLogo{display:block;width:7.5em;height:7.5em;flex:0 0 7.5em}' +

@@ -9,7 +9,7 @@ const webRoot = path.resolve(__dirname, '..');
 function loadCore() {
     const listeners = new Map();
     const window = {
-        ScryerRuntime153: { version: '153.7', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.8', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         addEventListener(name, listener) { listeners.set(name, listener); },
         removeEventListener(name) { listeners.delete(name); },
         setInterval() { return 1; },
@@ -90,6 +90,15 @@ test('Jellyfin DTO responses normalize to the browser field contract', () => {
         accountLinked: false,
         capabilities: { scryerUserId: 'user-c', libraries: [{ libraryId: 'view', canView: true }] }
     }));
+});
+
+test('plugin API calls stay on the web-shell origin so callback cookies are sent', () => {
+    const Scryer = loadCore();
+    const client = { getUrl(path) { return 'http://jellyfin.internal:8096/base/' + path; } };
+    assert.equal(
+        Scryer._testing.pluginApiUrl(client, 'Scryer/Auth/Finalize'),
+        'https://jellyfin.test/base/Scryer/Auth/Finalize'
+    );
 });
 
 test('anonymous OAuth status has dedicated connected copy', () => {

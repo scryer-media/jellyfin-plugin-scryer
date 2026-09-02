@@ -17,7 +17,7 @@ function createCoreHarness(apiClient) {
     const diagnostics = [];
     let nextHandle = 1;
     const window = {
-        ScryerRuntime153: { version: '153.7', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.8', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         ScryerStrings: { pages: {}, states: { requestConflict: 'This request conflicts with its current Scryer state.', internalError: 'The Scryer request could not be completed.' } },
         ApiClient: apiClient,
         addEventListener(name, listener) { listeners.set(name, listener); },
@@ -315,9 +315,34 @@ test('injected and loaded web assets share one cache version', () => {
 
 test('custom pages use Jellyfin library page spacing below the fixed header', () => {
     const core = readWebAsset('scryer-core.js');
+    const styles = readWebAsset('scryer-styles.js');
 
     assert.match(core, /root\.className = 'page type-interior libraryPage mainAnimatedPage hide scryer-runtime-owned';/);
     assert.doesNotMatch(core, /querySelector\('\.pageTitle'\)/);
+    assert.match(core, /classList\.add\('scryerPageActive'\)/);
+    assert.match(core, /classList\.remove\('scryerPageActive'\)/);
+    assert.match(styles, /\.scryerPageActive \.pageTitle\{display:none\}/);
+});
+
+test('OAuth finalization failures remain visible instead of falling back to Connect', () => {
+    const core = readWebAsset('scryer-core.js');
+
+    assert.match(core, /state\.finalizeFailure = error/);
+    assert.match(core, /finalizeFailure \? codeToConnectionState\(finalizeFailure\.code\) : connectionState/);
+    assert.doesNotMatch(core, /Scryer\/Auth\/Finalize'\)\.catch\(function \(\) \{ return null; \}\)/);
+});
+
+test('OAuth uses a centered 800 by 700 popup and refreshes its opener', () => {
+    const core = readWebAsset('scryer-core.js');
+
+    assert.match(core, /var width = 800;/);
+    assert.match(core, /var height = 700;/);
+    assert.match(core, /window\.open\('', OAUTH_WINDOW_NAME,/);
+    assert.match(core, /popup\.location\.replace\(data\.authorizationUrl\)/);
+    assert.match(core, /window\.opener\.postMessage\(\{/);
+    assert.match(core, /window\.close\(\);/);
+    assert.match(core, /event\.source !== state\.oauthWindow/);
+    assert.match(core, /refreshVisiblePage\(\);/);
 });
 
 test('account connection uses the centered SVG brand card', () => {
