@@ -10,7 +10,7 @@
     "versions": [
       {
         "version": "0.1.13.0",
-        "changelog": "",
+        "changelog": "Falls back from unavailable episode artwork to the parent title poster on calendar cards, using bounded server-side title lookups and browser load-failure retry.",
         "targetAbi": "10.11.0.0",
         "sourceUrl": "https://github.com/scryer-media/jellyfin-plugin-scryer/releases/download/v0.1.13.0/Jellyfin.Plugin.Scryer_0.1.13.0.zip",
         "checksum": "a7a5d3d4eade42ea8ea2935995ded47a",
