@@ -29,6 +29,7 @@
     <EmbeddedResource Include="Web\scryer-requests.js" />
     <EmbeddedResource Include="Web\scryer-downloads.js" />
     <EmbeddedResource Include="Web\scryer-logo.svg" />
+    <EmbeddedResource Include="Web\jellyfin-logo.svg" />
   </ItemGroup>
 
 </Project>

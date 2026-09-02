@@ -58,6 +58,20 @@ public class WebAssetsController : ControllerBase
         return File(stream, "image/svg+xml");
     }
 
+    [HttpGet("jellyfin-logo.svg")]
+    public ActionResult GetJellyfinLogo()
+    {
+        var stream = Assembly.GetExecutingAssembly()
+            .GetManifestResourceStream("Jellyfin.Plugin.Scryer.Web.jellyfin-logo.svg");
+        if (stream is null)
+        {
+            return NotFound();
+        }
+
+        Response.Headers.CacheControl = "public,max-age=86400";
+        return File(stream, "image/svg+xml");
+    }
+
     [HttpGet("config")]
     public ActionResult<object> GetConfig()
     {

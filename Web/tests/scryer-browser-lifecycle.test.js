@@ -17,7 +17,7 @@ function createCoreHarness(apiClient) {
     const diagnostics = [];
     let nextHandle = 1;
     const window = {
-        ScryerRuntime153: { version: '153.6', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.7', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         ScryerStrings: { pages: {}, states: { requestConflict: 'This request conflicts with its current Scryer state.', internalError: 'The Scryer request could not be completed.' } },
         ApiClient: apiClient,
         addEventListener(name, listener) { listeners.set(name, listener); },
@@ -327,7 +327,8 @@ test('account connection uses the centered SVG brand card', () => {
     assert.match(core, /class="scryerConnectCard"/);
     assert.match(core, /src="\/Scryer\/Web\/scryer-logo\.svg"/);
     assert.match(core, /class="scryerConnectArrows"/);
-    assert.match(core, /aria-label="Jellyfin"/);
+    assert.match(core, /src="\/Scryer\/Web\/jellyfin-logo\.svg" alt="Jellyfin"/);
+    assert.match(readWebAsset('jellyfin-logo.svg'), /viewBox="0 0 512 512"/);
     assert.match(core, /scryerConnectButton/);
     assert.match(styles, /\.scryerConnectCard\{[^}]*align-items:center/);
     assert.match(styles, /\.scryerConnectButton\{[^}]*linear-gradient/);

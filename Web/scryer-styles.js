@@ -68,8 +68,7 @@
         '.scryerConnectBrands{display:flex;align-items:center;justify-content:center;gap:1.4em;width:100%}' +
         '.scryerConnectLogo{display:block;width:7.5em;height:7.5em;flex:0 0 7.5em}' +
         '.scryerConnectScryerLogo{object-fit:contain}' +
-        '.scryerConnectJellyfinLogo{overflow:visible}' +
-        '.scryerConnectJellyfinOuter{fill:#00a4dc}.scryerConnectJellyfinInner{fill:#aa5cc3}' +
+        '.scryerConnectJellyfinLogo{object-fit:contain}' +
         '.scryerConnectArrows{width:4.4em;height:2.8em;flex:0 1 4.4em;fill:none;stroke:#fff;stroke-width:4;stroke-linecap:round;stroke-linejoin:round;opacity:.88}' +
         '.scryerConnectMessage{max-width:30em;margin:0;font-size:1.15em;line-height:1.5}' +
         '.scryerConnectCard .scryerConnectionActions{width:min(22em,100%)}' +

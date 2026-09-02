@@ -123,13 +123,13 @@ public class ScriptTagInjectionStartupFilter : IStartupFilter
 
 internal static class HtmlScriptInjector
 {
-    internal const string LoaderVersion = "153.6";
+    internal const string LoaderVersion = "153.7";
     private const string ScriptTag =
-        "<script src=\"/Scryer/Web/scryer-loader.js?v=153.6\" data-scryer-loader=\"153.6\" defer></script>";
+        "<script src=\"/Scryer/Web/scryer-loader.js?v=153.7\" data-scryer-loader=\"153.7\" defer></script>";
 
     private static readonly byte[] BodyClose = Encoding.ASCII.GetBytes("</body>");
     private static readonly byte[] LoaderPath = Encoding.ASCII.GetBytes("/Scryer/Web/scryer-loader.js");
-    private static readonly byte[] LoaderMarker = Encoding.ASCII.GetBytes("data-scryer-loader=\"153.6\"");
+    private static readonly byte[] LoaderMarker = Encoding.ASCII.GetBytes("data-scryer-loader=\"153.7\"");
     private static readonly byte[] ScriptBytes = Encoding.ASCII.GetBytes(ScriptTag + "\n");
 
     internal static (byte[] Content, bool Injected, bool AlreadyPresent) Inject(byte[] html)

@@ -2,7 +2,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '153.6';
+    var VERSION = '153.7';
     var runtime = window.ScryerRuntime153;
     if (!runtime || runtime.version !== VERSION) throw new Error('Scryer loader must run before core.');
     if (window.Scryer && window.Scryer.version === VERSION && window.Scryer._rfc153Installed) {
@@ -464,7 +464,7 @@
                 '<div class="scryerConnectBrands">' +
                     '<img class="scryerConnectLogo scryerConnectScryerLogo" src="/Scryer/Web/scryer-logo.svg" alt="Scryer">' +
                     '<svg class="scryerConnectArrows" viewBox="0 0 70 44" aria-hidden="true"><path d="M5 12h48m0 0-9-8m9 8-9 8M65 32H17m0 0 9-8m-9 8 9 8"/></svg>' +
-                    '<svg class="scryerConnectLogo scryerConnectJellyfinLogo" viewBox="0 0 72 72" role="img" aria-label="Jellyfin"><path class="scryerConnectJellyfinInner" d="M24.2116 49.1581C22.6599 46.0424 32.8378 27.5879 35.9999 27.5879C39.1666 27.5895 49.3228 46.0764 47.7882 49.1581C46.2536 52.2398 25.7632 52.2738 24.2116 49.1581Z"/><path class="scryerConnectJellyfinOuter" fill-rule="evenodd" d="M.4819 64.9951C-4.1948 55.6047 26.4765 0 36 0c9.5328 0 40.153 55.713 35.5274 64.9951C66.9018 74.2773 5.1585 74.3856.4819 64.9951Zm12.2539-8.1481c3.0647 6.1525 43.5178 6.0844 46.5485 0C62.3149 50.761 42.2515 14.2605 36.0093 14.2605c-6.2423 0-26.3381 36.4339-23.2735 42.5865Z"/></svg>' +
+                    '<img class="scryerConnectLogo scryerConnectJellyfinLogo" src="/Scryer/Web/jellyfin-logo.svg" alt="Jellyfin">' +
                 '</div>' +
                 '<p class="scryerConnectMessage">' + message + '</p>' +
                 '<div class="scryerConnectionActions"></div>' +
