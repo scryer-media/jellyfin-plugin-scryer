@@ -42,7 +42,7 @@ configuration; it does not grant Scryer permissions.
 ## Requirements
 
 - Jellyfin 10.11.x with the bundled Jellyfin web client.
-- Scryer 0.19.8 with manual custom OAuth application registration.
+- Scryer 0.19.7 with manual custom OAuth application registration.
 - Browser-reachable HTTPS URLs for Scryer and Jellyfin. Plain HTTP is accepted only for
   loopback development; private-network HTTP for the internal Scryer connection requires
   an explicit insecure opt-in.
@@ -87,7 +87,7 @@ the `Web` directory separately.
 
 ## Set up Scryer OAuth
 
-Scryer 0.19.8 uses manual custom OAuth application registration. Its setup does not
+Scryer 0.19.7 uses manual custom OAuth application registration. Its setup does not
 prefill values from a Jellyfin media-server connection and does not automatically link a
 Jellyfin identity to a Scryer account.
 
@@ -102,7 +102,7 @@ The plugin uses a public OAuth client with a client ID and no client secret:
 2. In Scryer, open **Settings > Security > OAuth applications** and select
    **Register an application**.
 3. Enter a descriptive application name such as `Scryer for Jellyfin`.
-4. Enter the exact callback in **HTTPS callback URLs**. Scryer 0.19.8 accepts one exact
+4. Enter the exact callback in **HTTPS callback URLs**. Scryer 0.19.7 accepts one exact
    HTTPS callback URL per line.
 5. Create the application and copy its OAuth client ID into the Jellyfin plugin settings.
 

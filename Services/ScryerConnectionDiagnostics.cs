@@ -21,7 +21,7 @@ namespace Jellyfin.Plugin.Scryer.Services;
 /// </summary>
 public sealed class ScryerConnectionDiagnostics : IDisposable
 {
-    public const string MinimumScryerVersion = "0.19.8";
+    public const string MinimumScryerVersion = "0.19.7";
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(5);
     private const int MaximumGraphQlProbeRequestBytes = 8 * 1024;
     private const int MaximumGraphQlProbeResponseBytes = 128 * 1024;
