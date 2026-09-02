@@ -278,15 +278,29 @@ public sealed class ScryerOAuthMetadataClient
                     configuration.PublicAuthority,
                     publicAuthorization,
                     publicToken,
-                    publicRevocation)))
+                    publicRevocation) ||
+                (SameOrigin(advertisedIssuer, configuration.PublicAuthority) &&
+                    MatchesMetadataSet(
+                        advertisedIssuer,
+                        advertisedAuthorization,
+                        advertisedToken,
+                        advertisedRevocation,
+                        advertisedIssuer,
+                        BuildEndpoint(advertisedIssuer, "oauth/authorize"),
+                        BuildEndpoint(advertisedIssuer, "oauth/token"),
+                        BuildEndpoint(advertisedIssuer, "oauth/revoke")))))
         {
             return ScryerResult<ScryerOAuthMetadata>.Fail(ScryerFailure.Incompatible);
         }
 
-        // Metadata is contract evidence only. Credential-bearing requests use fixed endpoint
-        // paths on configured authorities and never preserve metadata-controlled prefixes.
+        // Credential-bearing requests use fixed endpoint paths on configured authorities.
+        // The browser-facing authorization endpoint may use the advertised path when it is
+        // on the configured public origin, so a copied SPA path cannot leak into the OAuth URL.
+        var browserAuthorization = SameOrigin(advertisedAuthorization, configuration.PublicAuthority)
+            ? advertisedAuthorization
+            : publicAuthorization;
         return ScryerResult<ScryerOAuthMetadata>.Success(new ScryerOAuthMetadata(
-            publicAuthorization,
+            browserAuthorization,
             internalToken,
             internalRevocation,
             advertisedIssuer.AbsoluteUri.TrimEnd('/')));

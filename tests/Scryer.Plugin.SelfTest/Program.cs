@@ -9,6 +9,7 @@ using Jellyfin.Plugin.Scryer.Api;
 using Jellyfin.Plugin.Scryer.Configuration;
 using Jellyfin.Plugin.Scryer.OAuth;
 using Jellyfin.Plugin.Scryer.Services;
+using Jellyfin.Plugin.Scryer.WebInjection;
 using MediaBrowser.Common.Configuration;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Http;
@@ -23,6 +24,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("trusted Jellyfin actor canonicalizes and rejects ambiguity", TrustedActorAsync),
     ("configuration derives only the exact callback", ConfigurationAsync),
     ("OAuth metadata enforces the fixed contract", MetadataAsync),
+    ("web injection preserves original response bytes", WebInjectionPreservesBytesAsync),
     ("token exchange accepts only exact library scope sets", TokenExchangeAsync),
     ("PKCE is RFC 7636 S256", PkceAsync),
     ("Jellyfin link GraphQL request and response are fixed", JellyfinLinkAsync),
@@ -124,10 +126,37 @@ static async Task MetadataAsync()
     Assert.Equal("http://127.0.0.1:41111/base/oauth/token", result.Value.TokenEndpoint.AbsoluteUri.TrimEnd('/'));
     Assert.Equal("/base/.well-known/oauth-authorization-server", handler.Requests.Single().RequestUri!.AbsolutePath);
 
+    var copiedPageConfiguration = ValidPluginConfiguration();
+    copiedPageConfiguration.ScryerPublicBaseUrl = "https://scryer.example.test/system/users";
+    var copiedPageResult = await client.DiscoverAsync(
+        ScryerOAuthConfiguration.FromPluginConfiguration(copiedPageConfiguration).Value!,
+        CancellationToken.None);
+    Assert.True(copiedPageResult.IsSuccess, copiedPageResult.Failure?.Code.ToString());
+    Assert.Equal("https://scryer.example.test/oauth/authorize", copiedPageResult.Value!.AuthorizationEndpoint.AbsoluteUri.TrimEnd('/'));
+
     var badHandler = new RecordingHandler(_ => JsonResponse(ValidMetadataJson(tokenEndpoint: "https://evil.example.test/oauth/token")));
     var incompatible = await new ScryerOAuthMetadataClient(badHandler).DiscoverAsync(configuration, CancellationToken.None);
     Assert.False(incompatible.IsSuccess);
     Assert.Equal(ScryerFailureCode.ScryerIncompatible, incompatible.Failure!.Code);
+}
+
+static Task WebInjectionPreservesBytesAsync()
+{
+    var prefix = new byte[] { 0xff, 0xfe, 0x80 };
+    var shell = Encoding.ASCII.GetBytes("<HTML><body>Jellyfin</BODY>");
+    var suffix = new byte[] { 0x81, 0x00 };
+    var original = prefix.Concat(shell).Concat(suffix).ToArray();
+
+    var result = HtmlScriptInjector.Inject(original);
+    Assert.True(result.Injected);
+    Assert.True(result.Content.AsSpan(0, prefix.Length).SequenceEqual(prefix));
+    Assert.True(result.Content.AsSpan(result.Content.Length - suffix.Length).SequenceEqual(suffix));
+    Assert.Contains("data-scryer-loader=\"153.6\"", Encoding.ASCII.GetString(result.Content));
+
+    var secondPass = HtmlScriptInjector.Inject(result.Content);
+    Assert.True(secondPass.AlreadyPresent);
+    Assert.True(secondPass.Content.SequenceEqual(result.Content));
+    return Task.CompletedTask;
 }
 
 static async Task TokenExchangeAsync()

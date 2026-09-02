@@ -43,6 +43,21 @@ public class WebAssetsController : ControllerBase
         Response.Headers.CacheControl = "no-store";
         return File(stream, "application/javascript");
     }
+
+    [HttpGet("scryer-logo.svg")]
+    public ActionResult GetScryerBrand()
+    {
+        var stream = Assembly.GetExecutingAssembly()
+            .GetManifestResourceStream("Jellyfin.Plugin.Scryer.Web.scryer-logo.svg");
+        if (stream is null)
+        {
+            return NotFound();
+        }
+
+        Response.Headers.CacheControl = "public,max-age=86400";
+        return File(stream, "image/svg+xml");
+    }
+
     [HttpGet("config")]
     public ActionResult<object> GetConfig()
     {

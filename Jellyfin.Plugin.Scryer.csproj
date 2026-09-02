@@ -7,11 +7,12 @@
     <AssemblyName>Jellyfin.Plugin.Scryer</AssemblyName>
     <RootNamespace>Jellyfin.Plugin.Scryer</RootNamespace>
     <Product>Scryer</Product>
-    <Version>0.1.7.0</Version>
+    <Version>0.1.8.0</Version>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Remove="tests/**/*.cs" />
+    <InternalsVisibleTo Include="Scryer.Plugin.SelfTest" />
     <!-- Version must match the target Jellyfin server's plugin ABI (10.11.x server -> Jellyfin.Controller 10.11.x). -->
     <PackageReference Include="Jellyfin.Controller" Version="10.11.11" />
     <PackageReference Include="Jellyfin.Model" Version="10.11.11" />
@@ -27,6 +28,7 @@
     <EmbeddedResource Include="Web\scryer-calendar.js" />
     <EmbeddedResource Include="Web\scryer-requests.js" />
     <EmbeddedResource Include="Web\scryer-downloads.js" />
+    <EmbeddedResource Include="Web\scryer-logo.svg" />
   </ItemGroup>
 
 </Project>

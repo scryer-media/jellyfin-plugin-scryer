@@ -64,6 +64,18 @@
         '.scryerBannerWarning{background:rgba(229,160,13,.15);border:1px solid rgba(229,160,13,.4)}' +
         '.scryerBannerClose{background:none;border:none;color:inherit;font-size:1.3em;cursor:pointer;opacity:.7}' +
         '.scryerBannerClose:hover{opacity:1}' +
+        '.scryerConnectCard{box-sizing:border-box;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1.35em;width:min(38em,calc(100% - 2em));min-height:24em;margin:3em auto;padding:2.5em 2em;border:1px solid rgba(255,255,255,.12);border-radius:1.1em;background:rgba(8,14,30,.78);box-shadow:0 1.2em 3em rgba(0,0,0,.35);text-align:center}' +
+        '.scryerConnectBrands{display:flex;align-items:center;justify-content:center;gap:1.4em;width:100%}' +
+        '.scryerConnectLogo{display:block;width:7.5em;height:7.5em;flex:0 0 7.5em}' +
+        '.scryerConnectScryerLogo{object-fit:contain}' +
+        '.scryerConnectJellyfinLogo{overflow:visible}' +
+        '.scryerConnectJellyfinOuter{fill:#00a4dc}.scryerConnectJellyfinInner{fill:#aa5cc3}' +
+        '.scryerConnectArrows{width:4.4em;height:2.8em;flex:0 1 4.4em;fill:none;stroke:#fff;stroke-width:4;stroke-linecap:round;stroke-linejoin:round;opacity:.88}' +
+        '.scryerConnectMessage{max-width:30em;margin:0;font-size:1.15em;line-height:1.5}' +
+        '.scryerConnectCard .scryerConnectionActions{width:min(22em,100%)}' +
+        '.scryerConnectButton{box-sizing:border-box;width:100%;min-height:3.4em;border:0;border-radius:.55em;background:linear-gradient(100deg,#355baa,#de2189);color:#fff;font-size:1.15em;font-weight:700;letter-spacing:.02em;cursor:pointer}' +
+        '.scryerConnectButton:hover{filter:brightness(1.12)}.scryerConnectButton:disabled{cursor:wait;filter:saturate(.45);opacity:.72}' +
+        '@media(max-width:34em){.scryerConnectCard{min-height:20em;margin:1.5em auto;padding:2em 1.25em}.scryerConnectBrands{gap:.75em}.scryerConnectLogo{width:5.7em;height:5.7em;flex-basis:5.7em}.scryerConnectArrows{width:3.1em;flex-basis:3.1em}}' +
         '.scryerRequestTabs{display:flex;align-items:center;flex-wrap:wrap;gap:1.5em;margin:1em 0 1.2em;border-bottom:1px solid rgba(255,255,255,.1);padding-bottom:.8em}' +
         '.scryerTabGroup{display:flex;gap:1.2em}' +
         '.scryerDownloadTabs{margin:1em 0 1.2em;border-bottom:1px solid rgba(255,255,255,.1);padding-bottom:.8em}' +

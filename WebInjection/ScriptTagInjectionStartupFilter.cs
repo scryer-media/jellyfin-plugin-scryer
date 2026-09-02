@@ -12,9 +12,6 @@ namespace Jellyfin.Plugin.Scryer.WebInjection;
 // Injects versioned plugin assets into jellyfin-web's index.html at request time.
 public class ScriptTagInjectionStartupFilter : IStartupFilter
 {
-    private const string ScriptTag =
-        "<script src=\"/Scryer/Web/scryer-loader.js?v=153.5\" data-scryer-loader=\"153.5\" defer></script>";
-
     private readonly ILogger<ScriptTagInjectionStartupFilter> _logger;
     private readonly ScryerInjectionStatus _status;
     private int _loggedOnce;
@@ -75,21 +72,15 @@ public class ScriptTagInjectionStartupFilter : IStartupFilter
             return;
         }
 
-        string html;
-        using (var reader = new StreamReader(buffer, Encoding.UTF8, true, 1024, leaveOpen: true))
-        {
-            html = await reader.ReadToEndAsync().ConfigureAwait(false);
-        }
+        var bytes = buffer.ToArray();
 
         try
         {
-            var alreadyInjected = html.IndexOf("data-scryer-loader=\"153.5\"", StringComparison.OrdinalIgnoreCase) >= 0
-                || html.IndexOf("/Scryer/Web/scryer-loader.js", StringComparison.OrdinalIgnoreCase) >= 0;
-            var bodyClose = html.LastIndexOf("</body>", StringComparison.OrdinalIgnoreCase);
+            var injection = HtmlScriptInjector.Inject(bytes);
+            bytes = injection.Content;
 
-            if (!alreadyInjected && bodyClose >= 0)
+            if (injection.Injected)
             {
-                html = html.Substring(0, bodyClose) + ScriptTag + "\n" + html.Substring(bodyClose);
                 _status.RecordInjected();
 
                 if (System.Threading.Interlocked.Exchange(ref _loggedOnce, 1) == 0)
@@ -97,7 +88,7 @@ public class ScriptTagInjectionStartupFilter : IStartupFilter
                     _logger.LogInformation("Scryer web assets injected via request-time middleware.");
                 }
             }
-            else if (alreadyInjected)
+            else if (injection.AlreadyPresent)
             {
                 _status.RecordAlreadyPresent();
             }
@@ -114,8 +105,6 @@ public class ScriptTagInjectionStartupFilter : IStartupFilter
             _logger.LogWarning(ex, "Scryer script tag injection failed; serving original HTML.");
         }
 
-        var bytes = Encoding.UTF8.GetBytes(html);
-        context.Response.ContentType = "text/html;charset=utf-8";
         context.Response.ContentLength = bytes.Length;
         context.Response.Headers.Remove("ETag");
         context.Response.Headers.Remove("Last-Modified");
@@ -130,4 +119,81 @@ public class ScriptTagInjectionStartupFilter : IStartupFilter
                 || path.EndsWith("/web/", StringComparison.OrdinalIgnoreCase)
                 || path.Equals("/web", StringComparison.OrdinalIgnoreCase));
     }
+}
+
+internal static class HtmlScriptInjector
+{
+    internal const string LoaderVersion = "153.6";
+    private const string ScriptTag =
+        "<script src=\"/Scryer/Web/scryer-loader.js?v=153.6\" data-scryer-loader=\"153.6\" defer></script>";
+
+    private static readonly byte[] BodyClose = Encoding.ASCII.GetBytes("</body>");
+    private static readonly byte[] LoaderPath = Encoding.ASCII.GetBytes("/Scryer/Web/scryer-loader.js");
+    private static readonly byte[] LoaderMarker = Encoding.ASCII.GetBytes("data-scryer-loader=\"153.6\"");
+    private static readonly byte[] ScriptBytes = Encoding.ASCII.GetBytes(ScriptTag + "\n");
+
+    internal static (byte[] Content, bool Injected, bool AlreadyPresent) Inject(byte[] html)
+    {
+        var alreadyPresent = IndexOfAsciiIgnoreCase(html, LoaderMarker) >= 0
+            || IndexOfAsciiIgnoreCase(html, LoaderPath) >= 0;
+        if (alreadyPresent)
+        {
+            return (html, false, true);
+        }
+
+        var bodyClose = LastIndexOfAsciiIgnoreCase(html, BodyClose);
+        if (bodyClose < 0)
+        {
+            return (html, false, false);
+        }
+
+        var result = new byte[html.Length + ScriptBytes.Length];
+        Buffer.BlockCopy(html, 0, result, 0, bodyClose);
+        Buffer.BlockCopy(ScriptBytes, 0, result, bodyClose, ScriptBytes.Length);
+        Buffer.BlockCopy(html, bodyClose, result, bodyClose + ScriptBytes.Length, html.Length - bodyClose);
+        return (result, true, false);
+    }
+
+    private static int IndexOfAsciiIgnoreCase(byte[] value, byte[] pattern)
+    {
+        for (var index = 0; index <= value.Length - pattern.Length; index++)
+        {
+            if (MatchesAsciiIgnoreCase(value, index, pattern))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    private static int LastIndexOfAsciiIgnoreCase(byte[] value, byte[] pattern)
+    {
+        for (var index = value.Length - pattern.Length; index >= 0; index--)
+        {
+            if (MatchesAsciiIgnoreCase(value, index, pattern))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    private static bool MatchesAsciiIgnoreCase(byte[] value, int offset, byte[] pattern)
+    {
+        for (var index = 0; index < pattern.Length; index++)
+        {
+            if (FoldAscii(value[offset + index]) != FoldAscii(pattern[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static byte FoldAscii(byte value) => value is >= (byte)'A' and <= (byte)'Z'
+        ? (byte)(value + ('a' - 'A'))
+        : value;
 }

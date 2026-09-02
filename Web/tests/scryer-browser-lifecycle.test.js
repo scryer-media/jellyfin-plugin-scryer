@@ -17,7 +17,7 @@ function createCoreHarness(apiClient) {
     const diagnostics = [];
     let nextHandle = 1;
     const window = {
-        ScryerRuntime153: { version: '153.5', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
+        ScryerRuntime153: { version: '153.6', modules: {}, registerModule(name, version) { this.modules[name] = version; } },
         ScryerStrings: { pages: {}, states: { requestConflict: 'This request conflicts with its current Scryer state.', internalError: 'The Scryer request could not be completed.' } },
         ApiClient: apiClient,
         addEventListener(name, listener) { listeners.set(name, listener); },
@@ -317,4 +317,18 @@ test('custom pages use Jellyfin library page spacing below the fixed header', ()
     const core = readWebAsset('scryer-core.js');
 
     assert.match(core, /root\.className = 'page type-interior libraryPage mainAnimatedPage hide scryer-runtime-owned';/);
+    assert.doesNotMatch(core, /querySelector\('\.pageTitle'\)/);
+});
+
+test('account connection uses the centered SVG brand card', () => {
+    const core = readWebAsset('scryer-core.js');
+    const styles = readWebAsset('scryer-styles.js');
+
+    assert.match(core, /class="scryerConnectCard"/);
+    assert.match(core, /src="\/Scryer\/Web\/scryer-logo\.svg"/);
+    assert.match(core, /class="scryerConnectArrows"/);
+    assert.match(core, /aria-label="Jellyfin"/);
+    assert.match(core, /scryerConnectButton/);
+    assert.match(styles, /\.scryerConnectCard\{[^}]*align-items:center/);
+    assert.match(styles, /\.scryerConnectButton\{[^}]*linear-gradient/);
 });
