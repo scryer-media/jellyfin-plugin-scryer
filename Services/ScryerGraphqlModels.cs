@@ -27,6 +27,11 @@ public sealed record ScryerRecommendationSeed(
     string Facet,
     IReadOnlyDictionary<string, string> ProviderIds);
 
+/// <summary>A watch-history-derived recommendation group returned from one GraphQL batch.</summary>
+public sealed record ScryerRecommendationGroup(
+    string Title,
+    IReadOnlyList<ScryerTvDiscoveryItem> Items);
+
 /// <summary>A title projected into the native Jellyfin channel surface.</summary>
 public sealed record ScryerTvDiscoveryItem(
     string TargetKey,

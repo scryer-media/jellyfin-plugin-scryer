@@ -83,40 +83,12 @@
             renderFacetTabs();
             renderCategories([{ title: 'Results', items: found.filter(function (item) { return activeFacet === 'ALL' || facetOf(item) === activeFacet; }) }]);
         }
-        function recommendationLookups(seed) {
-            var ids = seed.providerIds || {};
-            var lookups = [];
-            function add(source, value) { if (value) lookups.push({ source: source, value: value }); }
-            if (seed.kind === 'MOVIE') {
-                add('tmdb', ids.tmdb); add('tmdb_movie', ids.tmdb);
-                add('imdb', ids.imdb);
-                add('tvdb', ids.tvdb); add('tvdb_movie', ids.tvdb);
-            } else {
-                add('tvdb', ids.tvdb); add('tvdb_series', ids.tvdb); add('tvdb_show', ids.tvdb);
-                add('tmdb', ids.tmdb); add('tmdb_series', ids.tmdb); add('tmdb_tv', ids.tmdb); add('tmdb_show', ids.tmdb);
-                add('imdb', ids.imdb);
-            }
-            return lookups;
-        }
-        function recommendationGroup(seed) {
-            var lookups = recommendationLookups(seed);
-            function tryLookup(index) {
-                if (index >= lookups.length) return Promise.resolve(null);
-                var lookup = lookups[index];
-                return apiGet('Scryer/Discovery/MoreLikeThis?source=' + encodeURIComponent(lookup.source) + '&value=' + encodeURIComponent(lookup.value) + '&limit=20').then(function (data) {
-                    var matches = data.recommendationTitles || [];
-                    if (!matches.length) return tryLookup(index + 1);
-                    var recommendations = matches[0].moreLikeThis || [];
-                    return recommendations.length ? { title: 'More like ' + seed.title, items: recommendations } : null;
-                });
-            }
-            return tryLookup(0);
-        }
         function recentRecommendationGroups() {
             return Scryer.getRecentWatchSeeds(5).then(function (seeds) {
-                return Promise.all(seeds.map(recommendationGroup));
-            }).then(function (groups) {
-                return groups.filter(function (group) { return !!group; }).slice(0, 5);
+                if (!seeds.length) return [];
+                return apiPost('Scryer/Discovery/Recommendations', { Seeds: seeds }).then(function (data) {
+                    return (data.recommendationGroups || []).slice(0, 5);
+                });
             }).catch(function () { return []; });
         }
         function uniqueGroups(groups) {

@@ -25,6 +25,7 @@ public interface IScryerGraphqlService
     Task<ScryerResult<JsonElement>> GetQualityProfilesAsync(string jellyfinUserId, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetDiscoveryHomeCardsAsync(string jellyfinUserId, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetTitleRecommendationsAsync(string jellyfinUserId, string source, string value, int limit, CancellationToken cancellationToken);
+    Task<ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>> GetRecommendationGroupsAsync(string jellyfinUserId, IReadOnlyList<ScryerRecommendationSeed> seeds, int limit, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> SearchMetadataMultiAsync(string jellyfinUserId, string query, int limit, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetDiscoveryItemDetailAsync(string jellyfinUserId, string targetKey, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetMyMediaRequestsAsync(string jellyfinUserId, CancellationToken cancellationToken);
@@ -53,6 +54,8 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
     private const int MaximumSearchLength = 256;
     private const int MaximumPageOffset = 10_000;
     private const int MaximumCalendarRangeDays = 62;
+    private const int MaximumRecommendationSeeds = 5;
+    private const int MaximumGraphqlBatchOperations = 100;
     private const int TitlePosterBatchSize = 16;
     private const int MaximumCalendarTitles = 64;
     private static readonly HashSet<string> RecommendationExternalIdSources = new(StringComparer.Ordinal)
@@ -134,6 +137,71 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         && limit is >= 1 and <= 30
             ? ExecuteOperationAsync(jellyfinUserId, "ScryerTitleRecommendations", TitleRecommendationsQuery, new { source, values = new[] { value.Trim() }, limit }, "titlesByExternalIds", cancellationToken)
             : Task.FromResult(ScryerResult<JsonElement>.Fail(ScryerFailure.InvalidResponse));
+
+    public async Task<ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>> GetRecommendationGroupsAsync(
+        string jellyfinUserId,
+        IReadOnlyList<ScryerRecommendationSeed> seeds,
+        int limit,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(seeds);
+        if (seeds.Count > MaximumRecommendationSeeds || limit is < 1 or > 30 ||
+            seeds.Any(seed => seed is null || !IsBoundedIdentifier(seed.Title) || NormalizeFacet(seed.Facet) is null || seed.ProviderIds is null))
+        {
+            return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Fail(ScryerFailure.InvalidResponse);
+        }
+
+        var lookups = seeds
+            .Select((seed, seedIndex) => RecommendationLookups(seed).Select(lookup => (SeedIndex: seedIndex, lookup.Source, lookup.Value)))
+            .SelectMany(seedLookups => seedLookups)
+            .ToArray();
+        if (lookups.Length > MaximumGraphqlBatchOperations)
+        {
+            return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Fail(ScryerFailure.InvalidResponse);
+        }
+
+        if (lookups.Length == 0)
+        {
+            return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Success(Array.Empty<ScryerRecommendationGroup>());
+        }
+
+        var operations = lookups.Select(lookup => new
+        {
+            operationName = "ScryerTitleRecommendations",
+            query = TitleRecommendationsQuery,
+            variables = new { source = lookup.Source, values = new[] { lookup.Value }, limit }
+        }).ToArray();
+        var batch = await ExecuteBatchOperationsAsync(jellyfinUserId, operations, "titlesByExternalIds", cancellationToken).ConfigureAwait(false);
+        if (!batch.IsSuccess)
+        {
+            return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Fail(batch.Failure!);
+        }
+
+        var groups = new List<ScryerRecommendationGroup>();
+        for (var seedIndex = 0; seedIndex < seeds.Count; seedIndex++)
+        {
+            for (var lookupIndex = 0; lookupIndex < lookups.Length; lookupIndex++)
+            {
+                if (lookups[lookupIndex].SeedIndex != seedIndex)
+                {
+                    continue;
+                }
+
+                if (!TryParseRecommendationItems(batch.Value![lookupIndex], out var items))
+                {
+                    return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Fail(ScryerFailure.InvalidResponse);
+                }
+
+                if (items.Count > 0)
+                {
+                    groups.Add(new ScryerRecommendationGroup($"More like {seeds[seedIndex].Title.Trim()}", items));
+                    break;
+                }
+            }
+        }
+
+        return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Success(groups);
+    }
 
     public Task<ScryerResult<JsonElement>> SearchMetadataMultiAsync(string jellyfinUserId, string query, int limit, CancellationToken cancellationToken) =>
         string.IsNullOrWhiteSpace(query) || query.Trim().Length > MaximumSearchLength
@@ -254,27 +322,27 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         var rails = new List<ScryerTvDiscoveryRail>();
         var seenTargets = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (var seed in recentSeeds.Take(5))
+        var recommendations = await GetRecommendationGroupsAsync(
+            jellyfinUserId,
+            recentSeeds.Take(MaximumRecommendationSeeds).ToArray(),
+            20,
+            cancellationToken).ConfigureAwait(false);
+        if (!recommendations.IsSuccess)
         {
-            foreach (var lookup in RecommendationLookups(seed))
+            return ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>.Fail(recommendations.Failure!);
+        }
+
+        foreach (var group in recommendations.Value!)
+        {
+            if (!TryResolvePosterUrls(group.Items, publicAuthority, out var resolvedItems))
             {
-                var recommendation = await GetTitleRecommendationsAsync(jellyfinUserId, lookup.Source, lookup.Value, 20, cancellationToken).ConfigureAwait(false);
-                if (!recommendation.IsSuccess || !TryParseRecommendationItems(recommendation.Value!, out var items))
-                {
-                    continue;
-                }
+                continue;
+            }
 
-                if (!TryResolvePosterUrls(items, publicAuthority, out var resolvedItems))
-                {
-                    continue;
-                }
-
-                var unique = Deduplicate(resolvedItems, seenTargets);
-                if (unique.Count > 0)
-                {
-                    rails.Add(new ScryerTvDiscoveryRail($"recent:{rails.Count}:{seed.Title}", $"More like {seed.Title}", unique));
-                    break;
-                }
+            var unique = Deduplicate(resolvedItems, seenTargets);
+            if (unique.Count > 0)
+            {
+                rails.Add(new ScryerTvDiscoveryRail($"recent:{rails.Count}:{group.Title}", group.Title, unique));
             }
         }
 
@@ -731,6 +799,91 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         }
 
         return await PostAndProjectAsync(BuildGraphqlEndpoint(currentConfiguration.Value!.InternalAuthority), lease.Value!, payload, rootField, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<ScryerResult<IReadOnlyList<JsonElement>>> ExecuteBatchOperationsAsync<T>(
+        string jellyfinUserId,
+        IReadOnlyList<T> operations,
+        string rootField,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(jellyfinUserId))
+        {
+            return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.NotConnected);
+        }
+
+        if (operations.Count is < 1 or > MaximumGraphqlBatchOperations)
+        {
+            return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse);
+        }
+
+        byte[] payload;
+        try { payload = JsonSerializer.SerializeToUtf8Bytes(operations); }
+        catch (JsonException) { return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse); }
+        if (payload.Length > MaximumRequestBytes) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse);
+
+        var configuration = _configurationProvider.GetConfiguration();
+        if (!configuration.IsSuccess) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(configuration.Failure!);
+        var lease = await _sessionService.GetAccessTokenAsync(jellyfinUserId, cancellationToken).ConfigureAwait(false);
+        if (!lease.IsSuccess) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(lease.Failure!);
+        var currentConfiguration = _configurationProvider.GetConfiguration();
+        if (!currentConfiguration.IsSuccess || !SameConfiguration(configuration.Value!, currentConfiguration.Value!))
+        {
+            return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.AuthorizationExpired);
+        }
+
+        return await PostBatchAndProjectAsync(
+            BuildGraphqlEndpoint(currentConfiguration.Value!.InternalAuthority),
+            lease.Value!,
+            payload,
+            operations.Count,
+            rootField,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<ScryerResult<IReadOnlyList<JsonElement>>> PostBatchAndProjectAsync(
+        Uri endpoint,
+        ScryerAccessTokenLease lease,
+        byte[] payload,
+        int expectedCount,
+        string rootField,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = new ByteArrayContent(payload) };
+            request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", lease.AccessToken);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/graphql-response+json"));
+            using var timeout = CreateTimeout(cancellationToken);
+            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
+            var statusFailure = MapStatus(response.StatusCode);
+            if (HasTerminalHttpFailure(response.StatusCode)) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(statusFailure!);
+            if (!IsJsonResponse(response.Content.Headers.ContentType)) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(statusFailure ?? ScryerFailure.InvalidResponse);
+
+            using var document = await ReadJsonAsync(response.Content, timeout.Token).ConfigureAwait(false);
+            if (statusFailure is not null || document.RootElement.ValueKind != JsonValueKind.Array || document.RootElement.GetArrayLength() != expectedCount)
+            {
+                return ScryerResult<IReadOnlyList<JsonElement>>.Fail(statusFailure ?? ScryerFailure.InvalidResponse);
+            }
+
+            var projected = new List<JsonElement>(expectedCount);
+            foreach (var operation in document.RootElement.EnumerateArray())
+            {
+                var graphQlFailure = MapGraphQlFailure(operation);
+                if (graphQlFailure is not null) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(graphQlFailure);
+                if (!TryGetRootField(operation, rootField, out var root)) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse);
+                projected.Add(root.Clone());
+            }
+
+            return ScryerResult<IReadOnlyList<JsonElement>>.Success(projected);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.Offline); }
+        catch (HttpRequestException) { return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.Offline); }
+        catch (JsonException) { return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse); }
+        catch (InvalidDataException) { return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse); }
+        catch (UriFormatException) { return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse); }
     }
 
     private async Task<ScryerResult<JsonElement>> PostAndProjectAsync(Uri endpoint, ScryerAccessTokenLease lease, byte[] payload, string? rootField, CancellationToken cancellationToken)

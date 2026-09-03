@@ -459,7 +459,7 @@ static async Task AndroidTvDiscoveryAsync()
 {
     var responses = new Queue<string>(new[]
     {
-        """{"data":{"titlesByExternalIds":[{"id":"seed","name":"Watched","moreLikeThis":[{"id":"one","targetKey":"tmdb:movie:1","targetKind":"MOVIE","displayTitle":"First","year":2026,"posterUrl":"https://scryer.example.test/first.avif"},{"id":"duplicate","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Duplicate","year":2025,"posterUrl":null}]}]}}""",
+        """[{"data":{"titlesByExternalIds":[]}},{"data":{"titlesByExternalIds":[{"id":"seed","name":"Watched","moreLikeThis":[{"id":"one","targetKey":"tmdb:movie:1","targetKind":"MOVIE","displayTitle":"First","year":2026,"posterUrl":"https://scryer.example.test/first.avif"},{"id":"duplicate","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Duplicate","year":2025,"posterUrl":null}]}]}}]""",
         """{"data":{"discoveryHomeCards":{"canViewPersonalized":true,"heroItem":null,"publicSections":[{"sectionId":"public","title":"Public","items":[{"id":"duplicate","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Duplicate","year":2025,"posterUrl":null},{"id":"three","targetKey":"tvdb:series:3","targetKind":"SERIES","displayTitle":"Third","year":2024,"posterUrl":null}]}],"personalizedSections":[{"sectionId":"personal","title":"For You","items":[{"id":"four","targetKey":"tmdb:movie:4","targetKind":"MOVIE","displayTitle":"Fourth","year":2023,"posterUrl":"/images/four.avif"}]}]}}}"""
     });
     var handler = new RecordingHandler(_ => JsonResponse(responses.Dequeue()));
@@ -477,6 +477,11 @@ static async Task AndroidTvDiscoveryAsync()
         .SequenceEqual(new[] { "tmdb:movie:1", "tmdb:movie:2", "tmdb:movie:4", "tvdb:series:3" }));
     Assert.Equal("https://scryer.example.test/images/four.avif", result.Value![1].Items[0].PosterUrl);
     Assert.Equal(2, handler.Requests.Count);
+    using var recommendationBatch = JsonDocument.Parse(handler.Requests[0].Content!);
+    Assert.Equal(JsonValueKind.Array, recommendationBatch.RootElement.ValueKind);
+    Assert.Equal(2, recommendationBatch.RootElement.GetArrayLength());
+    Assert.Equal("tmdb", recommendationBatch.RootElement[0].GetProperty("variables").GetProperty("source").GetString());
+    Assert.Equal("tmdb_movie", recommendationBatch.RootElement[1].GetProperty("variables").GetProperty("source").GetString());
 }
 
 static async Task AndroidTvActionsAsync()

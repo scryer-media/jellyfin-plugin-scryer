@@ -337,8 +337,9 @@ test('discovery prepends at most five watch-history recommendation rails', () =>
     const discovery = readWebAsset('scryer-discovery.js');
 
     assert.match(discovery, /Scryer\.getRecentWatchSeeds\(5\)/);
-    assert.match(discovery, /Scryer\/Discovery\/MoreLikeThis\?source=/);
-    assert.match(discovery, /groups\.filter\(function \(group\) \{ return !!group; \}\)\.slice\(0, 5\)/);
+    assert.match(discovery, /apiPost\('Scryer\/Discovery\/Recommendations', \{ Seeds: seeds \}\)/);
+    assert.match(discovery, /\(data\.recommendationGroups \|\| \[\]\)\.slice\(0, 5\)/);
+    assert.doesNotMatch(discovery, /Scryer\/Discovery\/MoreLikeThis\?source=/);
     assert.match(discovery, /results\[0\]\.concat\(results\[1\]\.groups\)/);
 });
 
