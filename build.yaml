@@ -20,5 +20,6 @@ changelog: >
   container deployments, and quarantines rather than deletes records it cannot
   decrypt. Makes the Android TV discovery channel opt-in and stops it writing
   Series rows or anonymous stubs into the Jellyfin
-  library database, and reports what preflight actually checked instead of
-  claiming a minimum Scryer version the plugin never verifies.
+  library database, removes the channel rows 0.1.14.0 already wrote into that
+  database, and reports what preflight actually checked instead of claiming a
+  minimum Scryer version the plugin never verifies.

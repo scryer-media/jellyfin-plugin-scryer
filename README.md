@@ -171,8 +171,17 @@ Android TV discovery channel** on the plugin configuration page; it also require
 It is opt-in because a Jellyfin channel is not a live view. Jellyfin persists every
 channel item it fetches as a row in its own library database, separately for each Jellyfin
 user, and re-fetches them from the daily **Refresh Channels** scheduled task. On a server
-with many users this creates a correspondingly large number of rows, and turning the
-channel back off does not remove rows Jellyfin has already stored.
+with many users this creates a correspondingly large number of rows.
+
+The plugin retracts the rows it caused. A cleanup sweep runs once at server startup and
+again whenever the plugin configuration is saved. With the channel off it removes every
+Scryer discovery channel item Jellyfin has stored, together with the metadata directories
+and downloaded posters that belong to them. With the channel on it removes only the legacy
+`Series` rows written by 0.1.14.0, which shipped the channel enabled; the current channel
+emits container folders only, so favourites set on valid entries survive. The sweep skips
+rows it cannot delete, records them in the log, and is safe to repeat. The empty **Scryer
+Discovery** channel entry itself is a Jellyfin-owned object: Jellyfin recreates it on every
+**Refresh Channels** run, so the plugin never deletes it.
 
 Once enabled, the unmodified Jellyfin Android TV client exposes **Scryer Discovery** as a
 channel tile under **My Media**. Android TV users must first link the same Jellyfin user to
