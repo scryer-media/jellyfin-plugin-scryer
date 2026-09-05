@@ -88,18 +88,27 @@
                 </div>
                 <div class="inputContainer">
                     <label class="inputLabel inputLabelUnfocused" for="MaxAndroidTvRails">Android TV rails to publish</label>
-                    <input is="emby-input" type="number" id="MaxAndroidTvRails" min="1" max="25" step="1" />
+                    <input is="emby-input" type="number" id="MaxAndroidTvRails" min="1" max="60" step="1" />
                     <div class="fieldDescription">
-                        Scryer decides how many discovery sections to send. Jellyfin stores every one it is
-                        given as a library row per user, so the plugin publishes at most this many. Default 8.
+                        Recently watched titles come first as "More like ..." rails of five, then Scryer's
+                        own discovery sections. The plugin publishes at most this many rails. Default 40.
                     </div>
                 </div>
                 <div class="inputContainer">
                     <label class="inputLabel inputLabelUnfocused" for="MaxAndroidTvItemsPerRail">Titles per rail</label>
                     <input is="emby-input" type="number" id="MaxAndroidTvItemsPerRail" min="1" max="100" step="1" />
                     <div class="fieldDescription">
-                        Each published title becomes a library row and a downloaded poster on the Jellyfin
-                        server for the user who opens the rail. Default 20.
+                        Applies to Scryer's discovery sections; "More like ..." rails always hold five. Each
+                        published title becomes a library row and a downloaded poster on the Jellyfin server
+                        for the user who opens the rail. Default 20.
+                    </div>
+                </div>
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="MaxAndroidTvTitles">Total titles to publish</label>
+                    <input is="emby-input" type="number" id="MaxAndroidTvTitles" min="1" max="1000" step="1" />
+                    <div class="fieldDescription">
+                        The overall budget per Jellyfin user. Rails are filled in order until it is spent, so
+                        this bounds what Jellyfin stores regardless of the other two limits. Default 200.
                     </div>
                 </div>
                 <div class="inputContainer">
@@ -249,8 +258,9 @@
                     document.querySelector('#EnableCalendar').checked = config.EnableCalendar !== false;
                     document.querySelector('#EnableDownloads').checked = config.EnableDownloads !== false;
                     document.querySelector('#EnableAndroidTvChannel').checked = config.EnableAndroidTvChannel === true;
-                    document.querySelector('#MaxAndroidTvRails').value = String(config.MaxAndroidTvRails > 0 ? config.MaxAndroidTvRails : 8);
+                    document.querySelector('#MaxAndroidTvRails').value = String(config.MaxAndroidTvRails > 0 ? config.MaxAndroidTvRails : 40);
                     document.querySelector('#MaxAndroidTvItemsPerRail').value = String(config.MaxAndroidTvItemsPerRail > 0 ? config.MaxAndroidTvItemsPerRail : 20);
+                    document.querySelector('#MaxAndroidTvTitles').value = String(config.MaxAndroidTvTitles > 0 ? config.MaxAndroidTvTitles : 200);
                     document.querySelector('#DiagnosticVerbosity').value = String(config.DiagnosticVerbosity == null ? 1 : config.DiagnosticVerbosity);
                     setCallbackUri();
                     Dashboard.hideLoadingMsg();
@@ -278,8 +288,9 @@
                     config.EnableAndroidTvChannel = document.querySelector('#EnableAndroidTvChannel').checked;
                     // Clamped here as well as on the server so a hand-typed value cannot ask the
                     // plugin to store an unbounded number of rows in the Jellyfin library.
-                    config.MaxAndroidTvRails = clampNumber(document.querySelector('#MaxAndroidTvRails').value, 1, 25, 8);
+                    config.MaxAndroidTvRails = clampNumber(document.querySelector('#MaxAndroidTvRails').value, 1, 60, 40);
                     config.MaxAndroidTvItemsPerRail = clampNumber(document.querySelector('#MaxAndroidTvItemsPerRail').value, 1, 100, 20);
+                    config.MaxAndroidTvTitles = clampNumber(document.querySelector('#MaxAndroidTvTitles').value, 1, 1000, 200);
                     config.DiagnosticVerbosity = Number(document.querySelector('#DiagnosticVerbosity').value);
 
                     ApiClient.updatePluginConfiguration(ScryerConfig.pluginUniqueId, config).then(function (result) {

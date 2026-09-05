@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -6,6 +7,7 @@ using Jellyfin.Data.Enums;
 using Jellyfin.Plugin.Scryer.Configuration;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Plugins;
 using Microsoft.Extensions.Hosting;
@@ -28,24 +30,50 @@ public sealed class ScryerChannelCleanupService : IHostedService
     private readonly ILibraryManager _libraryManager;
     private readonly ILogger<ScryerChannelCleanupService> _logger;
     private readonly Func<PluginConfiguration?> _configuration;
+    private readonly Action<Guid> _invalidateResponseCache;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private CancellationTokenSource? _stopping;
     private Task? _startupSweep;
     private EventHandler<BasePluginConfiguration>? _configurationChanged;
 
-    public ScryerChannelCleanupService(ILibraryManager libraryManager, ILogger<ScryerChannelCleanupService> logger)
-        : this(libraryManager, logger, static () => Plugin.Instance?.Configuration)
+    public ScryerChannelCleanupService(ILibraryManager libraryManager, IApplicationPaths applicationPaths, ILogger<ScryerChannelCleanupService> logger)
+        : this(
+            libraryManager,
+            logger,
+            static () => Plugin.Instance?.Configuration,
+            channelId => DeleteResponseCache((applicationPaths ?? throw new ArgumentNullException(nameof(applicationPaths))).CachePath, channelId))
     {
     }
 
     internal ScryerChannelCleanupService(
         ILibraryManager libraryManager,
         ILogger<ScryerChannelCleanupService> logger,
-        Func<PluginConfiguration?> configuration)
+        Func<PluginConfiguration?> configuration,
+        Action<Guid>? invalidateResponseCache = null)
     {
         _libraryManager = libraryManager ?? throw new ArgumentNullException(nameof(libraryManager));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+        _invalidateResponseCache = invalidateResponseCache ?? (static _ => { });
+    }
+
+    /// <summary>
+    /// Jellyfin's ChannelManager caches every channel response as JSON under
+    /// {cache}/channels/{channelId} for three hours and, on a cache hit, does not ask the channel
+    /// again: it lists whatever rows the library database holds for that folder. A cached response
+    /// that names a row this sweep has just deleted therefore renders as an empty channel until
+    /// the cache lapses. The rows and the cache have to go together.
+    /// </summary>
+    internal static string ResponseCacheDirectory(string cachePath, Guid channelId) =>
+        Path.Combine(cachePath, "channels", channelId.ToString("N"));
+
+    private static void DeleteResponseCache(string cachePath, Guid channelId)
+    {
+        var directory = ResponseCacheDirectory(cachePath, channelId);
+        if (Directory.Exists(directory))
+        {
+            Directory.Delete(directory, recursive: true);
+        }
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -221,6 +249,20 @@ public sealed class ScryerChannelCleanupService : IHostedService
                     error,
                     "Could not remove Scryer discovery channel row {ItemId} from the Jellyfin library.",
                     item.Id);
+            }
+        }
+
+        if (deleted > 0)
+        {
+            try
+            {
+                _invalidateResponseCache(channelId);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                // Best effort: a cache that could not be cleared expires on its own within three
+                // hours, and the DataVersion bump that ships with a fix bypasses it immediately.
+                _logger.LogDebug(error, "Could not clear Jellyfin's cached responses for the Scryer discovery channel ({ChannelId}).", channelId);
             }
         }
 

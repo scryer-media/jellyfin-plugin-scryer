@@ -69,6 +69,13 @@ public class PluginConfiguration : BasePluginConfiguration
     /// </summary>
     public int MaxAndroidTvItemsPerRail { get; set; } = ScryerAndroidTvLimits.DefaultItemsPerRail;
 
+    /// <summary>
+    /// Largest number of titles the Android TV channel will publish across all of its rails for
+    /// one user. This is the governing bound on the rows and posters Jellyfin stores per user;
+    /// rails are filled in order, recently-watched "More like ..." rails first, until it is spent.
+    /// </summary>
+    public int MaxAndroidTvTitles { get; set; } = ScryerAndroidTvLimits.DefaultTitles;
+
     public ScryerDiagnosticVerbosity DiagnosticVerbosity { get; set; } = ScryerDiagnosticVerbosity.Basic;
 
     /// <summary>

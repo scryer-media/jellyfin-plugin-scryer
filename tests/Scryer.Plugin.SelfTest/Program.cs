@@ -60,6 +60,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("the Android TV channel is inert until the administrator opts in", AndroidTvChannelDisabledAsync),
     ("Android TV discovery is bounded before Jellyfin stores it", AndroidTvChannelLimitsAsync),
     ("Android TV guidance cards say why they were published", AndroidTvChannelLogsGuidanceAsync),
+    ("Android TV guidance cards never answer a folder query and roll the cache key until content returns", AndroidTvChannelGuidanceIsRootOnlyAsync),
     ("channel cleanup retracts the rows 0.1.14.0 wrote and spares the channel entity", AndroidTvChannelCleanupAsync),
     ("Android TV action journal is durable, bounded, and isolated by Jellyfin user", AndroidTvActionJournalAsync),
     ("Android TV favorite worker retains success, rolls back failure, and suppresses duplicates", AndroidTvFavoriteWorkerAsync),
@@ -509,6 +510,35 @@ static async Task AndroidTvDiscoveryAsync()
     Assert.Equal(2, recommendationBatch.RootElement.GetArrayLength());
     Assert.Equal("tmdb", recommendationBatch.RootElement[0].GetProperty("variables").GetProperty("source").GetString());
     Assert.Equal("tmdb_movie", recommendationBatch.RootElement[1].GetProperty("variables").GetProperty("source").GetString());
+    // A "More like ..." rail holds five titles: enough to be useful, small enough that twenty of
+    // them per user still fit comfortably inside the channel's title budget on the Jellyfin server.
+    Assert.Equal(ScryerAndroidTvLimits.ItemsPerRecommendationRail, recommendationBatch.RootElement[0].GetProperty("variables").GetProperty("limit").GetInt32());
+    Assert.Equal(5, ScryerAndroidTvLimits.ItemsPerRecommendationRail);
+
+    // Twenty seeds with every identifier fan out to more lookups than one GraphQL batch allows.
+    // The most recent seeds that fit are sent; the rest are dropped rather than failing the rail set.
+    var batchHandler = new RecordingHandler(request =>
+    {
+        var body = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+        if (body.TrimStart().StartsWith('['))
+        {
+            using var operations = JsonDocument.Parse(body);
+            return JsonResponse("[" + string.Join(",", Enumerable.Repeat("""{"data":{"titlesByExternalIds":[]}}""", operations.RootElement.GetArrayLength())) + "]");
+        }
+
+        return JsonResponse("""{"data":{"discoveryHomeCards":{"canViewPersonalized":false,"heroItem":null,"publicSections":[],"personalizedSections":[]}}}""");
+    });
+    var batchService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), batchHandler);
+    var manySeeds = Enumerable.Range(0, 25).Select(index => new ScryerRecommendationSeed(
+        "Series " + index,
+        "SERIES",
+        new Dictionary<string, string> { ["tvdb"] = "1" + index, ["tmdb"] = "2" + index, ["imdb"] = "tt" + index })).ToArray();
+    var trimmed = await batchService.GetAndroidTvDiscoveryAsync("0123456789abcdef0123456789abcdef", manySeeds, CancellationToken.None);
+    Assert.True(trimmed.IsSuccess, trimmed.Failure?.Message);
+    using var trimmedBatch = JsonDocument.Parse(batchHandler.Requests[0].Content!);
+    // A series seed with all three identifiers is eight lookups; twelve seeds fit under 100.
+    Assert.Equal(96, trimmedBatch.RootElement.GetArrayLength());
+    Assert.Equal(ScryerAndroidTvLimits.RecommendationSeeds, 20);
 }
 
 static async Task AndroidTvActionsAsync()
@@ -682,6 +712,76 @@ static async Task AndroidTvChannelLogsGuidanceAsync()
     Assert.Equal(1, connectLog.Entries.Count(entry => entry.Level == LogLevel.Debug));
 }
 
+static async Task AndroidTvChannelGuidanceIsRootOnlyAsync()
+{
+    const string userId = "0123456789abcdef0123456789abcdef";
+    var jellyfinUser = new User("tv-user", "test-auth", "test-reset") { Id = Guid.ParseExact(userId, "N") };
+    var time = new ManualTimeProvider(new DateTimeOffset(2026, 9, 2, 12, 15, 0, TimeSpan.Zero));
+    var libraryManager = LibraryManagerHarness.Create().Contract;
+    var userManager = UserManagerHarness.Create(jellyfinUser).Contract;
+    var enabled = TvConfiguration(androidTvChannel: true);
+    var root = new InternalChannelItemQuery { UserId = jellyfinUser.Id };
+
+    // Jellyfin 10.11.11 crashed twice on the production server when a user opened a guidance
+    // card: the channel answered the card's own folder query with the card again, Jellyfin
+    // persisted the row with its own id as ParentId, and BaseItem.OfficialRatingForComparison
+    // recursed through that parent chain until the process died of a stack overflow.
+    var offline = new RecordingHandler(_ => new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+    {
+        Content = new StringContent("upstream down", Encoding.UTF8, "text/plain")
+    });
+    var failingGraphql = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), offline);
+    var unavailable = new ScryerDiscoveryChannel(new TokenSession(), failingGraphql, libraryManager, userManager, time, () => enabled, _ => true);
+
+    var beforeGuidance = unavailable.GetCacheKey(userId);
+    var card = (await unavailable.GetChannelItems(root, CancellationToken.None)).Items.Single();
+    Assert.Equal("Scryer Discovery unavailable", card.Name);
+    var inside = await unavailable.GetChannelItems(new InternalChannelItemQuery { UserId = jellyfinUser.Id, FolderId = card.Id }, CancellationToken.None);
+    Assert.Equal(0, inside.Items.Count);
+    Assert.Equal(0, inside.TotalRecordCount);
+    // Nor does an unavailable Scryer put a card under a rail folder left over from a good response.
+    var underRail = await unavailable.GetChannelItems(new InternalChannelItemQuery { UserId = jellyfinUser.Id, FolderId = "scryer-rail-0000" }, CancellationToken.None);
+    Assert.Equal(0, underRail.Items.Count);
+
+    // A guidance card is transient, so Jellyfin's three-hour response cache must not pin it: the
+    // key rolls every retry interval while a card is the latest thing published for this user.
+    var afterGuidance = unavailable.GetCacheKey(userId);
+    Assert.False(string.Equals(beforeGuidance, afterGuidance, StringComparison.Ordinal));
+    Assert.Equal(afterGuidance, unavailable.GetCacheKey(userId));
+    time.Advance(ScryerDiscoveryChannel.GuidanceRetryInterval);
+    Assert.False(string.Equals(afterGuidance, unavailable.GetCacheKey(userId), StringComparison.Ordinal));
+    // Other users are unaffected.
+    Assert.False(unavailable.GetCacheKey("11111111111111111111111111111111").Contains(":retry", StringComparison.Ordinal));
+
+    // The connect card behaves the same way.
+    var healthy = new RecordingHandler(_ => JsonResponse("""{"data":{"discoveryHomeCards":{"canViewPersonalized":true,"heroItem":null,"publicSections":[],"personalizedSections":[{"sectionId":"personal","title":"For You","items":[{"id":"one","targetKey":"tmdb:movie:1","targetKind":"MOVIE","displayTitle":"First","year":2026,"posterUrl":null}]}]}}}"""));
+    var graphql = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), healthy);
+    var unlinked = new ScryerDiscoveryChannel(new UnlinkedSession(), graphql, libraryManager, userManager, time, () => enabled, _ => false);
+    var connect = (await unlinked.GetChannelItems(root, CancellationToken.None)).Items.Single();
+    Assert.Equal("Connect Scryer in Jellyfin Web", connect.Name);
+    Assert.Equal(0, (await unlinked.GetChannelItems(new InternalChannelItemQuery { UserId = jellyfinUser.Id, FolderId = connect.Id }, CancellationToken.None)).Items.Count);
+    Assert.True(unlinked.GetCacheKey(userId).Contains(":retry", StringComparison.Ordinal));
+
+    // Once real rails are published the key settles back to the daily one and stays put.
+    var linked = new ScryerDiscoveryChannel(new TokenSession(), graphql, libraryManager, userManager, time, () => enabled, _ => true);
+    Assert.Equal(1, (await linked.GetChannelItems(root, CancellationToken.None)).Items.Count);
+    var settled = linked.GetCacheKey(userId);
+    Assert.False(settled.Contains(":retry", StringComparison.Ordinal));
+    time.Advance(ScryerDiscoveryChannel.GuidanceRetryInterval * 3);
+    Assert.Equal(settled, linked.GetCacheKey(userId));
+
+    // Defence in depth: nothing is ever listed as a child of itself, whatever produced it.
+    var rails = new[]
+    {
+        new ScryerTvDiscoveryRail("r", "Rail", new[] { new ScryerTvDiscoveryItem("tmdb:movie:1", "MOVIE", "First", 2026, null, null) })
+    };
+    var published = ScryerDiscoveryChannel.Publish(rails, railCap: 5, itemCap: 5, titleCap: 5);
+    Assert.Equal(1, published.Count);
+    Assert.Equal(1, published[0].Count);
+    Assert.Equal(0, ScryerDiscoveryChannel.Publish(rails, railCap: 5, itemCap: 5, titleCap: 0).Count);
+    Assert.Equal(0, ScryerDiscoveryChannel.Publish(rails, railCap: 0, itemCap: 5, titleCap: 5).Count);
+}
+
 static async Task AndroidTvChannelLimitsAsync()
 {
     const string userId = "0123456789abcdef0123456789abcdef";
@@ -714,23 +814,53 @@ static async Task AndroidTvChannelLimitsAsync()
 
     // An unset limit falls back to the shipped default, which is wide enough for this response.
     var defaults = TvConfiguration(androidTvChannel: true);
-    Assert.Equal(8, ScryerAndroidTvLimits.RailCap(defaults));
+    Assert.Equal(40, ScryerAndroidTvLimits.RailCap(defaults));
     Assert.Equal(20, ScryerAndroidTvLimits.ItemsPerRailCap(defaults));
+    Assert.Equal(200, ScryerAndroidTvLimits.TitleCap(defaults));
     var everything = await Channel(defaults).GetChannelItems(query, CancellationToken.None);
     Assert.Equal(4, everything.Items.Count);
     var thirdRailId = everything.Items[2].Id;
+    var fourthRailId = everything.Items[3].Id;
 
     // A nonsensical value falls back rather than publishing nothing, and an oversized one is capped.
     var nonsense = TvConfiguration(androidTvChannel: true);
     nonsense.MaxAndroidTvRails = 0;
     nonsense.MaxAndroidTvItemsPerRail = -3;
-    Assert.Equal(8, ScryerAndroidTvLimits.RailCap(nonsense));
+    nonsense.MaxAndroidTvTitles = 0;
+    Assert.Equal(40, ScryerAndroidTvLimits.RailCap(nonsense));
     Assert.Equal(20, ScryerAndroidTvLimits.ItemsPerRailCap(nonsense));
+    Assert.Equal(200, ScryerAndroidTvLimits.TitleCap(nonsense));
     var oversized = TvConfiguration(androidTvChannel: true);
     oversized.MaxAndroidTvRails = 999;
     oversized.MaxAndroidTvItemsPerRail = 999;
+    oversized.MaxAndroidTvTitles = 99_999;
     Assert.Equal(ScryerAndroidTvLimits.MaximumRails, ScryerAndroidTvLimits.RailCap(oversized));
     Assert.Equal(ScryerAndroidTvLimits.MaximumItemsPerRail, ScryerAndroidTvLimits.ItemsPerRailCap(oversized));
+    Assert.Equal(ScryerAndroidTvLimits.MaximumTitles, ScryerAndroidTvLimits.TitleCap(oversized));
+
+    // The total-title budget governs. Twenty titles offered, twelve allowed: rails are filled in
+    // order, the third is cut short, and the fourth is neither listed nor reachable.
+    var budgeted = TvConfiguration(androidTvChannel: true);
+    budgeted.MaxAndroidTvTitles = 12;
+    var budgetedChannel = Channel(budgeted);
+    var withinBudget = await budgetedChannel.GetChannelItems(query, CancellationToken.None);
+    Assert.Equal(3, withinBudget.Items.Count);
+    Assert.False(withinBudget.Items.Any(item => item.Id == fourthRailId));
+    var partialRail = await budgetedChannel.GetChannelItems(
+        new InternalChannelItemQuery { UserId = jellyfinUser.Id, FolderId = thirdRailId },
+        CancellationToken.None);
+    Assert.Equal(2, partialRail.Items.Count);
+    Assert.Equal(2, partialRail.TotalRecordCount);
+    var fullRail = await budgetedChannel.GetChannelItems(
+        new InternalChannelItemQuery { UserId = jellyfinUser.Id, FolderId = withinBudget.Items[0].Id },
+        CancellationToken.None);
+    Assert.Equal(5, fullRail.Items.Count);
+    Assert.Equal(0, (await budgetedChannel.GetChannelItems(
+        new InternalChannelItemQuery { UserId = jellyfinUser.Id, FolderId = fourthRailId },
+        CancellationToken.None)).Items.Count);
+    // The rail's etag tracks the published count, so a budget change refreshes it in Jellyfin.
+    Assert.False(string.Equals(withinBudget.Items[2].Etag, everything.Items[2].Etag, StringComparison.Ordinal));
+    Assert.Equal(withinBudget.Items[0].Etag, everything.Items[0].Etag);
 
     // Configured limits bound both what the channel publishes and what Jellyfin can store.
     var bounded = TvConfiguration(androidTvChannel: true);
@@ -812,11 +942,19 @@ static async Task AndroidTvChannelCleanupAsync()
 
     // Disabled: every persisted row goes, the Channel entity Jellyfin owns stays.
     var disabledHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, staleStub, foreignRow);
+    var invalidated = new List<Guid>();
     var disabled = new ScryerChannelCleanupService(
         disabledHarness.Contract,
         NullLogger<ScryerChannelCleanupService>.Instance,
-        () => TvConfiguration(androidTvChannel: false));
+        () => TvConfiguration(androidTvChannel: false),
+        invalidated.Add);
     var swept = await disabled.SweepAsync(CancellationToken.None);
+    // Jellyfin keeps serving a cached response that names deleted rows as an empty channel for
+    // three hours, so the rows and the cache go together, once, and only when something went.
+    Assert.True(invalidated.SequenceEqual(new[] { channelId }));
+    Assert.Equal(
+        Path.Combine("/cache", "channels", channelId.ToString("N")),
+        ScryerChannelCleanupService.ResponseCacheDirectory("/cache", channelId));
     Assert.Equal(channelId, swept.ChannelId);
     Assert.Equal(5, swept.Found);
     Assert.Equal(5, swept.Deleted);
@@ -838,6 +976,7 @@ static async Task AndroidTvChannelCleanupAsync()
     Assert.Equal(0, repeated.Found);
     Assert.Equal(0, repeated.Deleted);
     Assert.Equal(5, disabledHarness.Deleted.Count);
+    Assert.Equal(1, invalidated.Count);
 
     // Enabled: only the Series rows 0.1.14.0 wrote go; container rows keep their favourites.
     var enabledHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, staleStub, foreignRow);
@@ -860,7 +999,9 @@ static async Task AndroidTvChannelCleanupAsync()
     var failing = new ScryerChannelCleanupService(
         failingHarness.Contract,
         NullLogger<ScryerChannelCleanupService>.Instance,
-        () => TvConfiguration(androidTvChannel: false));
+        () => TvConfiguration(androidTvChannel: false),
+        // A cache directory that cannot be removed is a debug line, never a failed sweep.
+        _ => throw new IOException("cache busy"));
     var partial = await failing.SweepAsync(CancellationToken.None);
     Assert.Equal(5, partial.Found);
     Assert.Equal(4, partial.Deleted);

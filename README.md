@@ -174,12 +174,15 @@ user, and re-fetches them from the daily **Refresh Channels** scheduled task. On
 with many users this creates a correspondingly large number of rows.
 
 How much the channel publishes is bounded, because Scryer's discovery query takes no size
-arguments and the server decides how many sections and titles to send. **Android TV rails
-to publish** caps the rails, defaulting to 8 and never exceeding 25. **Titles per rail**
-caps each rail's contents, defaulting to 20 and never exceeding 100. Both are applied
-before Jellyfin sees the response, so they bound the rows and posters stored on the
-Jellyfin server rather than merely what a television draws. Lowering a limit also makes
-the rails it excluded unreachable, so an old folder id cannot reopen them.
+arguments and the server decides how many sections and titles to send. **Total titles to
+publish** is the governing budget per Jellyfin user, defaulting to 200 and never exceeding
+1000: rails are filled in order until it is spent, and the rail that crosses the line is
+cut short. **Android TV rails to publish** caps the rail count, defaulting to 40 and never
+exceeding 60. **Titles per rail** caps each Scryer discovery section, defaulting to 20 and
+never exceeding 100; **More like...** rails always hold five. All three are applied before
+Jellyfin sees the response, so they bound the rows and posters stored on the Jellyfin
+server rather than merely what a television draws. Lowering a limit also makes the rails
+and titles it excluded unreachable, so an old folder id cannot reopen them.
 
 The plugin retracts the rows it caused. A cleanup sweep runs once at server startup and
 again whenever the plugin configuration is saved. With the channel off it removes every
@@ -197,7 +200,20 @@ Jellyfin retires a channel row only when it re-queries the channel, and it re-qu
 when the channel's cache key changes or its own three-hour cache lapses. The cache key
 therefore includes whether that Jellyfin user has a stored Scryer grant, so connecting
 Scryer immediately invalidates a **Connect Scryer in Jellyfin Web** card rather than
-leaving it on screen for a connected user.
+leaving it on screen for a connected user. While a guidance card is the latest thing the
+channel published for a user, the key also rolls every five minutes, so a transient
+**Scryer Discovery unavailable** is re-checked promptly instead of being served from
+Jellyfin's cache for three hours. Because Jellyfin lists library rows on a cache hit
+rather than asking the channel again, the cleanup sweep also clears the channel's cached
+responses whenever it removes rows; otherwise a cached card whose row is gone renders as
+an empty channel.
+
+A guidance card only ever answers the channel's root query. Opening a card in a client
+asks the channel for the card's children, and answering that with the card again makes
+Jellyfin persist the row as its own parent, after which Jellyfin 10.11 recurses through
+that parent chain while computing the inherited parental rating until the server process
+dies of a stack overflow. The channel returns nothing for such a query, and never lists
+any item as a child of itself.
 
 Every guidance card also explains itself in the Jellyfin log. A **Scryer Discovery
 unavailable** card is written at warning level together with the Scryer failure code that
@@ -210,8 +226,9 @@ channel tile under **My Media**. Android TV users must first link the same Jelly
 Scryer by following **Connect a user** in Jellyfin Web; the television does not run a
 separate OAuth flow.
 
-Open the channel to browse up to five **More like...** rails derived from that Jellyfin
-user's recent watch history, followed by their available Scryer discovery sections.
+Open the channel to browse up to twenty **More like...** rails of five titles each,
+derived from that Jellyfin user's most recently watched movies and series, followed by
+their available Scryer discovery sections, all within the total-title budget.
 Titles intentionally appear as non-playable container folders, including movies, so the
 stock client does not offer a broken Play action for media that is not yet present and
 Jellyfin does not store them as real Series entries or run external metadata lookups

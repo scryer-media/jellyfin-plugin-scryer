@@ -9,6 +9,7 @@ using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Plugin.Scryer.Configuration;
 using Jellyfin.Plugin.Scryer.OAuth;
 
 namespace Jellyfin.Plugin.Scryer.Services;
@@ -54,7 +55,7 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
     private const int MaximumSearchLength = 256;
     private const int MaximumPageOffset = 10_000;
     private const int MaximumCalendarRangeDays = 62;
-    private const int MaximumRecommendationSeeds = 5;
+    private const int MaximumRecommendationSeeds = ScryerAndroidTvLimits.RecommendationSeeds;
     private const int MaximumGraphqlBatchOperations = 100;
     private const int TitlePosterBatchSize = 16;
     private const int MaximumCalendarTitles = 64;
@@ -324,8 +325,8 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
 
         var recommendations = await GetRecommendationGroupsAsync(
             jellyfinUserId,
-            recentSeeds.Take(MaximumRecommendationSeeds).ToArray(),
-            20,
+            SeedsWithinBatchBudget(recentSeeds),
+            ScryerAndroidTvLimits.ItemsPerRecommendationRail,
             cancellationToken).ConfigureAwait(false);
         if (!recommendations.IsSuccess)
         {
@@ -334,7 +335,9 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
 
         foreach (var group in recommendations.Value!)
         {
-            if (!TryResolvePosterUrls(group.Items, publicAuthority, out var resolvedItems))
+            // Scryer honours the limit, but the rail size is a storage bound on the Jellyfin
+            // server, so it is enforced here as well rather than trusted.
+            if (!TryResolvePosterUrls(group.Items.Take(ScryerAndroidTvLimits.ItemsPerRecommendationRail).ToArray(), publicAuthority, out var resolvedItems))
             {
                 continue;
             }
@@ -492,6 +495,35 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         return ScryerResult<ScryerTvActionResult>.Success(new ScryerTvActionResult(
             reused.GetBoolean() ? ScryerTvActionKind.AlreadyPresent : ScryerTvActionKind.Added,
             destination.Name));
+    }
+
+    /// <summary>
+    /// Takes the most recent seeds whose identifier lookups fit in one GraphQL batch. Every seed
+    /// fans out to one lookup per known identifier source, so twenty seeds can exceed the batch
+    /// ceiling; the oldest seeds are dropped rather than failing the whole projection.
+    /// </summary>
+    private static IReadOnlyList<ScryerRecommendationSeed> SeedsWithinBatchBudget(IReadOnlyList<ScryerRecommendationSeed> seeds)
+    {
+        var selected = new List<ScryerRecommendationSeed>();
+        var lookups = 0;
+        foreach (var seed in seeds.Take(MaximumRecommendationSeeds))
+        {
+            if (seed is null || seed.ProviderIds is null || NormalizeFacet(seed.Facet) is null)
+            {
+                continue;
+            }
+
+            var seedLookups = RecommendationLookups(seed).Count();
+            if (lookups + seedLookups > MaximumGraphqlBatchOperations)
+            {
+                break;
+            }
+
+            lookups += seedLookups;
+            selected.Add(seed);
+        }
+
+        return selected;
     }
 
     private static IEnumerable<(string Source, string Value)> RecommendationLookups(ScryerRecommendationSeed seed)

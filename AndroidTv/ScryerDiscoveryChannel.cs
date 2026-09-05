@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -39,7 +40,9 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
     internal const string ChannelName = "Scryer Discovery";
     internal const string TargetProviderId = "ScryerTarget";
     internal const string KindProviderId = "ScryerKind";
-    internal const string DataSchemaVersion = "android-tv-v3";
+    // v4: guidance cards no longer answer folder queries and the title budget changed what a rail
+    // publishes, so responses cached under v3 must not be served against the new rows.
+    internal const string DataSchemaVersion = "android-tv-v4";
 
     /// <summary>
     /// Channel item id prefix carried by every guidance stub ("Connect Scryer in Jellyfin Web" and
@@ -48,7 +51,16 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
     /// </summary>
     internal const string MessageIdPrefix = "scryer-message-";
 
-    private const int MaximumRecentItems = 25;
+    /// <summary>
+    /// How often Jellyfin is allowed to re-ask the channel while the last thing it published for a
+    /// user was a guidance card. Jellyfin caches a channel response for three hours and only
+    /// re-queries when the cache key changes, which is far too long for "Scryer unavailable".
+    /// </summary>
+    internal static readonly TimeSpan GuidanceRetryInterval = TimeSpan.FromMinutes(5);
+
+    // Played items, not titles: a binge of one series is many rows but a single seed, so the
+    // window has to be wide to find RecommendationSeeds distinct titles.
+    private const int MaximumRecentItems = 200;
     private const int MaximumPageSize = 100;
 
     private readonly Func<PluginConfiguration?> _configuration;
@@ -59,6 +71,7 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
     private readonly IUserManager _userManager;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger _logger;
+    private readonly ConcurrentDictionary<string, bool> _guidancePublished = new(StringComparer.Ordinal);
 
     public ScryerDiscoveryChannel(
         IScryerUserSessionService sessions,
@@ -130,7 +143,13 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         // disconnected otherwise outlives the moment they connect. Jellyfin passes the same "N"
         // formatted user id the plugin stores grants under.
         var connected = !string.IsNullOrEmpty(userId) && _hasStoredGrant(userId) ? "1" : "0";
-        return $"{DataSchemaVersion}:{day}:{connected}:{StableHash(userId)}";
+        // While the last thing published for this user was a guidance card the key also rolls
+        // every few minutes, so a transient "unavailable" is re-checked instead of being served
+        // from Jellyfin's cache for three hours. Real rails keep the daily key.
+        var retry = !string.IsNullOrEmpty(userId) && _guidancePublished.TryGetValue(userId, out var guidance) && guidance
+            ? ":retry" + (_timeProvider.GetUtcNow().ToUnixTimeSeconds() / (long)GuidanceRetryInterval.TotalSeconds)
+            : string.Empty;
+        return $"{DataSchemaVersion}:{day}:{connected}:{StableHash(userId)}{retry}";
     }
 
     private bool IsChannelEnabled()
@@ -170,10 +189,7 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
                     status.Failure?.WireCode ?? "unknown");
             }
 
-            return Page(query, new[]
-            {
-                MessageItem(jellyfinUserId, "connect", "Connect Scryer in Jellyfin Web", "Open Jellyfin Web, choose a Scryer page, and connect this Jellyfin user to a Scryer account first.")
-            });
+            return Guidance(query, jellyfinUserId, "connect", "Connect Scryer in Jellyfin Web", "Open Jellyfin Web, choose a Scryer page, and connect this Jellyfin user to a Scryer account first.");
         }
 
         IReadOnlyList<ScryerRecommendationSeed> seeds;
@@ -197,10 +213,7 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
                 query.UserId,
                 projection.Failure?.WireCode ?? "unknown");
 
-            return Page(query, new[]
-            {
-                MessageItem(jellyfinUserId, "unavailable", "Scryer Discovery unavailable", "Reconnect in Jellyfin Web or try again after Scryer is reachable.")
-            });
+            return Guidance(query, jellyfinUserId, "unavailable", "Scryer Discovery unavailable", "Reconnect in Jellyfin Web or try again after Scryer is reachable.");
         }
 
         // Scryer's discovery query takes no size arguments, so the response is whatever the server
@@ -208,28 +221,82 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         // downloaded poster - on the Jellyfin server, for every user who opens the channel, so the
         // rails and their contents are capped before Jellyfin ever sees them.
         var configuration = _configuration();
-        var railCap = ScryerAndroidTvLimits.RailCap(configuration);
-        var itemCap = ScryerAndroidTvLimits.ItemsPerRailCap(configuration);
-        var rails = projection.Value.Take(railCap).ToArray();
+        var rails = Publish(
+            projection.Value,
+            ScryerAndroidTvLimits.RailCap(configuration),
+            ScryerAndroidTvLimits.ItemsPerRailCap(configuration),
+            ScryerAndroidTvLimits.TitleCap(configuration));
 
         if (string.IsNullOrEmpty(query.FolderId))
         {
-            var folders = rails.Select(rail => RailItem(jellyfinUserId, rail, itemCap)).ToArray();
-            return folders.Length > 0
-                ? Page(query, folders)
-                : Page(query, new[] { MessageItem(jellyfinUserId, "empty", "No recommendations yet", "Watch some media or try Scryer Discovery again later.") });
+            if (rails.Count == 0)
+            {
+                return Guidance(query, jellyfinUserId, "empty", "No recommendations yet", "Watch some media or try Scryer Discovery again later.");
+            }
+
+            _guidancePublished[jellyfinUserId] = false;
+            return Page(query, rails.Select(rail => RailItem(jellyfinUserId, rail.Rail, rail.Count)).ToArray());
         }
 
-        // Resolved against the capped list on purpose: a rail the channel never published must not
-        // be browsable through a folder id left over from an earlier, larger response.
-        var selectedRail = rails.FirstOrDefault(rail =>
-            string.Equals(StableId(jellyfinUserId, "rail", rail.Key), query.FolderId, StringComparison.Ordinal));
-        if (selectedRail is null)
+        // Resolved against the published list on purpose: a rail the channel never published must
+        // not be browsable through a folder id left over from an earlier, larger response.
+        var selected = rails.FirstOrDefault(rail =>
+            string.Equals(StableId(jellyfinUserId, "rail", rail.Rail.Key), query.FolderId, StringComparison.Ordinal));
+        if (selected.Rail is null)
         {
             return Page(query, Array.Empty<ChannelItemInfo>());
         }
 
-        return Page(query, selectedRail.Items.Take(itemCap).Select(item => TitleItem(jellyfinUserId, item)).ToArray());
+        return Page(query, selected.Rail.Items.Take(selected.Count).Select(item => TitleItem(jellyfinUserId, item)).ToArray());
+    }
+
+    /// <summary>
+    /// Decides what the channel publishes out of what Scryer returned. Rails are taken in order,
+    /// recently-watched "More like ..." rails ahead of Scryer's sections, each trimmed to the
+    /// per-rail cap, until the rail cap or the total-title budget is spent. The published count is
+    /// what both the rail etag and the rail's folder query use, so Jellyfin never stores a title
+    /// the root listing did not account for.
+    /// </summary>
+    internal static IReadOnlyList<PublishedRail> Publish(IReadOnlyList<ScryerTvDiscoveryRail> rails, int railCap, int itemCap, int titleCap)
+    {
+        var published = new List<PublishedRail>();
+        var remaining = titleCap;
+        foreach (var rail in rails)
+        {
+            if (published.Count >= railCap || remaining <= 0)
+            {
+                break;
+            }
+
+            var count = Math.Min(Math.Min(rail.Items.Count, itemCap), remaining);
+            if (count <= 0)
+            {
+                continue;
+            }
+
+            published.Add(new PublishedRail(rail, count));
+            remaining -= count;
+        }
+
+        return published;
+    }
+
+    internal readonly record struct PublishedRail(ScryerTvDiscoveryRail Rail, int Count);
+
+    /// <summary>
+    /// Publishes a guidance card, which is a statement about the channel as a whole and therefore
+    /// only ever an answer to the root query. Answering a folder query with it would make Jellyfin
+    /// file the card under the folder it was asked about; when that folder is the card itself
+    /// (the user opened it), Jellyfin 10.11 sets the row as its own parent and then follows that
+    /// parent chain without end while computing the inherited parental rating, and the whole
+    /// server process dies of a stack overflow. Observed twice on 10.11.11 before this guard.
+    /// </summary>
+    private ChannelItemResult Guidance(InternalChannelItemQuery query, string jellyfinUserId, string key, string name, string overview)
+    {
+        _guidancePublished[jellyfinUserId] = true;
+        return string.IsNullOrEmpty(query.FolderId)
+            ? Page(query, new[] { MessageItem(jellyfinUserId, key, name, overview) })
+            : Empty();
     }
 
     public Task<DynamicImageResponse> GetChannelImage(ImageType type, CancellationToken cancellationToken)
@@ -321,7 +388,7 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
             }
 
             seeds.Add(new ScryerRecommendationSeed(source.Name, facet, providerIds));
-            if (seeds.Count == 5)
+            if (seeds.Count == ScryerAndroidTvLimits.RecommendationSeeds)
             {
                 break;
             }
@@ -403,6 +470,14 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
 
     private static ChannelItemResult Page(InternalChannelItemQuery query, IReadOnlyList<ChannelItemInfo> all)
     {
+        // Nothing may ever be listed as a child of itself: Jellyfin would persist it with its own
+        // id as ParentId and recurse through that parent chain until the process dies. Guidance()
+        // already keeps cards out of folder queries; this is the last line for every other item.
+        if (!string.IsNullOrEmpty(query.FolderId) && all.Any(item => string.Equals(item.Id, query.FolderId, StringComparison.Ordinal)))
+        {
+            all = all.Where(item => !string.Equals(item.Id, query.FolderId, StringComparison.Ordinal)).ToArray();
+        }
+
         var start = Math.Clamp(query.StartIndex ?? 0, 0, all.Count);
         var limit = Math.Clamp(query.Limit ?? MaximumPageSize, 0, MaximumPageSize);
         return new ChannelItemResult
