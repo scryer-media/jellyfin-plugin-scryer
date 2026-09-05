@@ -87,6 +87,22 @@
                     </div>
                 </div>
                 <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="MaxAndroidTvRails">Android TV rails to publish</label>
+                    <input is="emby-input" type="number" id="MaxAndroidTvRails" min="1" max="25" step="1" />
+                    <div class="fieldDescription">
+                        Scryer decides how many discovery sections to send. Jellyfin stores every one it is
+                        given as a library row per user, so the plugin publishes at most this many. Default 8.
+                    </div>
+                </div>
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="MaxAndroidTvItemsPerRail">Titles per rail</label>
+                    <input is="emby-input" type="number" id="MaxAndroidTvItemsPerRail" min="1" max="100" step="1" />
+                    <div class="fieldDescription">
+                        Each published title becomes a library row and a downloaded poster on the Jellyfin
+                        server for the user who opens the rail. Default 20.
+                    </div>
+                </div>
+                <div class="inputContainer">
                     <label class="selectLabel" for="DiagnosticVerbosity">Diagnostic verbosity</label>
                     <select is="emby-select" id="DiagnosticVerbosity">
                         <option value="0">Off</option>
@@ -158,6 +174,14 @@
             return normalized;
         }
 
+        function clampNumber(raw, minimum, maximum, fallback) {
+            var parsed = parseInt(raw, 10);
+            if (!isFinite(parsed) || parsed < minimum) {
+                return fallback;
+            }
+            return parsed > maximum ? maximum : parsed;
+        }
+
         function detail(probe) {
             var parts = [];
             if (probe.failureCode) parts.push('code ' + probe.failureCode);
@@ -225,6 +249,8 @@
                     document.querySelector('#EnableCalendar').checked = config.EnableCalendar !== false;
                     document.querySelector('#EnableDownloads').checked = config.EnableDownloads !== false;
                     document.querySelector('#EnableAndroidTvChannel').checked = config.EnableAndroidTvChannel === true;
+                    document.querySelector('#MaxAndroidTvRails').value = String(config.MaxAndroidTvRails > 0 ? config.MaxAndroidTvRails : 8);
+                    document.querySelector('#MaxAndroidTvItemsPerRail').value = String(config.MaxAndroidTvItemsPerRail > 0 ? config.MaxAndroidTvItemsPerRail : 20);
                     document.querySelector('#DiagnosticVerbosity').value = String(config.DiagnosticVerbosity == null ? 1 : config.DiagnosticVerbosity);
                     setCallbackUri();
                     Dashboard.hideLoadingMsg();
@@ -250,6 +276,10 @@
                     config.EnableCalendar = document.querySelector('#EnableCalendar').checked;
                     config.EnableDownloads = document.querySelector('#EnableDownloads').checked;
                     config.EnableAndroidTvChannel = document.querySelector('#EnableAndroidTvChannel').checked;
+                    // Clamped here as well as on the server so a hand-typed value cannot ask the
+                    // plugin to store an unbounded number of rows in the Jellyfin library.
+                    config.MaxAndroidTvRails = clampNumber(document.querySelector('#MaxAndroidTvRails').value, 1, 25, 8);
+                    config.MaxAndroidTvItemsPerRail = clampNumber(document.querySelector('#MaxAndroidTvItemsPerRail').value, 1, 100, 20);
                     config.DiagnosticVerbosity = Number(document.querySelector('#DiagnosticVerbosity').value);
 
                     ApiClient.updatePluginConfiguration(ScryerConfig.pluginUniqueId, config).then(function (result) {

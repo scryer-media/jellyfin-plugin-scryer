@@ -18,6 +18,13 @@ public interface IScryerTokenStore
 {
     Task<ScryerGrantReadResult> ReadAsync(ScryerGrantKey key, CancellationToken cancellationToken);
     Task<ScryerGrantReadResult> ReadCurrentAsync(string jellyfinUserId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Reports whether a stored grant exists for this Jellyfin user without decrypting or reading
+    /// it. Synchronous and non-throwing, so callers that cannot await - a channel cache key, for
+    /// one - can still tell a connected user from a disconnected one.
+    /// </summary>
+    bool HasStoredGrant(string jellyfinUserId);
     Task<bool> SaveAsync(ScryerRefreshGrant grant, CancellationToken cancellationToken);
     Task<bool> QuarantineAsync(ScryerRefreshGrant grant, CancellationToken cancellationToken);
     Task<bool> QuarantineDetachedAsync(ScryerRefreshGrant grant, CancellationToken cancellationToken);
@@ -59,6 +66,25 @@ public sealed class ScryerTokenStore : IScryerTokenStore
         _protector = dataProtection.CreateProtector(PurposeRoot, PurposeRecord, PurposeVersion);
         _directory = Path.Combine(applicationPaths.DataPath, "plugins", "scryer", "oauth-grants");
         _logger = logger;
+    }
+
+    public bool HasStoredGrant(string jellyfinUserId)
+    {
+        if (string.IsNullOrWhiteSpace(jellyfinUserId))
+        {
+            return false;
+        }
+
+        try
+        {
+            return File.Exists(GetPath(jellyfinUserId));
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            // The caller is a cache key, not an authorization decision. An unreadable directory
+            // must degrade to "no grant" rather than throw into Jellyfin's channel plumbing.
+            return false;
+        }
     }
 
     public async Task<ScryerGrantReadResult> ReadAsync(ScryerGrantKey key, CancellationToken cancellationToken)

@@ -57,6 +57,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Android TV default actions prefer direct add and support request-only users", AndroidTvActionsAsync),
     ("Android TV channel uses isolated stable IDs, daily cache keys, and container stubs", AndroidTvChannelAsync),
     ("the Android TV channel is inert until the administrator opts in", AndroidTvChannelDisabledAsync),
+    ("Android TV discovery is bounded before Jellyfin stores it", AndroidTvChannelLimitsAsync),
     ("channel cleanup retracts the rows 0.1.14.0 wrote and spares the channel entity", AndroidTvChannelCleanupAsync),
     ("Android TV action journal is durable, bounded, and isolated by Jellyfin user", AndroidTvActionJournalAsync),
     ("Android TV favorite worker retains success, rolls back failure, and suppresses duplicates", AndroidTvFavoriteWorkerAsync),
@@ -569,7 +570,8 @@ static async Task AndroidTvChannelAsync()
     var libraryManager = LibraryManagerHarness.Create().Contract;
     var userManager = UserManagerHarness.Create(jellyfinUser).Contract;
     var enabled = TvConfiguration(androidTvChannel: true);
-    var channel = new ScryerDiscoveryChannel(new TokenSession(), graphql, libraryManager, userManager, time, () => enabled);
+    var hasStoredGrant = false;
+    var channel = new ScryerDiscoveryChannel(new TokenSession(), graphql, libraryManager, userManager, time, () => enabled, _ => hasStoredGrant);
     var query = new InternalChannelItemQuery { UserId = jellyfinUser.Id };
 
     var cacheKey = channel.GetCacheKey(userId);
@@ -577,6 +579,14 @@ static async Task AndroidTvChannelAsync()
     Assert.Equal(cacheKey, channel.GetCacheKey(userId));
     time.Advance(TimeSpan.FromHours(24));
     Assert.False(string.Equals(cacheKey, channel.GetCacheKey(userId), StringComparison.Ordinal));
+    // Connecting must change the key. Jellyfin retires a channel row only when it actually
+    // re-queries the channel, so without this a "Connect Scryer" stub published while the user was
+    // disconnected keeps being served after they connect.
+    var disconnectedKey = channel.GetCacheKey(userId);
+    hasStoredGrant = true;
+    Assert.False(string.Equals(disconnectedKey, channel.GetCacheKey(userId), StringComparison.Ordinal));
+    hasStoredGrant = false;
+    Assert.Equal(disconnectedKey, channel.GetCacheKey(userId));
     Assert.False(string.Equals(
         ScryerDiscoveryChannel.StableId(userId, "title", "tmdb:movie:1"),
         ScryerDiscoveryChannel.StableId("11111111111111111111111111111111", "title", "tmdb:movie:1"),
@@ -627,6 +637,78 @@ static async Task AndroidTvChannelAsync()
     Assert.Equal("Connect Scryer in Jellyfin Web", instruction.Items.Single().Name);
     Assert.Equal(0, instruction.Items.Single().ProviderIds.Count);
     Assert.Equal(ChannelFolderType.Container, instruction.Items.Single().FolderType);
+}
+
+static async Task AndroidTvChannelLimitsAsync()
+{
+    const string userId = "0123456789abcdef0123456789abcdef";
+    var jellyfinUser = new User("tv-user", "test-auth", "test-reset") { Id = Guid.ParseExact(userId, "N") };
+
+    // Four sections of five titles. Scryer's discovery query takes no size arguments, so a real
+    // server can answer with far more than this and every published row lands in Jellyfin's own
+    // library database, once per user.
+    var sections = string.Join(",", Enumerable.Range(0, 4).Select(section =>
+        "{\"sectionId\":\"s" + section + "\",\"title\":\"Section " + section + "\",\"items\":[" +
+        string.Join(",", Enumerable.Range(0, 5).Select(item =>
+            "{\"id\":\"i" + section + "x" + item + "\",\"targetKey\":\"tmdb:movie:" + section + item +
+            "\",\"targetKind\":\"MOVIE\",\"displayTitle\":\"Title " + section + item +
+            "\",\"year\":2026,\"posterUrl\":null}")) +
+        "]}"));
+    var body = "{\"data\":{\"discoveryHomeCards\":{\"canViewPersonalized\":true,\"heroItem\":null," +
+        "\"publicSections\":[],\"personalizedSections\":[" + sections + "]}}}";
+
+    var time = new ManualTimeProvider(new DateTimeOffset(2026, 9, 2, 12, 15, 0, TimeSpan.Zero));
+    var libraryManager = LibraryManagerHarness.Create().Contract;
+    var userManager = UserManagerHarness.Create(jellyfinUser).Contract;
+    var query = new InternalChannelItemQuery { UserId = jellyfinUser.Id };
+
+    ScryerDiscoveryChannel Channel(PluginConfiguration configuration)
+    {
+        var handler = new RecordingHandler(_ => JsonResponse(body));
+        var graphql = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), handler);
+        return new ScryerDiscoveryChannel(new TokenSession(), graphql, libraryManager, userManager, time, () => configuration, _ => true);
+    }
+
+    // An unset limit falls back to the shipped default, which is wide enough for this response.
+    var defaults = TvConfiguration(androidTvChannel: true);
+    Assert.Equal(8, ScryerAndroidTvLimits.RailCap(defaults));
+    Assert.Equal(20, ScryerAndroidTvLimits.ItemsPerRailCap(defaults));
+    var everything = await Channel(defaults).GetChannelItems(query, CancellationToken.None);
+    Assert.Equal(4, everything.Items.Count);
+    var thirdRailId = everything.Items[2].Id;
+
+    // A nonsensical value falls back rather than publishing nothing, and an oversized one is capped.
+    var nonsense = TvConfiguration(androidTvChannel: true);
+    nonsense.MaxAndroidTvRails = 0;
+    nonsense.MaxAndroidTvItemsPerRail = -3;
+    Assert.Equal(8, ScryerAndroidTvLimits.RailCap(nonsense));
+    Assert.Equal(20, ScryerAndroidTvLimits.ItemsPerRailCap(nonsense));
+    var oversized = TvConfiguration(androidTvChannel: true);
+    oversized.MaxAndroidTvRails = 999;
+    oversized.MaxAndroidTvItemsPerRail = 999;
+    Assert.Equal(ScryerAndroidTvLimits.MaximumRails, ScryerAndroidTvLimits.RailCap(oversized));
+    Assert.Equal(ScryerAndroidTvLimits.MaximumItemsPerRail, ScryerAndroidTvLimits.ItemsPerRailCap(oversized));
+
+    // Configured limits bound both what the channel publishes and what Jellyfin can store.
+    var bounded = TvConfiguration(androidTvChannel: true);
+    bounded.MaxAndroidTvRails = 2;
+    bounded.MaxAndroidTvItemsPerRail = 3;
+    var boundedChannel = Channel(bounded);
+    var rails = await boundedChannel.GetChannelItems(query, CancellationToken.None);
+    Assert.Equal(2, rails.Items.Count);
+    Assert.Equal(2, rails.TotalRecordCount);
+
+    var titles = await boundedChannel.GetChannelItems(
+        new InternalChannelItemQuery { UserId = jellyfinUser.Id, FolderId = rails.Items[0].Id },
+        CancellationToken.None);
+    Assert.Equal(3, titles.Items.Count);
+    Assert.Equal(3, titles.TotalRecordCount);
+
+    // A rail the cap excluded is not reachable through a folder id left over from a wider response.
+    var excluded = await boundedChannel.GetChannelItems(
+        new InternalChannelItemQuery { UserId = jellyfinUser.Id, FolderId = thirdRailId },
+        CancellationToken.None);
+    Assert.Equal(0, excluded.Items.Count);
 }
 
 static async Task AndroidTvChannelDisabledAsync()
@@ -682,21 +764,22 @@ static async Task AndroidTvChannelCleanupAsync()
     var legacyStub = Guid.ParseExact("11111111111111111111111111111102", "N");
     var currentRail = Guid.ParseExact("11111111111111111111111111111103", "N");
     var currentTitle = Guid.ParseExact("11111111111111111111111111111104", "N");
+    var staleStub = Guid.ParseExact("11111111111111111111111111111107", "N");
     var foreignRow = Guid.ParseExact("11111111111111111111111111111105", "N");
 
     // Disabled: every persisted row goes, the Channel entity Jellyfin owns stays.
-    var disabledHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, foreignRow);
+    var disabledHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, staleStub, foreignRow);
     var disabled = new ScryerChannelCleanupService(
         disabledHarness.Contract,
         NullLogger<ScryerChannelCleanupService>.Instance,
         () => TvConfiguration(androidTvChannel: false));
     var swept = await disabled.SweepAsync(CancellationToken.None);
     Assert.Equal(channelId, swept.ChannelId);
-    Assert.Equal(4, swept.Found);
-    Assert.Equal(4, swept.Deleted);
+    Assert.Equal(5, swept.Found);
+    Assert.Equal(5, swept.Deleted);
     Assert.Equal(0, swept.Failed);
     Assert.True(disabledHarness.Deleted.OrderBy(id => id).SequenceEqual(
-        new[] { legacyRail, legacyStub, currentRail, currentTitle }.OrderBy(id => id)));
+        new[] { legacyRail, legacyStub, currentRail, currentTitle, staleStub }.OrderBy(id => id)));
     Assert.False(disabledHarness.Deleted.Contains(channelId));
     Assert.False(disabledHarness.Deleted.Contains(foreignRow));
     Assert.True(disabledHarness.Remaining.Any(item => item.Id == channelId && item is Channel));
@@ -711,45 +794,46 @@ static async Task AndroidTvChannelCleanupAsync()
     var repeated = await disabled.SweepAsync(CancellationToken.None);
     Assert.Equal(0, repeated.Found);
     Assert.Equal(0, repeated.Deleted);
-    Assert.Equal(4, disabledHarness.Deleted.Count);
+    Assert.Equal(5, disabledHarness.Deleted.Count);
 
     // Enabled: only the Series rows 0.1.14.0 wrote go; container rows keep their favourites.
-    var enabledHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, foreignRow);
+    var enabledHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, staleStub, foreignRow);
     var enabled = new ScryerChannelCleanupService(
         enabledHarness.Contract,
         NullLogger<ScryerChannelCleanupService>.Instance,
         () => TvConfiguration(androidTvChannel: true));
     var legacyOnly = await enabled.SweepAsync(CancellationToken.None);
-    Assert.Equal(2, legacyOnly.Found);
-    Assert.Equal(2, legacyOnly.Deleted);
+    // The guidance stub goes too: it describes a moment, not content, so it is never valid to keep.
+    Assert.Equal(3, legacyOnly.Found);
+    Assert.Equal(3, legacyOnly.Deleted);
     Assert.Equal(0, legacyOnly.Failed);
-    Assert.True(enabledHarness.Deleted.OrderBy(id => id).SequenceEqual(new[] { legacyRail, legacyStub }.OrderBy(id => id)));
+    Assert.True(enabledHarness.Deleted.OrderBy(id => id).SequenceEqual(new[] { legacyRail, legacyStub, staleStub }.OrderBy(id => id)));
     Assert.True(enabledHarness.Remaining.Any(item => item.Id == currentRail));
     Assert.True(enabledHarness.Remaining.Any(item => item.Id == currentTitle));
 
     // One unremovable row is counted and never aborts the sweep.
-    var failingHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, foreignRow);
+    var failingHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, staleStub, foreignRow);
     failingHarness.ThrowOnDelete.Add(currentRail);
     var failing = new ScryerChannelCleanupService(
         failingHarness.Contract,
         NullLogger<ScryerChannelCleanupService>.Instance,
         () => TvConfiguration(androidTvChannel: false));
     var partial = await failing.SweepAsync(CancellationToken.None);
-    Assert.Equal(4, partial.Found);
-    Assert.Equal(3, partial.Deleted);
+    Assert.Equal(5, partial.Found);
+    Assert.Equal(4, partial.Deleted);
     Assert.Equal(1, partial.Failed);
     Assert.True(failingHarness.Deleted.OrderBy(id => id).SequenceEqual(
-        new[] { legacyRail, legacyStub, currentTitle }.OrderBy(id => id)));
+        new[] { legacyRail, legacyStub, currentTitle, staleStub }.OrderBy(id => id)));
     Assert.True(failingHarness.Remaining.Any(item => item.Id == currentRail));
 
     // Startup runs the sweep off StartAsync and never lets it escape.
-    var startupHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, foreignRow);
+    var startupHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, staleStub, foreignRow);
     var startup = new ScryerChannelCleanupService(
         startupHarness.Contract,
         NullLogger<ScryerChannelCleanupService>.Instance,
         () => TvConfiguration(androidTvChannel: false));
     await startup.StartAsync(CancellationToken.None);
-    await WaitUntilAsync(() => startupHarness.Deleted.Count == 4);
+    await WaitUntilAsync(() => startupHarness.Deleted.Count == 5);
 
     // Saving the configuration sweeps again, off the administrator's request thread.
     var reappeared = Guid.ParseExact("11111111111111111111111111111106", "N");
@@ -758,7 +842,7 @@ static async Task AndroidTvChannelCleanupAsync()
     await WaitUntilAsync(() => startupHarness.Deleted.Contains(reappeared));
 
     await startup.StopAsync(CancellationToken.None);
-    Assert.Equal(5, startupHarness.Deleted.Count);
+    Assert.Equal(6, startupHarness.Deleted.Count);
 
     var services = new ServiceCollection();
     new PluginServiceRegistrator().RegisterServices(services, InterfaceProxy.Create<IServerApplicationHost>());
@@ -773,6 +857,7 @@ static ChannelLibraryHarness CleanupHarness(
     Guid legacyStub,
     Guid currentRail,
     Guid currentTitle,
+    Guid staleStub,
     Guid foreignRow) =>
     ChannelLibraryHarness.Create(
         channelId,
@@ -781,6 +866,15 @@ static ChannelLibraryHarness CleanupHarness(
         new Series { Id = legacyStub, ChannelId = channelId, Name = "Connect Scryer in Jellyfin Web" },
         new Folder { Id = currentRail, ChannelId = channelId, Name = "For You" },
         new Folder { Id = currentTitle, ChannelId = channelId, Name = "Arrival" },
+        // A container-typed guidance stub, the shape 0.1.15.0 wrote. Jellyfin copies the channel
+        // item id into ExternalId, which is how cleanup recognises a stub that outlived its moment.
+        new Folder
+        {
+            Id = staleStub,
+            ChannelId = channelId,
+            Name = "Connect Scryer in Jellyfin Web",
+            ExternalId = ScryerDiscoveryChannel.MessageIdPrefix + "0f1e2d"
+        },
         new Series { Id = foreignRow, ChannelId = Guid.ParseExact("99999999999999999999999999999999", "N"), Name = "Another channel" });
 
 static PluginConfiguration TvConfiguration(bool androidTvChannel)
@@ -2011,6 +2105,8 @@ static class ProxyDefaults
 
 sealed class InMemoryTokenStore : IScryerTokenStore
 {
+    public bool HasStoredGrant(string jellyfinUserId) => Current is not null;
+
     public ScryerRefreshGrant? Current { get; set; }
     public List<ScryerRefreshGrant> Detached { get; } = [];
     public List<string> Events { get; } = [];

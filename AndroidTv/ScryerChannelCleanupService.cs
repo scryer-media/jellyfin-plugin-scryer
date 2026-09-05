@@ -227,7 +227,7 @@ public sealed class ScryerChannelCleanupService : IHostedService
         _logger.LogInformation(
             "Removed Scryer discovery channel rows from the Jellyfin library ({ChannelId}, scope {Scope}): found {Found}, deleted {Deleted}, failed {Failed}.",
             channelId,
-            enabled ? "legacy Series rows" : "all channel rows",
+            enabled ? "legacy Series rows and guidance stubs" : "all channel rows",
             candidates.Length,
             deleted,
             failed);
@@ -244,8 +244,15 @@ public sealed class ScryerChannelCleanupService : IHostedService
             return false;
         }
 
-        return !channelEnabled || IsLegacySeriesRow(item);
+        // A guidance stub describes a moment ("connect Scryer", "Scryer unavailable"), never
+        // content. Jellyfin only retires a channel row when it re-queries the channel, so a stub
+        // can outlive the condition it described; it is always the plugin's to remove.
+        return !channelEnabled || IsLegacySeriesRow(item) || IsMessageStub(item);
     }
+
+    private static bool IsMessageStub(BaseItem item) =>
+        item.ExternalId is not null &&
+        item.ExternalId.StartsWith(ScryerDiscoveryChannel.MessageIdPrefix, StringComparison.Ordinal);
 
     private static bool IsLegacySeriesRow(BaseItem item)
     {

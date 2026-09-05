@@ -37,11 +37,20 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
     internal const string ChannelName = "Scryer Discovery";
     internal const string TargetProviderId = "ScryerTarget";
     internal const string KindProviderId = "ScryerKind";
-    internal const string DataSchemaVersion = "android-tv-v2";
+    internal const string DataSchemaVersion = "android-tv-v3";
+
+    /// <summary>
+    /// Channel item id prefix carried by every guidance stub ("Connect Scryer in Jellyfin Web" and
+    /// friends). Jellyfin copies a channel item's id into BaseItem.ExternalId, so cleanup can find
+    /// a stub that outlived the condition it described.
+    /// </summary>
+    internal const string MessageIdPrefix = "scryer-message-";
+
     private const int MaximumRecentItems = 25;
     private const int MaximumPageSize = 100;
 
     private readonly Func<PluginConfiguration?> _configuration;
+    private readonly Func<string, bool> _hasStoredGrant;
     private readonly IScryerUserSessionService _sessions;
     private readonly IScryerGraphqlService _scryer;
     private readonly ILibraryManager _libraryManager;
@@ -50,10 +59,18 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
 
     public ScryerDiscoveryChannel(
         IScryerUserSessionService sessions,
+        IScryerTokenStore tokens,
         IScryerGraphqlService scryer,
         ILibraryManager libraryManager,
         IUserManager userManager)
-        : this(sessions, scryer, libraryManager, userManager, TimeProvider.System, static () => Plugin.Instance?.Configuration)
+        : this(
+            sessions,
+            scryer,
+            libraryManager,
+            userManager,
+            TimeProvider.System,
+            static () => Plugin.Instance?.Configuration,
+            (tokens ?? throw new ArgumentNullException(nameof(tokens))).HasStoredGrant)
     {
     }
 
@@ -63,9 +80,11 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         ILibraryManager libraryManager,
         IUserManager userManager,
         TimeProvider timeProvider,
-        Func<PluginConfiguration?>? configuration = null)
+        Func<PluginConfiguration?>? configuration = null,
+        Func<string, bool>? hasStoredGrant = null)
     {
         _configuration = configuration ?? (static () => Plugin.Instance?.Configuration);
+        _hasStoredGrant = hasStoredGrant ?? (static _ => false);
         _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
         _scryer = scryer ?? throw new ArgumentNullException(nameof(scryer));
         _libraryManager = libraryManager ?? throw new ArgumentNullException(nameof(libraryManager));
@@ -99,7 +118,12 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         // Daily, not hourly: every key change makes Jellyfin refetch the channel and upsert its
         // items into the server's own library database for each user.
         var day = _timeProvider.GetUtcNow().ToUnixTimeSeconds() / 86400;
-        return $"{DataSchemaVersion}:{day}:{StableHash(userId)}";
+        // Connection state has to be part of the key. Jellyfin retires a channel row only when it
+        // actually re-queries the channel, so a "Connect Scryer" stub published while the user was
+        // disconnected otherwise outlives the moment they connect. Jellyfin passes the same "N"
+        // formatted user id the plugin stores grants under.
+        var connected = !string.IsNullOrEmpty(userId) && _hasStoredGrant(userId) ? "1" : "0";
+        return $"{DataSchemaVersion}:{day}:{connected}:{StableHash(userId)}";
     }
 
     private bool IsChannelEnabled()
@@ -147,22 +171,33 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
             });
         }
 
+        // Scryer's discovery query takes no size arguments, so the response is whatever the server
+        // decided to send. Everything published here becomes a persisted library row - and a
+        // downloaded poster - on the Jellyfin server, for every user who opens the channel, so the
+        // rails and their contents are capped before Jellyfin ever sees them.
+        var configuration = _configuration();
+        var railCap = ScryerAndroidTvLimits.RailCap(configuration);
+        var itemCap = ScryerAndroidTvLimits.ItemsPerRailCap(configuration);
+        var rails = projection.Value.Take(railCap).ToArray();
+
         if (string.IsNullOrEmpty(query.FolderId))
         {
-            var folders = projection.Value.Select(rail => RailItem(jellyfinUserId, rail)).ToArray();
+            var folders = rails.Select(rail => RailItem(jellyfinUserId, rail, itemCap)).ToArray();
             return folders.Length > 0
                 ? Page(query, folders)
                 : Page(query, new[] { MessageItem(jellyfinUserId, "empty", "No recommendations yet", "Watch some media or try Scryer Discovery again later.") });
         }
 
-        var selectedRail = projection.Value.FirstOrDefault(rail =>
+        // Resolved against the capped list on purpose: a rail the channel never published must not
+        // be browsable through a folder id left over from an earlier, larger response.
+        var selectedRail = rails.FirstOrDefault(rail =>
             string.Equals(StableId(jellyfinUserId, "rail", rail.Key), query.FolderId, StringComparison.Ordinal));
         if (selectedRail is null)
         {
             return Page(query, Array.Empty<ChannelItemInfo>());
         }
 
-        return Page(query, selectedRail.Items.Select(item => TitleItem(jellyfinUserId, item)).ToArray());
+        return Page(query, selectedRail.Items.Take(itemCap).Select(item => TitleItem(jellyfinUserId, item)).ToArray());
     }
 
     public Task<DynamicImageResponse> GetChannelImage(ImageType type, CancellationToken cancellationToken)
@@ -263,7 +298,7 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         return seeds;
     }
 
-    private ChannelItemInfo RailItem(string jellyfinUserId, ScryerTvDiscoveryRail rail) => new()
+    private ChannelItemInfo RailItem(string jellyfinUserId, ScryerTvDiscoveryRail rail, int itemCap) => new()
     {
         Id = StableId(jellyfinUserId, "rail", rail.Key),
         Name = rail.Title,
@@ -271,7 +306,8 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         FolderType = ChannelFolderType.Container,
         MediaType = ChannelMediaType.Video,
         DateModified = CurrentHourUtc(),
-        Etag = StableHash(rail.Key + "\u001f" + rail.Items.Count)
+        // The published count, not the received one, so the etag tracks what Jellyfin stores.
+        Etag = StableHash(rail.Key + "\u001f" + Math.Min(rail.Items.Count, itemCap))
     };
 
     private ChannelItemInfo TitleItem(string jellyfinUserId, ScryerTvDiscoveryItem item)

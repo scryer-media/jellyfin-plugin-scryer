@@ -56,6 +56,19 @@ public class PluginConfiguration : BasePluginConfiguration
     /// </summary>
     public bool EnableAndroidTvChannel { get; set; }
 
+    /// <summary>
+    /// Largest number of discovery rails the Android TV channel will publish. Scryer decides how
+    /// many sections to return and Jellyfin persists every published folder as a library row per
+    /// user, so the plugin caps what it hands over rather than storing whatever arrives.
+    /// </summary>
+    public int MaxAndroidTvRails { get; set; } = ScryerAndroidTvLimits.DefaultRails;
+
+    /// <summary>
+    /// Largest number of titles the Android TV channel will publish inside one rail. Each title
+    /// becomes a library row and a downloaded poster for the user who opened the rail.
+    /// </summary>
+    public int MaxAndroidTvItemsPerRail { get; set; } = ScryerAndroidTvLimits.DefaultItemsPerRail;
+
     public ScryerDiagnosticVerbosity DiagnosticVerbosity { get; set; } = ScryerDiagnosticVerbosity.Basic;
 
     /// <summary>

@@ -173,15 +173,31 @@ channel item it fetches as a row in its own library database, separately for eac
 user, and re-fetches them from the daily **Refresh Channels** scheduled task. On a server
 with many users this creates a correspondingly large number of rows.
 
+How much the channel publishes is bounded, because Scryer's discovery query takes no size
+arguments and the server decides how many sections and titles to send. **Android TV rails
+to publish** caps the rails, defaulting to 8 and never exceeding 25. **Titles per rail**
+caps each rail's contents, defaulting to 20 and never exceeding 100. Both are applied
+before Jellyfin sees the response, so they bound the rows and posters stored on the
+Jellyfin server rather than merely what a television draws. Lowering a limit also makes
+the rails it excluded unreachable, so an old folder id cannot reopen them.
+
 The plugin retracts the rows it caused. A cleanup sweep runs once at server startup and
 again whenever the plugin configuration is saved. With the channel off it removes every
 Scryer discovery channel item Jellyfin has stored, together with the metadata directories
-and downloaded posters that belong to them. With the channel on it removes only the legacy
-`Series` rows written by 0.1.14.0, which shipped the channel enabled; the current channel
-emits container folders only, so favourites set on valid entries survive. The sweep skips
-rows it cannot delete, records them in the log, and is safe to repeat. The empty **Scryer
-Discovery** channel entry itself is a Jellyfin-owned object: Jellyfin recreates it on every
-**Refresh Channels** run, so the plugin never deletes it.
+and downloaded posters that belong to them. With the channel on it removes the legacy
+`Series` rows written by 0.1.14.0, which shipped the channel enabled, and any guidance stub
+such as **Connect Scryer in Jellyfin Web**; the current channel emits container folders
+only, so favourites set on valid entries survive. The sweep skips rows it cannot delete,
+records them in the log, and is safe to repeat. The empty **Scryer Discovery** channel
+entry itself is a Jellyfin-owned object: Jellyfin recreates it on every **Refresh
+Channels** run, so the plugin never deletes it.
+
+A guidance stub describes a moment rather than content, so it must not outlive that moment.
+Jellyfin retires a channel row only when it re-queries the channel, and it re-queries only
+when the channel's cache key changes or its own three-hour cache lapses. The cache key
+therefore includes whether that Jellyfin user has a stored Scryer grant, so connecting
+Scryer immediately invalidates a **Connect Scryer in Jellyfin Web** card rather than
+leaving it on screen for a connected user.
 
 Once enabled, the unmodified Jellyfin Android TV client exposes **Scryer Discovery** as a
 channel tile under **My Media**. Android TV users must first link the same Jellyfin user to
