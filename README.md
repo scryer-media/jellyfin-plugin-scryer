@@ -199,6 +199,12 @@ therefore includes whether that Jellyfin user has a stored Scryer grant, so conn
 Scryer immediately invalidates a **Connect Scryer in Jellyfin Web** card rather than
 leaving it on screen for a connected user.
 
+Every guidance card also explains itself in the Jellyfin log. A **Scryer Discovery
+unavailable** card is written at warning level together with the Scryer failure code that
+produced it, such as `scryer_offline` or `invalid_response`, so a card on a television
+corresponds to a line an administrator can act on. A user who has simply not linked an
+account yet is an ordinary state and is recorded at debug level instead.
+
 Once enabled, the unmodified Jellyfin Android TV client exposes **Scryer Discovery** as a
 channel tile under **My Media**. Android TV users must first link the same Jellyfin user to
 Scryer by following **Connect a user** in Jellyfin Web; the television does not run a

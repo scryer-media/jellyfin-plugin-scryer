@@ -33,6 +33,7 @@ using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 var tests = new (string Name, Func<Task> Run)[]
@@ -58,6 +59,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Android TV channel uses isolated stable IDs, daily cache keys, and container stubs", AndroidTvChannelAsync),
     ("the Android TV channel is inert until the administrator opts in", AndroidTvChannelDisabledAsync),
     ("Android TV discovery is bounded before Jellyfin stores it", AndroidTvChannelLimitsAsync),
+    ("Android TV guidance cards say why they were published", AndroidTvChannelLogsGuidanceAsync),
     ("channel cleanup retracts the rows 0.1.14.0 wrote and spares the channel entity", AndroidTvChannelCleanupAsync),
     ("Android TV action journal is durable, bounded, and isolated by Jellyfin user", AndroidTvActionJournalAsync),
     ("Android TV favorite worker retains success, rolls back failure, and suppresses duplicates", AndroidTvFavoriteWorkerAsync),
@@ -637,6 +639,47 @@ static async Task AndroidTvChannelAsync()
     Assert.Equal("Connect Scryer in Jellyfin Web", instruction.Items.Single().Name);
     Assert.Equal(0, instruction.Items.Single().ProviderIds.Count);
     Assert.Equal(ChannelFolderType.Container, instruction.Items.Single().FolderType);
+}
+
+static async Task AndroidTvChannelLogsGuidanceAsync()
+{
+    const string userId = "0123456789abcdef0123456789abcdef";
+    var jellyfinUser = new User("tv-user", "test-auth", "test-reset") { Id = Guid.ParseExact(userId, "N") };
+    var time = new ManualTimeProvider(new DateTimeOffset(2026, 9, 2, 12, 15, 0, TimeSpan.Zero));
+    var libraryManager = LibraryManagerHarness.Create().Contract;
+    var userManager = UserManagerHarness.Create(jellyfinUser).Contract;
+    var enabled = TvConfiguration(androidTvChannel: true);
+    var query = new InternalChannelItemQuery { UserId = jellyfinUser.Id };
+
+    // A card on a television is not a diagnosis. When Scryer cannot answer, the plugin publishes
+    // "Scryer Discovery unavailable"; without a log line an administrator has nothing to act on.
+    var offline = new RecordingHandler(_ => new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+    {
+        Content = new StringContent("upstream down", Encoding.UTF8, "text/plain")
+    });
+    var failingGraphql = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), offline);
+    var unavailableLog = new RecordingLogger();
+    var unavailable = new ScryerDiscoveryChannel(
+        new TokenSession(), failingGraphql, libraryManager, userManager, time, () => enabled, _ => true, unavailableLog);
+
+    var unavailableItems = await unavailable.GetChannelItems(query, CancellationToken.None);
+    Assert.Equal("Scryer Discovery unavailable", unavailableItems.Items.Single().Name);
+    var warning = unavailableLog.Entries.Single(entry => entry.Level == LogLevel.Warning);
+    Assert.True(warning.Message.Contains("unavailable", StringComparison.Ordinal), "the warning names the published card");
+    Assert.True(warning.Message.Contains("scryer_offline", StringComparison.Ordinal), "the warning carries the Scryer failure code");
+
+    // A user who has simply never linked is an ordinary state. Logging that at warning level
+    // would train an administrator to ignore the level that carries real faults.
+    var healthy = new RecordingHandler(_ => JsonResponse("""{"data":{"discoveryHomeCards":{"canViewPersonalized":true,"heroItem":null,"publicSections":[],"personalizedSections":[]}}}"""));
+    var graphql = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), healthy);
+    var connectLog = new RecordingLogger();
+    var unlinked = new ScryerDiscoveryChannel(
+        new UnlinkedSession(), graphql, libraryManager, userManager, time, () => enabled, _ => false, connectLog);
+
+    var connectItems = await unlinked.GetChannelItems(query, CancellationToken.None);
+    Assert.Equal("Connect Scryer in Jellyfin Web", connectItems.Items.Single().Name);
+    Assert.Equal(0, connectLog.Entries.Count(entry => entry.Level == LogLevel.Warning));
+    Assert.Equal(1, connectLog.Entries.Count(entry => entry.Level == LogLevel.Debug));
 }
 
 static async Task AndroidTvChannelLimitsAsync()
@@ -2272,4 +2315,15 @@ static class Assert
     }
 
     public static T IsType<T>(object? value) where T : class => value as T ?? throw new InvalidOperationException($"Expected {typeof(T).Name}.");
+}
+
+sealed class RecordingLogger : ILogger
+{
+    public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) =>
+        Entries.Add((logLevel, formatter(state, exception)));
 }

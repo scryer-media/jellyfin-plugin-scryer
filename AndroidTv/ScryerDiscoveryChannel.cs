@@ -21,6 +21,8 @@ using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Drawing;
 using MediaBrowser.Model.Entities;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Jellyfin.Plugin.Scryer.AndroidTv;
 
@@ -56,13 +58,15 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
     private readonly ILibraryManager _libraryManager;
     private readonly IUserManager _userManager;
     private readonly TimeProvider _timeProvider;
+    private readonly ILogger _logger;
 
     public ScryerDiscoveryChannel(
         IScryerUserSessionService sessions,
         IScryerTokenStore tokens,
         IScryerGraphqlService scryer,
         ILibraryManager libraryManager,
-        IUserManager userManager)
+        IUserManager userManager,
+        ILogger<ScryerDiscoveryChannel> logger)
         : this(
             sessions,
             scryer,
@@ -70,7 +74,8 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
             userManager,
             TimeProvider.System,
             static () => Plugin.Instance?.Configuration,
-            (tokens ?? throw new ArgumentNullException(nameof(tokens))).HasStoredGrant)
+            (tokens ?? throw new ArgumentNullException(nameof(tokens))).HasStoredGrant,
+            logger)
     {
     }
 
@@ -81,8 +86,10 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         IUserManager userManager,
         TimeProvider timeProvider,
         Func<PluginConfiguration?>? configuration = null,
-        Func<string, bool>? hasStoredGrant = null)
+        Func<string, bool>? hasStoredGrant = null,
+        ILogger? logger = null)
     {
+        _logger = logger ?? NullLogger.Instance;
         _configuration = configuration ?? (static () => Plugin.Instance?.Configuration);
         _hasStoredGrant = hasStoredGrant ?? (static _ => false);
         _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
@@ -146,6 +153,23 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         var status = await _sessions.GetGrantStatusAsync(jellyfinUserId, cancellationToken).ConfigureAwait(false);
         if (!status.IsSuccess || status.Value is null || !status.Value.Connected || !status.Value.AccountLinked)
         {
+            // A user who has simply not linked yet is an ordinary state, not a fault. A grant
+            // lookup that actually failed is a fault, and the card the user sees says nothing
+            // about which of the two happened, so the log has to.
+            if (status.IsSuccess)
+            {
+                _logger.LogDebug(
+                    "Scryer discovery channel is showing the connect card to Jellyfin user {UserId}: no linked Scryer account.",
+                    query.UserId);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "Scryer discovery channel could not read the Scryer grant for Jellyfin user {UserId} ({Code}); showing the connect card.",
+                    query.UserId,
+                    status.Failure?.WireCode ?? "unknown");
+            }
+
             return Page(query, new[]
             {
                 MessageItem(jellyfinUserId, "connect", "Connect Scryer in Jellyfin Web", "Open Jellyfin Web, choose a Scryer page, and connect this Jellyfin user to a Scryer account first.")
@@ -165,6 +189,14 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         var projection = await _scryer.GetAndroidTvDiscoveryAsync(jellyfinUserId, seeds, cancellationToken).ConfigureAwait(false);
         if (!projection.IsSuccess || projection.Value is null)
         {
+            // Without this the plugin publishes "Scryer Discovery unavailable" and records
+            // nothing, leaving an administrator with a card on a television and an empty log.
+            // WireCode is the stable, credential-free vocabulary, so it is safe to write out.
+            _logger.LogWarning(
+                "Scryer discovery is unavailable for Jellyfin user {UserId} ({Code}); showing the unavailable card.",
+                query.UserId,
+                projection.Failure?.WireCode ?? "unknown");
+
             return Page(query, new[]
             {
                 MessageItem(jellyfinUserId, "unavailable", "Scryer Discovery unavailable", "Reconnect in Jellyfin Web or try again after Scryer is reachable.")
