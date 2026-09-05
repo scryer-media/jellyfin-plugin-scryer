@@ -487,7 +487,7 @@ static async Task AndroidTvDiscoveryAsync()
 {
     var responses = new Queue<string>(new[]
     {
-        """[{"data":{"titlesByExternalIds":[]}},{"data":{"titlesByExternalIds":[{"id":"seed","name":"Watched","facet":"MOVIE","externalIds":[{"source":"tmdb_movie","value":"99"}],"moreLikeThis":[{"id":"one","targetKey":"tmdb:movie:1","targetKind":"MOVIE","displayTitle":"First","year":2026,"posterUrl":"https://scryer.example.test/first.avif"},{"id":"duplicate","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Duplicate","year":2025,"posterUrl":null}]}]}}]""",
+        """[{"data":{"titlesByExternalIds":[]}},{"data":{"titlesByExternalIds":[{"id":"seed","name":"Watched","facet":"MOVIE","externalIds":[{"source":"tmdb_movie","value":"99"}],"moreLikeThis":[{"id":"one","targetKey":"tmdb:movie:1","targetKind":"MOVIE","displayTitle":"First","year":2026,"posterUrl":"https://scryer.example.test/first.avif"},{"id":"duplicate","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Duplicate","year":2025,"posterUrl":null},{"id":"anime","targetKey":"tvdb:series:299497","targetKind":"series","contentType":"anime","displayTitle":"Orphans","year":2015,"posterUrl":null,"externalIds":[{"source":"tvdb","kind":"series","id":"299497"},{"source":"anidb","kind":"anime","id":"11372"},{"source":"","kind":"x","id":"1"}]}]}]}}]""",
         """{"data":{"discoveryHomeCards":{"canViewPersonalized":true,"heroItem":null,"publicSections":[{"sectionId":"public","title":"Public","items":[{"id":"duplicate","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Duplicate","year":2025,"posterUrl":null},{"id":"three","targetKey":"tvdb:series:3","targetKind":"SERIES","displayTitle":"Third","year":2024,"posterUrl":null}]}],"personalizedSections":[{"sectionId":"personal","title":"For You","items":[{"id":"four","targetKey":"tmdb:movie:4","targetKind":"MOVIE","displayTitle":"Fourth","year":2023,"posterUrl":"/images/four.avif"}]}]}}}"""
     });
     var handler = new RecordingHandler(_ => JsonResponse(responses.Dequeue()));
@@ -502,8 +502,16 @@ static async Task AndroidTvDiscoveryAsync()
     Assert.True(result.IsSuccess, result.Failure?.Message);
     Assert.True(result.Value!.Select(rail => rail.Title).SequenceEqual(new[] { "More like Watched", "For You", "Public" }));
     Assert.True(result.Value!.SelectMany(rail => rail.Items).Select(item => item.TargetKey)
-        .SequenceEqual(new[] { "tmdb:movie:1", "tmdb:movie:2", "tmdb:movie:4", "tvdb:series:3" }));
+        .SequenceEqual(new[] { "tmdb:movie:1", "tmdb:movie:2", "tvdb:series:299497", "tmdb:movie:4", "tvdb:series:3" }));
     Assert.Equal("https://scryer.example.test/images/four.avif", result.Value![1].Items[0].PosterUrl);
+    // A recommendation names an anime as a plain series; its content type is what the row is
+    // published under, and the ids it was matched on travel with it (the blank one dropped).
+    var animeItem = result.Value![0].Items[2];
+    Assert.Equal("ANIME", animeItem.TargetKind);
+    Assert.Equal(2, animeItem.ExternalIds!.Count);
+    Assert.Equal("anidb", animeItem.ExternalIds[1].Source);
+    Assert.Equal("11372", animeItem.ExternalIds[1].Value);
+    Assert.Equal(null, result.Value![1].Items[0].ExternalIds!.Count == 0 ? null : "home cards carry no ids");
     Assert.Equal(2, handler.Requests.Count);
     using var recommendationBatch = JsonDocument.Parse(handler.Requests[0].Content!);
     Assert.Equal(JsonValueKind.Array, recommendationBatch.RootElement.ValueKind);
@@ -618,13 +626,13 @@ static async Task AndroidTvActionsAsync()
     const string userId = "0123456789abcdef0123456789abcdef";
     var manageResponses = new Queue<string>(new[]
     {
-        """{"data":{"libraries":[{"id":"movies","facet":"MOVIE","name":"Movies","slug":"movies","isDefault":true,"qualityProfileId":"profile-hd","roots":[]}]}}""",
         """{"data":{"discoveryItemDetail":{"targetKey":"tmdb:movie:42","targetKind":"MOVIE","displayTitle":"Answer","year":2026,"posterUrl":null,"overview":"Overview","rating":null,"ratingSources":[],"externalRatings":[],"externalIds":[{"source":"tmdb","id":"42"}]}}}""",
+        """{"data":{"libraries":[{"id":"movies","facet":"MOVIE","name":"Movies","slug":"movies","isDefault":true,"qualityProfileId":"profile-hd","roots":[]}]}}""",
         """{"data":{"addTitle":{"title":{"id":"title","name":"Answer","libraryId":"movies","facet":"MOVIE","monitored":true},"metadataHydrationState":"READY","reusedExistingTitle":false}}}"""
     });
     var manageHandler = new RecordingHandler(_ => JsonResponse(manageResponses.Dequeue()));
     var manageService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), manageHandler);
-    var managed = await manageService.ResolveDefaultTvActionAndExecuteAsync(userId, "tmdb:movie:42", "MOVIE", CancellationToken.None);
+    var managed = await manageService.ResolveDefaultTvActionAndExecuteAsync(userId, "tmdb:movie:42", "MOVIE", null, CancellationToken.None);
     Assert.True(managed.IsSuccess, managed.Failure?.Message);
     Assert.Equal(ScryerTvActionKind.Added, managed.Value!.Kind);
     Assert.Equal("Movies", managed.Value.LibraryName);
@@ -639,16 +647,16 @@ static async Task AndroidTvActionsAsync()
 
     var requestResponses = new Queue<string>(new[]
     {
-        """{"data":{"libraries":[]}}""",
-        """{"data":{"libraries":[{"id":"shows","facet":"SERIES","name":"Shows","slug":"shows","isDefault":true,"requestQualityProfileIds":["profile-tv"],"requestQualityProfileDefaultId":"profile-tv","roots":[]}]}}""",
         // Scryer's real detail payload: a lowercase target kind, more external ids than any client
         // needs (one of them unreadable, one repeated), a year it does not know, and a long overview.
         """{"data":{"discoveryItemDetail":{"targetKey":"tvdb:series:7","targetKind":"series","displayTitle":"Seven","year":0,"posterUrl":null,"overview":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","rating":null,"ratingSources":[],"externalRatings":[],"externalIds":[{"source":"tvdb","kind":"series","id":"7"},{"source":"TVDB","kind":"series","id":"7"},{"source":"imdb","kind":"series","id":""},{"source":"source0","kind":"series","id":"0"},{"source":"source1","kind":"series","id":"1"},{"source":"source2","kind":"series","id":"2"},{"source":"source3","kind":"series","id":"3"},{"source":"source4","kind":"series","id":"4"},{"source":"source5","kind":"series","id":"5"},{"source":"source6","kind":"series","id":"6"},{"source":"source7","kind":"series","id":"7"},{"source":"source8","kind":"series","id":"8"},{"source":"source9","kind":"series","id":"9"},{"source":"source10","kind":"series","id":"10"},{"source":"source11","kind":"series","id":"11"},{"source":"source12","kind":"series","id":"12"},{"source":"source13","kind":"series","id":"13"},{"source":"source14","kind":"series","id":"14"},{"source":"source15","kind":"series","id":"15"},{"source":"source16","kind":"series","id":"16"},{"source":"source17","kind":"series","id":"17"}],"canonicalTags":[]}}}""",
+        """{"data":{"libraries":[]}}""",
+        """{"data":{"libraries":[{"id":"shows","facet":"SERIES","name":"Shows","slug":"shows","isDefault":true,"requestQualityProfileIds":["profile-tv"],"requestQualityProfileDefaultId":"profile-tv","roots":[]}]}}""",
         """{"data":{"submitMediaRequest":{"requestId":"request-1"}}}"""
     });
     var requestHandler = new RecordingHandler(_ => JsonResponse(requestResponses.Dequeue()));
     var requestService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), requestHandler);
-    var requested = await requestService.ResolveDefaultTvActionAndExecuteAsync(userId, "tvdb:series:7", "SERIES", CancellationToken.None);
+    var requested = await requestService.ResolveDefaultTvActionAndExecuteAsync(userId, "tvdb:series:7", "SERIES", null, CancellationToken.None);
     Assert.True(requested.IsSuccess, requested.Failure?.Message);
     Assert.Equal(ScryerTvActionKind.Requested, requested.Value!.Kind);
     using (var request = JsonDocument.Parse(requestHandler.Requests[3].Content!))
@@ -664,12 +672,100 @@ static async Task AndroidTvActionsAsync()
         Assert.Equal(8192, input.GetProperty("overview").GetString()!.Length);
     }
 
-    var ambiguousHandler = new RecordingHandler(_ => JsonResponse("""{"data":{"libraries":[{"id":"one","facet":"MOVIE","name":"One","slug":"one","isDefault":true,"qualityProfileId":"p1","roots":[]},{"id":"two","facet":"MOVIE","name":"Two","slug":"two","isDefault":true,"qualityProfileId":"p2","roots":[]}]}}"""));
+    var ambiguousResponses = new Queue<string>(new[]
+    {
+        """{"data":{"discoveryItemDetail":{"targetKey":"tmdb:movie:42","targetKind":"MOVIE","displayTitle":"Answer","year":2026,"posterUrl":null,"overview":null,"rating":null,"ratingSources":[],"externalRatings":[],"externalIds":[{"source":"tmdb","id":"42"}]}}}""",
+        """{"data":{"libraries":[{"id":"one","facet":"MOVIE","name":"One","slug":"one","isDefault":true,"qualityProfileId":"p1","roots":[]},{"id":"two","facet":"MOVIE","name":"Two","slug":"two","isDefault":true,"qualityProfileId":"p2","roots":[]}]}}"""
+    });
+    var ambiguousHandler = new RecordingHandler(_ => JsonResponse(ambiguousResponses.Dequeue()));
     var ambiguousService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), ambiguousHandler);
-    var ambiguous = await ambiguousService.ResolveDefaultTvActionAndExecuteAsync(userId, "tmdb:movie:42", "MOVIE", CancellationToken.None);
+    var ambiguous = await ambiguousService.ResolveDefaultTvActionAndExecuteAsync(userId, "tmdb:movie:42", "MOVIE", null, CancellationToken.None);
     Assert.False(ambiguous.IsSuccess);
     Assert.Equal("Configure exactly one default Scryer library for this media type.", ambiguous.Failure!.Message);
-    Assert.Equal(1, ambiguousHandler.Requests.Count);
+    Assert.Equal(2, ambiguousHandler.Requests.Count);
+
+    // A recommendation row names an anime as a series (targetKind "series"); the detail's content
+    // type says anime, and that decides the library, not the row.
+    var animeResponses = new Queue<string>(new[]
+    {
+        """{"data":{"discoveryItemDetail":{"targetKey":"tvdb:series:299497","targetKind":"series","contentType":"anime","displayTitle":"Orphans","year":2015,"posterUrl":null,"overview":"Mars.","rating":null,"ratingSources":[],"externalRatings":[],"externalIds":[{"source":"tvdb","kind":"series","id":"299497"},{"source":"anidb","kind":"anime","id":"11372"}]}}}""",
+        """{"data":{"libraries":[{"id":"anime_default_library","facet":"ANIME","name":"Anime","slug":"anime","isDefault":true,"qualityProfileId":"wizard-anime","roots":[]}]}}""",
+        """{"data":{"addTitle":{"title":{"id":"title","name":"Orphans","libraryId":"anime_default_library","facet":"ANIME","monitored":true},"metadataHydrationState":"READY","reusedExistingTitle":false}}}"""
+    });
+    var animeHandler = new RecordingHandler(_ => JsonResponse(animeResponses.Dequeue()));
+    var animeService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), animeHandler);
+    var anime = await animeService.ResolveDefaultTvActionAndExecuteAsync(userId, "tvdb:series:299497", "SERIES", null, CancellationToken.None);
+    Assert.True(anime.IsSuccess, anime.Failure?.Message);
+    Assert.Equal("Anime", anime.Value!.LibraryName);
+    using (var libraries = JsonDocument.Parse(animeHandler.Requests[1].Content!))
+    {
+        Assert.Equal("ANIME", libraries.RootElement.GetProperty("variables").GetProperty("facet").GetString());
+    }
+
+    using (var add = JsonDocument.Parse(animeHandler.Requests[2].Content!))
+    {
+        var input = add.RootElement.GetProperty("variables").GetProperty("input");
+        Assert.Equal("ANIME", input.GetProperty("facet").GetString());
+        Assert.Equal("anime_default_library", input.GetProperty("libraryId").GetString());
+    }
+
+    // Scryer's discovery store has no detail for a title that only the title graph knows
+    // (discoveryItemDetail is null). The row's own name, year and stored ids carry the add, and the
+    // key itself contributes its id even when nothing was stored.
+    var fallbackResponses = new Queue<string>(new[]
+    {
+        """{"data":{"discoveryItemDetail":null}}""",
+        """{"data":{"libraries":[{"id":"anime_default_library","facet":"ANIME","name":"Anime","slug":"anime","isDefault":true,"qualityProfileId":"wizard-anime","roots":[]}]}}""",
+        """{"data":{"addTitle":{"title":{"id":"title","name":"Azur Lane","libraryId":"anime_default_library","facet":"ANIME","monitored":true},"metadataHydrationState":"READY","reusedExistingTitle":true}}}"""
+    });
+    var fallbackHandler = new RecordingHandler(_ => JsonResponse(fallbackResponses.Dequeue()));
+    var fallbackService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), fallbackHandler);
+    var fallback = new ScryerTvActionFallback("Azur Lane", 2019, "Ships.", new[] { new ScryerTvExternalId("TMDB", "90290"), new ScryerTvExternalId("tvdb", "367277") });
+    var fellBack = await fallbackService.ResolveDefaultTvActionAndExecuteAsync(userId, "tvdb:series:367277", "ANIME", fallback, CancellationToken.None);
+    Assert.True(fellBack.IsSuccess, fellBack.Failure?.Message);
+    Assert.Equal(ScryerTvActionKind.AlreadyPresent, fellBack.Value!.Kind);
+    using (var add = JsonDocument.Parse(fallbackHandler.Requests[2].Content!))
+    {
+        var input = add.RootElement.GetProperty("variables").GetProperty("input");
+        Assert.Equal("Azur Lane", input.GetProperty("name").GetString());
+        Assert.Equal(2019, input.GetProperty("year").GetInt32());
+        Assert.Equal(2, input.GetProperty("externalIds").GetArrayLength());
+        Assert.Equal("tmdb", input.GetProperty("externalIds")[0].GetProperty("source").GetString());
+        Assert.Equal("tvdb", input.GetProperty("externalIds")[1].GetProperty("source").GetString());
+    }
+
+    var keyOnlyResponses = new Queue<string>(new[]
+    {
+        """{"data":{"discoveryItemDetail":null}}""",
+        """{"data":{"libraries":[{"id":"anime_default_library","facet":"ANIME","name":"Anime","slug":"anime","isDefault":true,"qualityProfileId":"wizard-anime","roots":[]}]}}""",
+        """{"data":{"addTitle":{"title":{"id":"title","name":"Azur Lane","libraryId":"anime_default_library","facet":"ANIME","monitored":true},"metadataHydrationState":"READY","reusedExistingTitle":false}}}"""
+    });
+    var keyOnlyHandler = new RecordingHandler(_ => JsonResponse(keyOnlyResponses.Dequeue()));
+    var keyOnlyService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), keyOnlyHandler);
+    var keyOnly = await keyOnlyService.ResolveDefaultTvActionAndExecuteAsync(userId, "tvdb:series:367277", "ANIME", new ScryerTvActionFallback("Azur Lane", null, null, Array.Empty<ScryerTvExternalId>()), CancellationToken.None);
+    Assert.True(keyOnly.IsSuccess, keyOnly.Failure?.Message);
+    using (var add = JsonDocument.Parse(keyOnlyHandler.Requests[2].Content!))
+    {
+        var ids = add.RootElement.GetProperty("variables").GetProperty("input").GetProperty("externalIds");
+        Assert.Equal(1, ids.GetArrayLength());
+        Assert.Equal("tvdb", ids[0].GetProperty("source").GetString());
+        Assert.Equal("367277", ids[0].GetProperty("value").GetString());
+    }
+
+    // Without a row to fall back on, a null detail is reported as the item being gone.
+    var goneHandler = new RecordingHandler(_ => JsonResponse("""{"data":{"discoveryItemDetail":null}}"""));
+    var goneService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), goneHandler);
+    var gone = await goneService.ResolveDefaultTvActionAndExecuteAsync(userId, "tvdb:series:367277", "ANIME", null, CancellationToken.None);
+    Assert.False(gone.IsSuccess);
+    Assert.Equal("This discovery item is no longer valid.", gone.Failure!.Message);
+
+    // Stored ids round-trip through the row's provider id and skip anything that would not.
+    var encoded = ScryerDiscoveryChannel.EncodeExternalIds(new[] { new ScryerTvExternalId("TVDB", "367277"), new ScryerTvExternalId("bad;source", "1"), new ScryerTvExternalId("imdb", "tt123") });
+    Assert.Equal("tvdb=367277;imdb=tt123", encoded);
+    var decoded = ScryerDiscoveryChannel.ParseExternalIds(encoded + ";broken;=x;y=");
+    Assert.Equal(2, decoded.Count);
+    Assert.Equal("imdb", decoded[1].Source);
+    Assert.Equal("tt123", decoded[1].Value);
 }
 
 static async Task AndroidTvChannelAsync()
@@ -1193,9 +1289,10 @@ static async Task AndroidTvFavoriteWorkerAsync()
     var sessionManager = SessionManagerHarness.Create();
     var responses = new Queue<string>(new[]
     {
-        """{"data":{"libraries":[{"id":"movies","facet":"MOVIE","name":"Movies","slug":"movies","isDefault":true,"qualityProfileId":"profile-hd","roots":[]}]}}""",
         """{"data":{"discoveryItemDetail":{"targetKey":"tmdb:movie:42","targetKind":"MOVIE","displayTitle":"Answer","year":2026,"posterUrl":null,"overview":null,"rating":null,"ratingSources":[],"externalRatings":[],"externalIds":[{"source":"tmdb","id":"42"}]}}}""",
+        """{"data":{"libraries":[{"id":"movies","facet":"MOVIE","name":"Movies","slug":"movies","isDefault":true,"qualityProfileId":"profile-hd","roots":[]}]}}""",
         """{"data":{"addTitle":{"title":{"id":"title","name":"Answer","libraryId":"movies","facet":"MOVIE","monitored":true},"metadataHydrationState":"READY","reusedExistingTitle":false}}}""",
+        """{"data":{"discoveryItemDetail":{"targetKey":"tmdb:movie:43","targetKind":"MOVIE","displayTitle":"Other","year":2026,"posterUrl":null,"overview":null,"rating":null,"ratingSources":[],"externalRatings":[],"externalIds":[{"source":"tmdb","id":"43"}]}}}""",
         """{"data":{"libraries":[{"id":"one","facet":"MOVIE","name":"One","slug":"one","isDefault":true,"qualityProfileId":"p1","roots":[]},{"id":"two","facet":"MOVIE","name":"Two","slug":"two","isDefault":true,"qualityProfileId":"p2","roots":[]}]}}"""
     });
     var handler = new RecordingHandler(_ => JsonResponse(responses.Dequeue()));
@@ -1244,7 +1341,7 @@ static async Task AndroidTvFavoriteWorkerAsync()
 
         userDataManager.Raise(userId, failureItem, isFavorite: true);
         await WaitUntilAsync(() => sessionManager.Messages.Count == 2 && !userDataManager.Get(failureItem).IsFavorite);
-        Assert.Equal(4, handler.Requests.Count);
+        Assert.Equal(5, handler.Requests.Count);
         Assert.Equal("Configure exactly one default Scryer library for this media type.", sessionManager.Messages[1].Arguments["Text"]);
     }
     finally

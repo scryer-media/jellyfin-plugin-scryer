@@ -247,6 +247,12 @@ Use the standard Favorite heart on a title to send it to Scryer:
 - The default library must have its appropriate default quality profile configured.
 - Successful actions keep the heart selected. Clearing the heart does not remove or
   cancel anything in Scryer; it only permits a later retry.
+- The library is chosen by Scryer's content type, so an anime recommended as a plain
+  series still goes to the anime library.
+- **More like...** rails come from Scryer's title graph, which is wider than its
+  discovery store, so a rail title may have no discovery detail. Each row therefore
+  carries the ids Scryer matched it on, and the action falls back to those, plus the id
+  in the row's own key, when the detail lookup returns nothing.
 
 The action always uses `MONITORED`. Jellyfin displays a native success or failure message
 on the active user's clients. Scryer's AVIF posters are handed to Jellyfin unchanged.

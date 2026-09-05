@@ -42,7 +42,7 @@ public interface IScryerGraphqlService
     Task<ScryerResult<JsonElement>> GetDownloadQueuePageAsync(string jellyfinUserId, int offset, CancellationToken cancellationToken);
     Task<ScryerResult<JsonElement>> GetDownloadHistoryPageAsync(string jellyfinUserId, int offset, CancellationToken cancellationToken);
     Task<ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>> GetAndroidTvDiscoveryAsync(string jellyfinUserId, IReadOnlyList<ScryerRecommendationSeed> recentSeeds, CancellationToken cancellationToken);
-    Task<ScryerResult<ScryerTvActionResult>> ResolveDefaultTvActionAndExecuteAsync(string jellyfinUserId, string targetKey, string targetKind, CancellationToken cancellationToken);
+    Task<ScryerResult<ScryerTvActionResult>> ResolveDefaultTvActionAndExecuteAsync(string jellyfinUserId, string targetKey, string targetKind, ScryerTvActionFallback? fallback, CancellationToken cancellationToken);
 }
 
 public sealed class ScryerGraphqlService : IScryerGraphqlService
@@ -74,10 +74,10 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
     private const string RequestLibrariesQuery = """query ScryerRequestLibraries($facet: MediaFacetValue) { libraries(facet: $facet, permission: REQUEST) { id facet name slug isDefault requestQualityProfileIds requestQualityProfileDefaultId roots { id path isDefault } } }""";
     private const string ManageableLibrariesQuery = """query ScryerManageableLibraries($facet: MediaFacetValue) { libraries(facet: $facet, permission: MANAGE_TITLES) { id facet name slug isDefault qualityProfileId roots { id path isDefault } } }""";
     private const string QualityProfilesQuery = """query ScryerQualityProfiles { qualityProfileSettings { profiles { id name } } }""";
-    private const string DiscoveryHomeCardsQuery = """query ScryerDiscoveryHomeCards { discoveryHomeCards { canViewPersonalized heroItem { id targetKey targetKind displayTitle year posterUrl } publicSections { sectionId title items { id targetKey targetKind displayTitle year posterUrl } } personalizedSections { sectionId title items { id targetKey targetKind displayTitle year posterUrl } } } }""";
-    private const string TitleRecommendationsQuery = """query ScryerTitleRecommendations($source: String!, $values: [String!]!, $limit: Int!) { titlesByExternalIds(source: $source, values: $values) { id name facet externalIds { source value } moreLikeThis(limit: $limit) { id targetKey targetKind displayTitle year posterUrl } } }""";
+    private const string DiscoveryHomeCardsQuery = """query ScryerDiscoveryHomeCards { discoveryHomeCards { canViewPersonalized heroItem { id targetKey targetKind contentType displayTitle year posterUrl } publicSections { sectionId title items { id targetKey targetKind contentType displayTitle year posterUrl } } personalizedSections { sectionId title items { id targetKey targetKind contentType displayTitle year posterUrl } } } }""";
+    private const string TitleRecommendationsQuery = """query ScryerTitleRecommendations($source: String!, $values: [String!]!, $limit: Int!) { titlesByExternalIds(source: $source, values: $values) { id name facet externalIds { source value } moreLikeThis(limit: $limit) { id targetKey targetKind contentType displayTitle year posterUrl externalIds { source id } } } }""";
     private const string SearchMetadataMultiQuery = """query ScryerSearchMetadataMulti($query: String!, $limit: Int, $language: String! = "eng") { searchMetadataMulti(query: $query, limit: $limit, language: $language) { movies { tvdbId smgId tmdbId imdbId name slug type year status overview posterUrl language runtimeMinutes sortTitle externalIds { source value } } series { tvdbId smgId tmdbId imdbId name slug type year status overview posterUrl language runtimeMinutes sortTitle externalIds { source value } } anime { tvdbId smgId tmdbId imdbId name slug type year status overview posterUrl language runtimeMinutes sortTitle externalIds { source value } } } }""";
-    private const string DiscoveryItemDetailQuery = """query ScryerDiscoveryItemDetail($input: DiscoveryItemDetailInput!) { discoveryItemDetail(input: $input) { targetKey targetKind displayTitle year posterUrl overview rating ratingSources externalRatings { source value score normalized votes url } externalIds { source id } } }""";
+    private const string DiscoveryItemDetailQuery = """query ScryerDiscoveryItemDetail($input: DiscoveryItemDetailInput!) { discoveryItemDetail(input: $input) { targetKey targetKind contentType displayTitle year posterUrl overview rating ratingSources externalRatings { source value score normalized votes url } externalIds { source id } } }""";
     private const string MyMediaRequestsQuery = """query ScryerMyMediaRequests { myMediaRequests { id libraryId facet status identityFingerprint title sortTitle slug posterUrl year overview runtimeMinutes language contentStatus requestedQualityProfileId requestedQualityProfileName requestedMonitorType resolvedByUserId resolvedAt createdTitleId approvedQualityProfileId approvedQualityProfileName externalIds { source value } requesters { userId username avatarUrl } } }""";
     private const string ManageableMediaRequestsQuery = """query ScryerManageableMediaRequests { mediaRequests { id libraryId facet status identityFingerprint title sortTitle slug posterUrl year overview runtimeMinutes language contentStatus requestedQualityProfileId requestedQualityProfileName requestedMonitorType resolvedByUserId resolvedAt createdTitleId approvedQualityProfileId approvedQualityProfileName externalIds { source value } requesters { userId username avatarUrl requestedAt } createdByUserId createdAt updatedAt } }""";
     private const string SubmitMediaRequestMutation = """mutation ScryerSubmitMediaRequest($input: SubmitMediaRequestInput!) { submitMediaRequest(input: $input) { requestId } }""";
@@ -408,12 +408,43 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         string jellyfinUserId,
         string targetKey,
         string targetKind,
+        ScryerTvActionFallback? fallback,
         CancellationToken cancellationToken)
     {
-        var facet = NormalizeFacet(targetKind);
-        if (!IsBoundedIdentifier(targetKey) || facet is null)
+        var rowFacet = NormalizeFacet(targetKind);
+        if (!IsBoundedIdentifier(targetKey) || rowFacet is null)
         {
             return TvActionFailure("This discovery item is no longer valid.");
+        }
+
+        // The detail comes first because it decides the facet. A row published from a
+        // recommendation names an anime as a series; Scryer's detail carries the content type, and
+        // that, not the row, must pick between the series and anime libraries. When the discovery
+        // store has no detail for this key (recommendations come from the title graph, which is
+        // wider than the store), the row's own name and ids carry the action instead.
+        var detail = await GetDiscoveryItemDetailAsync(jellyfinUserId, targetKey, cancellationToken).ConfigureAwait(false);
+        if (!detail.IsSuccess)
+        {
+            return ScryerResult<ScryerTvActionResult>.Fail(detail.Failure!);
+        }
+
+        string facet;
+        ScryerTvActionDetail actionDetail;
+        if (TryReadTvActionDetail(detail.Value!, targetKey, out var readDetail, out var detailFacet))
+        {
+            actionDetail = readDetail;
+            facet = detailFacet ?? rowFacet;
+        }
+        else if (TryBuildFallbackDetail(targetKey, fallback, out var fallbackDetail))
+        {
+            actionDetail = fallbackDetail;
+            facet = rowFacet;
+        }
+        else
+        {
+            return TvActionFailure(fallback is null || string.IsNullOrWhiteSpace(fallback.Title)
+                ? "This discovery item is no longer valid."
+                : "This title has no supported external identifier.");
         }
 
         var manageable = await GetManageableLibrariesAsync(jellyfinUserId, facet, cancellationToken).ConfigureAwait(false);
@@ -460,17 +491,6 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         if (string.IsNullOrWhiteSpace(destination.QualityProfileId))
         {
             return TvActionFailure("Configure a default quality profile on the default Scryer library.");
-        }
-
-        var detail = await GetDiscoveryItemDetailAsync(jellyfinUserId, targetKey, cancellationToken).ConfigureAwait(false);
-        if (!detail.IsSuccess)
-        {
-            return ScryerResult<ScryerTvActionResult>.Fail(detail.Failure!);
-        }
-
-        if (!TryReadTvActionDetail(detail.Value!, targetKey, facet, out var actionDetail))
-        {
-            return TvActionFailure("This title has no supported external identifier.");
         }
 
         var manageOptions = new Dictionary<string, object?>
@@ -666,8 +686,7 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         {
             if (item.ValueKind != JsonValueKind.Object ||
                 !TryReadBoundedString(item, "targetKey", out var targetKey) ||
-                !TryReadBoundedString(item, "targetKind", out var targetKind) ||
-                NormalizeFacet(targetKind) is null ||
+                ResolveFacet(item) is not { } facet ||
                 !TryReadBoundedString(item, "displayTitle", out var displayTitle))
             {
                 continue;
@@ -695,7 +714,7 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
                 }
             }
 
-            parsed.Add(new ScryerTvDiscoveryItem(targetKey, NormalizeFacet(targetKind)!, displayTitle, year, posterUrl, null));
+            parsed.Add(new ScryerTvDiscoveryItem(targetKey, facet, displayTitle, year, posterUrl, null, ReadExternalIds(item)));
         }
 
         items = parsed;
@@ -790,23 +809,109 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         return true;
     }
 
-    private static bool TryReadTvActionDetail(JsonElement value, string expectedTargetKey, string expectedFacet, out ScryerTvActionDetail detail)
+    private static bool TryReadTvActionDetail(JsonElement value, string expectedTargetKey, out ScryerTvActionDetail detail, out string? facet)
     {
         // Only the identity of the item is checked strictly: it must be the item that was asked
-        // about, of the facet the row was published under, with a title. Everything else is read
-        // as well as it can be, because Scryer knows far more ids for a title than this action
-        // needs and one it cannot read must not stop the add or request.
+        // about, with a title. Everything else is read as well as it can be, because Scryer knows
+        // far more ids for a title than this action needs and one it cannot read must not stop the
+        // add or request. The facet is reported, not checked: Scryer's content type is what tells
+        // an anime apart from a series, and the row that was hearted may predate that distinction.
         detail = default!;
+        facet = null;
         if (value.ValueKind != JsonValueKind.Object ||
             !TryReadBoundedString(value, "targetKey", out var targetKey) ||
             !string.Equals(targetKey, expectedTargetKey.Trim(), StringComparison.Ordinal) ||
-            !TryReadBoundedString(value, "targetKind", out var targetKind) ||
-            !string.Equals(NormalizeFacet(targetKind), expectedFacet, StringComparison.Ordinal) ||
-            !TryReadBoundedString(value, "displayTitle", out var title) ||
-            !value.TryGetProperty("externalIds", out var externalIds) ||
-            externalIds.ValueKind != JsonValueKind.Array)
+            !TryReadBoundedString(value, "displayTitle", out var title))
         {
             return false;
+        }
+
+        var ids = ReadExternalIds(value);
+        if (ids.Count == 0)
+        {
+            return false;
+        }
+
+        facet = ResolveFacet(value);
+        detail = new ScryerTvActionDetail(title, ReadYear(value), ReadOverview(value), ids);
+        return true;
+    }
+
+    /// <summary>
+    /// Builds the action detail from what the Jellyfin row knows when Scryer has no discovery
+    /// detail for its key. The key itself ("tvdb:series:367277") names one identifier, so even a
+    /// row published before ids were stored on it can still be added.
+    /// </summary>
+    private static bool TryBuildFallbackDetail(string targetKey, ScryerTvActionFallback? fallback, out ScryerTvActionDetail detail)
+    {
+        detail = default!;
+        var title = fallback?.Title?.Trim();
+        if (string.IsNullOrEmpty(title) || title.Length > MaximumIdentifierLength)
+        {
+            return false;
+        }
+
+        var ids = new List<ScryerTvExternalId>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        void Add(string? source, string? value)
+        {
+            source = source?.Trim().ToLowerInvariant();
+            value = value?.Trim();
+            if (string.IsNullOrEmpty(source) || source.Length > 64 || string.IsNullOrEmpty(value) || value.Length > MaximumIdentifierLength)
+            {
+                return;
+            }
+
+            if (seen.Add(source + "\u001f" + value))
+            {
+                ids.Add(new ScryerTvExternalId(source, value));
+            }
+        }
+
+        foreach (var id in (fallback?.ExternalIds ?? Array.Empty<ScryerTvExternalId>()).Take(64))
+        {
+            Add(id.Source, id.Value);
+        }
+
+        var keyParts = targetKey.Trim().Split(':', 3);
+        if (keyParts.Length == 3)
+        {
+            Add(keyParts[0], keyParts[2]);
+        }
+
+        if (ids.Count == 0)
+        {
+            return false;
+        }
+
+        var year = fallback!.Year is >= 1800 and <= 2100 ? fallback.Year : null;
+        var overview = fallback.Overview?.Trim();
+        overview = string.IsNullOrEmpty(overview) ? null : overview.Length > 8192 ? overview[..8192] : overview;
+        detail = new ScryerTvActionDetail(title, year, overview, ids);
+        return true;
+    }
+
+    /// <summary>
+    /// The facet a discovery payload is acted on under. Scryer's contentType tells an anime apart
+    /// from a series; targetKind alone calls both "series".
+    /// </summary>
+    private static string? ResolveFacet(JsonElement item)
+    {
+        if (item.TryGetProperty("contentType", out var contentType) && contentType.ValueKind == JsonValueKind.String &&
+            NormalizeFacet(contentType.GetString()) is { } fromContentType)
+        {
+            return fromContentType;
+        }
+
+        return TryReadBoundedString(item, "targetKind", out var targetKind) ? NormalizeFacet(targetKind) : null;
+    }
+
+    /// <summary>Reads externalIds [{source, id}] leniently: unreadable entries skipped, duplicates folded, at most 64.</summary>
+    private static IReadOnlyList<ScryerTvExternalId> ReadExternalIds(JsonElement owner)
+    {
+        if (!owner.TryGetProperty("externalIds", out var externalIds) || externalIds.ValueKind != JsonValueKind.Array)
+        {
+            return Array.Empty<ScryerTvExternalId>();
         }
 
         var ids = new List<ScryerTvExternalId>();
@@ -827,43 +932,30 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             }
         }
 
-        if (ids.Count == 0)
+        return ids;
+    }
+
+    private static int? ReadYear(JsonElement owner) =>
+        owner.TryGetProperty("year", out var year) && year.ValueKind == JsonValueKind.Number &&
+        year.TryGetInt32(out var parsed) && parsed is >= 1800 and <= 2100
+            ? parsed
+            : null;
+
+    private static string? ReadOverview(JsonElement owner)
+    {
+        if (!owner.TryGetProperty("overview", out var element) || element.ValueKind != JsonValueKind.String)
         {
-            return false;
+            return null;
         }
 
-        int? year = null;
-        if (value.TryGetProperty("year", out var yearElement) &&
-            yearElement.ValueKind == JsonValueKind.Number &&
-            yearElement.TryGetInt32(out var parsedYear) &&
-            parsedYear is >= 1800 and <= 2100)
-        {
-            year = parsedYear;
-        }
-
-        string? overview = null;
-        if (value.TryGetProperty("overview", out var overviewElement) && overviewElement.ValueKind == JsonValueKind.String)
-        {
-            overview = overviewElement.GetString()?.Trim();
-            if (string.IsNullOrEmpty(overview))
-            {
-                overview = null;
-            }
-            else if (overview.Length > 8192)
-            {
-                overview = overview[..8192];
-            }
-        }
-
-        detail = new ScryerTvActionDetail(title, year, overview, ids);
-        return true;
+        var overview = element.GetString()?.Trim();
+        return string.IsNullOrEmpty(overview) ? null : overview.Length > 8192 ? overview[..8192] : overview;
     }
 
     private static ScryerResult<ScryerTvActionResult> TvActionFailure(string message) =>
         ScryerResult<ScryerTvActionResult>.Fail(new ScryerFailure(ScryerFailureCode.InvalidResponse, message));
 
     private sealed record ScryerTvLibrary(string Id, string Name, bool IsDefault, string? QualityProfileId);
-    private sealed record ScryerTvExternalId(string Source, string Value);
     private sealed record ScryerTvActionDetail(string Title, int? Year, string? Overview, IReadOnlyList<ScryerTvExternalId> ExternalIds);
 
     private Task<ScryerResult<JsonElement>> ExecuteIdentifierMutationAsync(string jellyfinUserId, string operationName, string document, string rootField, string requestId, CancellationToken cancellationToken) =>

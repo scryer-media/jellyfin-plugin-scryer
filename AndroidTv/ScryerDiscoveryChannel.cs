@@ -40,9 +40,16 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
     internal const string ChannelName = "Scryer Discovery";
     internal const string TargetProviderId = "ScryerTarget";
     internal const string KindProviderId = "ScryerKind";
-    // v4: guidance cards no longer answer folder queries and the title budget changed what a rail
-    // publishes, so responses cached under v3 must not be served against the new rows.
-    internal const string DataSchemaVersion = "android-tv-v4";
+    /// <summary>
+    /// The external ids Scryer matched the title on, stored on the row as "source=value;..." so
+    /// the Favorite action can still add the title when Scryer's discovery store has no detail
+    /// for the row's key (recommendation rails come from the wider title graph).
+    /// </summary>
+    internal const string ExternalIdsProviderId = "ScryerExternalIds";
+    private const int MaximumStoredExternalIdsLength = 1024;
+    // v5: rows carry the content-type facet (anime is no longer published as a series) and their
+    // external ids, so responses cached under v4 must not be served against the new rows.
+    internal const string DataSchemaVersion = "android-tv-v5";
 
     /// <summary>
     /// Channel item id prefix carried by every guidance stub ("Connect Scryer in Jellyfin Web" and
@@ -433,6 +440,11 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
                 [KindProviderId] = item.TargetKind
             }
         };
+        var storedIds = EncodeExternalIds(item.ExternalIds);
+        if (storedIds.Length > 0)
+        {
+            result.ProviderIds[ExternalIdsProviderId] = storedIds;
+        }
         // Scryer posters are AVIF by design. Jellyfin downloads and caches the file (any image/*
         // content type is accepted) and, because Skia cannot transcode AVIF, serves the original
         // bytes to the client, whose Android TV 12+ decoder renders them.
@@ -491,4 +503,64 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
 
     private static string StableHash(string? value) => Convert.ToHexString(
         SHA256.HashData(Encoding.UTF8.GetBytes(value ?? string.Empty))).ToLowerInvariant();
+
+    /// <summary>Encodes external ids as "source=value;source=value", bounded, skipping any that would not round-trip.</summary>
+    internal static string EncodeExternalIds(IReadOnlyList<ScryerTvExternalId>? ids)
+    {
+        if (ids is null || ids.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var builder = new System.Text.StringBuilder();
+        foreach (var id in ids)
+        {
+            var source = id.Source?.Trim().ToLowerInvariant();
+            var value = id.Value?.Trim();
+            if (string.IsNullOrEmpty(source) || string.IsNullOrEmpty(value) ||
+                source.Contains('=') || source.Contains(';') || value.Contains('=') || value.Contains(';'))
+            {
+                continue;
+            }
+
+            var entry = source + "=" + value;
+            if (builder.Length + entry.Length + 1 > MaximumStoredExternalIdsLength)
+            {
+                break;
+            }
+
+            if (builder.Length > 0)
+            {
+                builder.Append(';');
+            }
+
+            builder.Append(entry);
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>Reverses <see cref="EncodeExternalIds"/>; anything unreadable is skipped.</summary>
+    internal static IReadOnlyList<ScryerTvExternalId> ParseExternalIds(string? encoded)
+    {
+        if (string.IsNullOrWhiteSpace(encoded) || encoded.Length > MaximumStoredExternalIdsLength)
+        {
+            return Array.Empty<ScryerTvExternalId>();
+        }
+
+        var ids = new List<ScryerTvExternalId>();
+        foreach (var entry in encoded.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var separator = entry.IndexOf('=');
+            if (separator <= 0 || separator == entry.Length - 1)
+            {
+                continue;
+            }
+
+            ids.Add(new ScryerTvExternalId(entry[..separator].Trim().ToLowerInvariant(), entry[(separator + 1)..].Trim()));
+        }
+
+        return ids;
+    }
+
 }

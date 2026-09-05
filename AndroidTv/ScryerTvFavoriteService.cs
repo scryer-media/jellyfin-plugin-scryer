@@ -191,6 +191,7 @@ internal sealed class ScryerTvFavoriteService : BackgroundService
             jellyfinUserId,
             work.TargetKey,
             work.TargetKind,
+            FallbackFor(work.ItemId),
             cancellationToken).ConfigureAwait(false);
         if (result.IsSuccess && result.Value is not null)
         {
@@ -263,6 +264,26 @@ internal sealed class ScryerTvFavoriteService : BackgroundService
             SessionMessageType.GeneralCommand,
             command,
             cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// What the hearted row itself knows about the title, for when Scryer has no discovery detail
+    /// for its key. Null when the row is gone, in which case the action can only use the key.
+    /// </summary>
+    private ScryerTvActionFallback? FallbackFor(Guid itemId)
+    {
+        var item = _libraryManager.GetItemById(itemId);
+        if (item is null || string.IsNullOrWhiteSpace(item.Name))
+        {
+            return null;
+        }
+
+        item.ProviderIds.TryGetValue(ScryerDiscoveryChannel.ExternalIdsProviderId, out var encodedIds);
+        return new ScryerTvActionFallback(
+            item.Name.Trim(),
+            item.ProductionYear,
+            item.Overview,
+            ScryerDiscoveryChannel.ParseExternalIds(encodedIds));
     }
 
     private static bool TryGetTarget(BaseItem item, out string targetKey, out string targetKind)
