@@ -580,6 +580,37 @@ static async Task AndroidTvDiscoveryAsync()
     var limited = await limitedService.GetAndroidTvDiscoveryAsync("0123456789abcdef0123456789abcdef", seeds, CancellationToken.None);
     Assert.False(limited.IsSuccess);
     Assert.Equal(ScryerFailureCode.RateLimited, limited.Failure!.Code);
+
+    // One odd row in Scryer's data must not blank the channel: an item without a title is left
+    // out, an unreadable year or poster is dropped from an otherwise good item, an unreadable
+    // section is skipped, and only a missing section list is a failure that names itself.
+    var oddResponses = new Queue<string>(new[]
+    {
+        """[{"data":{"titlesByExternalIds":[]}},{"data":{"titlesByExternalIds":[]}}]""",
+        """{"data":{"discoveryHomeCards":{"canViewPersonalized":false,"heroItem":null,"publicSections":[{"sectionId":"odd","title":"Odd","items":[{"id":"no-title","targetKey":"tmdb:movie:1","targetKind":"MOVIE","displayTitle":"","year":2020,"posterUrl":null},{"id":"kept","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Kept","year":0,"posterUrl":""},{"id":"person","targetKey":"tmdb:person:3","targetKind":"PERSON","displayTitle":"Someone","year":null,"posterUrl":null}]},{"sectionId":"broken","title":"Broken","items":"nope"},{"sectionId":"fine","title":"Fine","items":[{"id":"four","targetKey":"tvdb:series:4","targetKind":"SERIES","displayTitle":"Fourth","year":2019,"posterUrl":"ftp://bad/poster"}]}],"personalizedSections":[]}}}"""
+    });
+    var oddHandler = new RecordingHandler(_ => JsonResponse(oddResponses.Dequeue()));
+    var oddService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), oddHandler);
+    var odd = await oddService.GetAndroidTvDiscoveryAsync("0123456789abcdef0123456789abcdef", seeds, CancellationToken.None);
+    Assert.True(odd.IsSuccess, odd.Failure?.Message);
+    Assert.True(odd.Value!.Select(rail => rail.Title).SequenceEqual(new[] { "Odd", "Fine" }));
+    Assert.Equal(1, odd.Value![0].Items.Count);
+    Assert.Equal("Kept", odd.Value![0].Items[0].DisplayTitle);
+    Assert.Equal(null, odd.Value![0].Items[0].Year);
+    Assert.Equal(null, odd.Value![0].Items[0].PosterUrl);
+    Assert.Equal(null, odd.Value![1].Items[0].PosterUrl);
+
+    var missingResponses = new Queue<string>(new[]
+    {
+        """[{"data":{"titlesByExternalIds":[]}},{"data":{"titlesByExternalIds":[]}}]""",
+        """{"data":{"discoveryHomeCards":{"canViewPersonalized":false,"heroItem":null,"personalizedSections":[]}}}"""
+    });
+    var missingHandler = new RecordingHandler(_ => JsonResponse(missingResponses.Dequeue()));
+    var missingService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), missingHandler);
+    var missing = await missingService.GetAndroidTvDiscoveryAsync("0123456789abcdef0123456789abcdef", seeds, CancellationToken.None);
+    Assert.False(missing.IsSuccess);
+    Assert.Equal(ScryerFailureCode.InvalidResponse, missing.Failure!.Code);
+    Assert.Contains("publicSections", missing.Failure.Message);
 }
 
 static async Task AndroidTvActionsAsync()

@@ -207,11 +207,13 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         {
             // Without this the plugin publishes "Scryer Discovery unavailable" and records
             // nothing, leaving an administrator with a card on a television and an empty log.
-            // WireCode is the stable, credential-free vocabulary, so it is safe to write out.
+            // WireCode is the stable, credential-free vocabulary, so it is safe to write out, and
+            // the message is plugin-authored text naming which check failed.
             _logger.LogWarning(
-                "Scryer discovery is unavailable for Jellyfin user {UserId} ({Code}); showing the unavailable card.",
+                "Scryer discovery is unavailable for Jellyfin user {UserId} ({Code}: {Detail}); showing the unavailable card.",
                 query.UserId,
-                projection.Failure?.WireCode ?? "unknown");
+                projection.Failure?.WireCode ?? "unknown",
+                projection.Failure?.Message ?? "no detail");
 
             return Guidance(query, jellyfinUserId, "unavailable", "Scryer Discovery unavailable", "Reconnect in Jellyfin Web or try again after Scryer is reachable.");
         }

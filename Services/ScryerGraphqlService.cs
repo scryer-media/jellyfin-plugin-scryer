@@ -201,7 +201,7 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         {
             if (!TryParseRecommendedTitles(result, out var parsed))
             {
-                return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Fail(ScryerFailure.InvalidResponse);
+                return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Fail(InvalidResponseAt("titlesByExternalIds is not an array"));
             }
 
             titles.AddRange(parsed);
@@ -363,11 +363,7 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         {
             // Scryer honours the limit, but the rail size is a storage bound on the Jellyfin
             // server, so it is enforced here as well rather than trusted.
-            if (!TryResolvePosterUrls(group.Items.Take(ScryerAndroidTvLimits.ItemsPerRecommendationRail).ToArray(), publicAuthority, out var resolvedItems))
-            {
-                continue;
-            }
-
+            var resolvedItems = ResolvePosterUrls(group.Items.Take(ScryerAndroidTvLimits.ItemsPerRecommendationRail).ToArray(), publicAuthority);
             var unique = Deduplicate(resolvedItems, seenTargets);
             if (unique.Count > 0)
             {
@@ -381,13 +377,28 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             return ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>.Fail(home.Failure!);
         }
 
-        if (home.Value!.ValueKind != JsonValueKind.Object ||
-            !home.Value.TryGetProperty("canViewPersonalized", out var canViewPersonalized) ||
-            canViewPersonalized.ValueKind is not (JsonValueKind.True or JsonValueKind.False) ||
-            (canViewPersonalized.GetBoolean() && !TryAppendDiscoverySections(home.Value, "personalizedSections", publicAuthority, seenTargets, rails)) ||
-            !TryAppendDiscoverySections(home.Value, "publicSections", publicAuthority, seenTargets, rails))
+        // Each structural check names itself in the failure so the channel's log says which part
+        // of the response could not be read, instead of only "invalid_response".
+        var cards = home.Value!;
+        if (cards.ValueKind != JsonValueKind.Object)
         {
-            return ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>.Fail(ScryerFailure.InvalidResponse);
+            return ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>.Fail(InvalidResponseAt("discoveryHomeCards is not an object"));
+        }
+
+        if (!cards.TryGetProperty("canViewPersonalized", out var canViewPersonalized) ||
+            canViewPersonalized.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+        {
+            return ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>.Fail(InvalidResponseAt("discoveryHomeCards.canViewPersonalized is not a boolean"));
+        }
+
+        if (canViewPersonalized.GetBoolean() && !TryAppendDiscoverySections(cards, "personalizedSections", publicAuthority, seenTargets, rails))
+        {
+            return ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>.Fail(InvalidResponseAt("discoveryHomeCards.personalizedSections is not an array"));
+        }
+
+        if (!TryAppendDiscoverySections(cards, "publicSections", publicAuthority, seenTargets, rails))
+        {
+            return ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>.Fail(InvalidResponseAt("discoveryHomeCards.publicSections is not an array"));
         }
 
         return ScryerResult<IReadOnlyList<ScryerTvDiscoveryRail>>.Success(rails);
@@ -569,12 +580,13 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         var result = new List<RecommendedTitle>();
         foreach (var title in titles.EnumerateArray())
         {
+            // A title that cannot be read is left out rather than failing every rail.
             if (title.ValueKind != JsonValueKind.Object ||
                 !TryReadBoundedString(title, "id", out var id) ||
                 !title.TryGetProperty("externalIds", out var externalIdsElement) || externalIdsElement.ValueKind != JsonValueKind.Array ||
                 !title.TryGetProperty("moreLikeThis", out var recommendations))
             {
-                return false;
+                continue;
             }
 
             var externalIds = new List<(string Source, string Value)>();
@@ -609,12 +621,14 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         List<ScryerTvDiscoveryRail> rails)
     {
         if (home.ValueKind != JsonValueKind.Object || !home.TryGetProperty(propertyName, out var sections) ||
-            sections.ValueKind != JsonValueKind.Array || sections.GetArrayLength() > 64)
+            sections.ValueKind != JsonValueKind.Array)
         {
             return false;
         }
 
-        foreach (var section in sections.EnumerateArray())
+        // Only the shape of the section list is fatal. A section or item that cannot be read is
+        // left out, because one odd row in Scryer's data must not blank the whole channel.
+        foreach (var section in sections.EnumerateArray().Take(64))
         {
             if (section.ValueKind != JsonValueKind.Object ||
                 !TryReadBoundedString(section, "sectionId", out var sectionId) ||
@@ -622,14 +636,10 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
                 !section.TryGetProperty("items", out var sectionItems) ||
                 !TryReadDiscoveryItems(sectionItems, out var items))
             {
-                return false;
+                continue;
             }
 
-            if (!TryResolvePosterUrls(items, publicAuthority, out var resolvedItems))
-            {
-                return false;
-            }
-
+            var resolvedItems = ResolvePosterUrls(items, publicAuthority);
             var unique = Deduplicate(resolvedItems, seenTargets);
             if (unique.Count > 0)
             {
@@ -643,13 +653,16 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
     private static bool TryReadDiscoveryItems(JsonElement value, out IReadOnlyList<ScryerTvDiscoveryItem> items)
     {
         items = Array.Empty<ScryerTvDiscoveryItem>();
-        if (value.ValueKind != JsonValueKind.Array || value.GetArrayLength() > 30)
+        if (value.ValueKind != JsonValueKind.Array)
         {
             return false;
         }
 
+        // An item that cannot be read is skipped; a year or poster that cannot be read is dropped
+        // from an otherwise readable item. Only the first 100 entries are considered, so the
+        // bound on what Jellyfin may store holds whatever Scryer sends.
         var parsed = new List<ScryerTvDiscoveryItem>();
-        foreach (var item in value.EnumerateArray())
+        foreach (var item in value.EnumerateArray().Take(100))
         {
             if (item.ValueKind != JsonValueKind.Object ||
                 !TryReadBoundedString(item, "targetKey", out var targetKey) ||
@@ -657,30 +670,28 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
                 NormalizeFacet(targetKind) is null ||
                 !TryReadBoundedString(item, "displayTitle", out var displayTitle))
             {
-                return false;
+                continue;
             }
 
             int? year = null;
-            if (item.TryGetProperty("year", out var yearElement) && yearElement.ValueKind != JsonValueKind.Null)
+            if (item.TryGetProperty("year", out var yearElement) &&
+                yearElement.ValueKind == JsonValueKind.Number &&
+                yearElement.TryGetInt32(out var parsedYear) &&
+                parsedYear is >= 1800 and <= 2100)
             {
-                if (yearElement.ValueKind != JsonValueKind.Number || !yearElement.TryGetInt32(out var parsedYear) || parsedYear is < 1800 or > 2100)
-                {
-                    return false;
-                }
-
                 year = parsedYear;
             }
 
             string? posterUrl = null;
-            if (item.TryGetProperty("posterUrl", out var posterElement) && posterElement.ValueKind != JsonValueKind.Null)
+            if (item.TryGetProperty("posterUrl", out var posterElement) && posterElement.ValueKind == JsonValueKind.String)
             {
-                posterUrl = posterElement.ValueKind == JsonValueKind.String ? posterElement.GetString()?.Trim() : null;
+                posterUrl = posterElement.GetString()?.Trim();
                 if (string.IsNullOrEmpty(posterUrl) || posterUrl.Length > 4096 || posterUrl.StartsWith("//", StringComparison.Ordinal) ||
                     (!posterUrl.StartsWith("/", StringComparison.Ordinal) &&
                      (!Uri.TryCreate(posterUrl, UriKind.Absolute, out var posterUri) ||
                       (posterUri.Scheme != Uri.UriSchemeHttps && posterUri.Scheme != Uri.UriSchemeHttp))))
                 {
-                    return false;
+                    posterUrl = null;
                 }
             }
 
@@ -707,10 +718,11 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         return unique;
     }
 
-    private static bool TryResolvePosterUrls(
-        IReadOnlyList<ScryerTvDiscoveryItem> items,
-        Uri publicAuthority,
-        out IReadOnlyList<ScryerTvDiscoveryItem> resolved)
+    /// <summary>
+    /// Makes every poster URL absolute against Scryer's public authority. A poster that cannot be
+    /// resolved to an http(s) URL without credentials is dropped; the title itself is kept.
+    /// </summary>
+    private static IReadOnlyList<ScryerTvDiscoveryItem> ResolvePosterUrls(IReadOnlyList<ScryerTvDiscoveryItem> items, Uri publicAuthority)
     {
         var result = new List<ScryerTvDiscoveryItem>(items.Count);
         foreach (var item in items)
@@ -725,16 +737,18 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
                 (posterUri.Scheme != Uri.UriSchemeHttps && posterUri.Scheme != Uri.UriSchemeHttp) ||
                 !string.IsNullOrEmpty(posterUri.UserInfo))
             {
-                resolved = Array.Empty<ScryerTvDiscoveryItem>();
-                return false;
+                result.Add(item with { PosterUrl = null });
+                continue;
             }
 
             result.Add(item with { PosterUrl = posterUri.AbsoluteUri });
         }
 
-        resolved = result;
-        return true;
+        return result;
     }
+
+    private static ScryerFailure InvalidResponseAt(string detail) =>
+        new(ScryerFailureCode.InvalidResponse, "Scryer returned an invalid response: " + detail + ".");
 
     private static bool TryReadTvLibraries(JsonElement value, bool request, string expectedFacet, out IReadOnlyList<ScryerTvLibrary> libraries)
     {
@@ -933,7 +947,7 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
             var statusFailure = MapStatus(response.StatusCode);
             if (HasTerminalHttpFailure(response.StatusCode)) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(statusFailure!);
-            if (!IsJsonResponse(response.Content.Headers.ContentType)) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(statusFailure ?? ScryerFailure.InvalidResponse);
+            if (!IsJsonResponse(response.Content.Headers.ContentType)) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(statusFailure ?? InvalidResponseAt("batch response was not JSON"));
 
             using var document = await ReadJsonAsync(response.Content, timeout.Token).ConfigureAwait(false);
             if (statusFailure is not null)
@@ -948,9 +962,14 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
                 return ScryerResult<IReadOnlyList<JsonElement>>.Fail(MapGraphQlFailure(document.RootElement) ?? ScryerFailure.InvalidResponse);
             }
 
-            if (document.RootElement.ValueKind != JsonValueKind.Array || document.RootElement.GetArrayLength() != expectedCount)
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
             {
-                return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse);
+                return ScryerResult<IReadOnlyList<JsonElement>>.Fail(InvalidResponseAt("batch response was a " + document.RootElement.ValueKind + ", not an array"));
+            }
+
+            if (document.RootElement.GetArrayLength() != expectedCount)
+            {
+                return ScryerResult<IReadOnlyList<JsonElement>>.Fail(InvalidResponseAt($"batch returned {document.RootElement.GetArrayLength()} results for {expectedCount} operations"));
             }
 
             var projected = new List<JsonElement>(expectedCount);
@@ -958,7 +977,7 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             {
                 var graphQlFailure = MapGraphQlFailure(operation);
                 if (graphQlFailure is not null) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(graphQlFailure);
-                if (!TryGetRootField(operation, rootField, out var root)) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse);
+                if (!TryGetRootField(operation, rootField, out var root)) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(InvalidResponseAt("a batch result has no data." + rootField));
                 projected.Add(root.Clone());
             }
 
