@@ -2,7 +2,7 @@
 name: "Scryer"
 guid: "6a9c9f2e-6b2f-4a1a-9d3d-2c7f2f5b3d10"
 imageUrl: "https://raw.githubusercontent.com/scryer-media/jellyfin-plugin-scryer/main/artwork/scryer-plugin.png"
-version: "0.1.20.0"
+version: "0.1.21.0"
 targetAbi: "10.11.0.0"
 framework: "net9.0"
 overview: "Requests, discovery, and calendar pages for Jellyfin, backed by Scryer."
@@ -15,12 +15,10 @@ owner: "scryer-media"
 artifacts:
   - Jellyfin.Plugin.Scryer.dll
 changelog: >
-  Makes the Android TV channel tolerate odd rows in Scryer's discovery data and say what it
-  could not read. The channel still showed "Scryer Discovery unavailable" on the first
-  request after 0.1.19.0 loaded, before any quota could have been spent, so the response
-  parsing was rejecting real data: one item without a readable title, year, or poster, or
-  one section it could not read, failed the whole projection with a bare invalid_response.
-  An unreadable item or section is now left out, an unreadable year or poster is dropped
-  from an otherwise good item, and only a missing section list or an unreadable batch is a
-  failure. Every remaining failure names the check that tripped, and the channel writes
-  that detail next to the code in its warning so the log says why the card was published.
+  Fixes the Favorite heart on an Android TV title failing with "This title has no supported
+  external identifier." Scryer's item detail carries every id it knows for a title, often
+  more than sixteen across providers and kinds, and the plugin rejected the whole detail
+  when there were more than sixteen, when any single id was unreadable, when the year was
+  unknown, or when the overview was long. Ids are now read individually, an unreadable one
+  is skipped, an unknown year is sent as unknown, and a long overview is trimmed, so the add
+  or request goes through with the ids Scryer actually returned.
