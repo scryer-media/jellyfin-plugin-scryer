@@ -2,7 +2,7 @@
 name: "Scryer"
 guid: "6a9c9f2e-6b2f-4a1a-9d3d-2c7f2f5b3d10"
 imageUrl: "https://raw.githubusercontent.com/scryer-media/jellyfin-plugin-scryer/main/artwork/scryer-plugin.png"
-version: "0.1.22.0"
+version: "0.1.23.0"
 targetAbi: "10.11.0.0"
 framework: "net9.0"
 overview: "Requests, discovery, and calendar pages for Jellyfin, backed by Scryer."
@@ -15,12 +15,9 @@ owner: "scryer-media"
 artifacts:
   - Jellyfin.Plugin.Scryer.dll
 changelog: >
-  Fixes two Android TV Favorite problems traced on a live server. Hearting a title from a
-  "More like..." rail could fail with "This title has no supported external identifier."
-  because those rails come from Scryer's title graph and the title is not always in its
-  discovery store, so the detail lookup the action relied on returned nothing. Rows now
-  carry the external ids Scryer matched them on, and the action falls back to them, plus
-  the id in the row's own key, when there is no detail. Separately, an anime recommended
-  as a plain series was added to the series library; the library is now chosen by Scryer's
-  content type, so anime goes to the anime library. Channel rows are republished under a
-  new data version so existing rows pick up both changes.
+  Fixes the Android TV Favorite action still sending an anime recommendation to the series
+  library after 0.1.22.0. Traced on a live server: Scryer now reports the row as anime with its
+  matched ids, but Jellyfin copies a channel row's provider ids only when it first creates the
+  row, so a title already published as a plain series kept its old kind and had no stored ids no
+  matter how often the channel refreshed. Title row ids now cover the kind and the stored ids, so
+  a changed title is republished as a new row and the stale one is retired.
