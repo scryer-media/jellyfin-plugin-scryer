@@ -164,6 +164,25 @@ static async Task MetadataAsync()
     var incompatible = await new ScryerOAuthMetadataClient(badHandler).DiscoverAsync(configuration, CancellationToken.None);
     Assert.False(incompatible.IsSuccess);
     Assert.Equal(ScryerFailureCode.ScryerIncompatible, incompatible.Failure!.Code);
+
+    // Diagnostics must separate a misrouted well-known path from a real contract mismatch.
+    var contractProbe = await new ScryerOAuthMetadataClient(badHandler).DiscoverWithObservationAsync(configuration, CancellationToken.None);
+    Assert.Equal(ScryerFailureCode.ScryerIncompatible, contractProbe.Result.Failure!.Code);
+    Assert.Equal(200, contractProbe.HttpStatus);
+    Assert.True(contractProbe.ResponseIsJson == true);
+
+    var proxyProbe = await new ScryerOAuthMetadataClient(new RecordingHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = new StringContent("<html><body>Scryer</body></html>", Encoding.UTF8, "text/html")
+    })).DiscoverWithObservationAsync(configuration, CancellationToken.None);
+    Assert.False(proxyProbe.Result.IsSuccess);
+    Assert.Equal(200, proxyProbe.HttpStatus);
+    Assert.True(proxyProbe.ResponseIsJson == false);
+
+    var offlineProbe = await new ScryerOAuthMetadataClient(new RecordingHandler(
+        _ => throw new HttpRequestException("connection refused"))).DiscoverWithObservationAsync(configuration, CancellationToken.None);
+    Assert.Equal(ScryerFailureCode.ScryerOffline, offlineProbe.Result.Failure!.Code);
+    Assert.True(offlineProbe.HttpStatus is null);
 }
 
 static Task WebInjectionPreservesBytesAsync()

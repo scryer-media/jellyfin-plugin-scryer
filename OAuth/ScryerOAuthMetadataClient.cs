@@ -36,42 +36,65 @@ public sealed class ScryerOAuthMetadataClient
         ScryerOAuthConfiguration configuration,
         CancellationToken cancellationToken)
     {
+        var probe = await DiscoverWithObservationAsync(configuration, cancellationToken).ConfigureAwait(false);
+        return probe.Result;
+    }
+
+    /// <summary>
+    /// Performs discovery and additionally reports the transport-level facts an administrator
+    /// needs to tell an unreachable server apart from a reverse proxy that answered the
+    /// well-known path with something that is not the metadata document. The parse itself is
+    /// unchanged: the observed content type is reported, never used to reject a response.
+    /// </summary>
+    public async Task<ScryerOAuthMetadataProbe> DiscoverWithObservationAsync(
+        ScryerOAuthConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(configuration);
         var documentUri = new Uri(configuration.InternalAuthority, ".well-known/oauth-authorization-server");
+        int? httpStatus = null;
+        bool? responseIsJson = null;
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, documentUri);
             using var timeout = CreateTimeout(cancellationToken);
             using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
+            httpStatus = (int)response.StatusCode;
+            responseIsJson = IsJsonMediaType(response.Content.Headers.ContentType?.MediaType);
             if (!response.IsSuccessStatusCode)
             {
-                return ScryerResult<ScryerOAuthMetadata>.Fail(MapStatus(response.StatusCode));
+                return new ScryerOAuthMetadataProbe(
+                    ScryerResult<ScryerOAuthMetadata>.Fail(MapStatus(response.StatusCode)), httpStatus, responseIsJson);
             }
 
             using var document = await ReadJsonAsync(response.Content, timeout.Token).ConfigureAwait(false);
-            return ParseMetadata(document.RootElement, configuration);
+            return new ScryerOAuthMetadataProbe(ParseMetadata(document.RootElement, configuration), httpStatus, responseIsJson);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            return ScryerResult<ScryerOAuthMetadata>.Fail(ScryerFailure.Offline);
+            return new ScryerOAuthMetadataProbe(ScryerResult<ScryerOAuthMetadata>.Fail(ScryerFailure.Offline), httpStatus, responseIsJson);
         }
         catch (HttpRequestException)
         {
-            return ScryerResult<ScryerOAuthMetadata>.Fail(ScryerFailure.Offline);
+            return new ScryerOAuthMetadataProbe(ScryerResult<ScryerOAuthMetadata>.Fail(ScryerFailure.Offline), httpStatus, responseIsJson);
         }
         catch (JsonException)
         {
-            return ScryerResult<ScryerOAuthMetadata>.Fail(ScryerFailure.InvalidResponse);
+            return new ScryerOAuthMetadataProbe(ScryerResult<ScryerOAuthMetadata>.Fail(ScryerFailure.InvalidResponse), httpStatus, responseIsJson);
         }
         catch (InvalidDataException)
         {
-            return ScryerResult<ScryerOAuthMetadata>.Fail(ScryerFailure.InvalidResponse);
+            return new ScryerOAuthMetadataProbe(ScryerResult<ScryerOAuthMetadata>.Fail(ScryerFailure.InvalidResponse), httpStatus, responseIsJson);
         }
         catch (UriFormatException)
         {
-            return ScryerResult<ScryerOAuthMetadata>.Fail(ScryerFailure.InvalidResponse);
+            return new ScryerOAuthMetadataProbe(ScryerResult<ScryerOAuthMetadata>.Fail(ScryerFailure.InvalidResponse), httpStatus, responseIsJson);
         }
     }
+
+    private static bool IsJsonMediaType(string? mediaType) => mediaType is not null &&
+        (mediaType.Equals("application/json", StringComparison.OrdinalIgnoreCase) ||
+         mediaType.EndsWith("+json", StringComparison.OrdinalIgnoreCase));
 
     public Task<ScryerResult<ScryerOAuthTokenSet>> ExchangeAuthorizationCodeAsync(
         ScryerOAuthMetadata metadata,
@@ -420,3 +443,12 @@ public sealed class ScryerOAuthMetadataClient
         _ => ScryerFailure.InvalidResponse
     };
 }
+
+/// <summary>
+/// Discovery outcome plus the transport facts an administrator diagnostic needs. It carries no
+/// response body, endpoint, or credential material.
+/// </summary>
+public sealed record ScryerOAuthMetadataProbe(
+    ScryerResult<ScryerOAuthMetadata> Result,
+    int? HttpStatus,
+    bool? ResponseIsJson);

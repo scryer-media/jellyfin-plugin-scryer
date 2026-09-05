@@ -21,6 +21,11 @@ namespace Jellyfin.Plugin.Scryer.Services;
 /// </summary>
 public sealed class ScryerConnectionDiagnostics : IDisposable
 {
+    /// <summary>
+    /// The Scryer version this plugin build was developed and tested against. The plugin never
+    /// reads or compares a Scryer version number, so this must never be reported as a requirement.
+    /// Compatibility is decided solely by the OAuth metadata and GraphQL contract probes below.
+    /// </summary>
     public const string MinimumScryerVersion = "0.19.7";
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(5);
     private const int MaximumGraphQlProbeRequestBytes = 8 * 1024;
@@ -78,26 +83,34 @@ public sealed class ScryerConnectionDiagnostics : IDisposable
         }
         else
         {
-            if (!metadata.Reachable)
+            if (!metadata.SupportsAlphaContract)
             {
-                compatibilityErrors.Add("Scryer OAuth metadata is unreachable.");
-            }
-            else if (!metadata.SupportsAlphaContract)
-            {
-                compatibilityErrors.Add("Scryer OAuth metadata does not advertise the RFC 153 Alpha contract.");
+                compatibilityErrors.Add(metadata.FailureCode switch
+                {
+                    "unreachable" => "The Jellyfin server could not reach /.well-known/oauth-authorization-server at the internal Scryer URL.",
+                    "non_json_response" => "The internal Scryer URL answered /.well-known/oauth-authorization-server with a non-JSON response. A reverse proxy is usually serving the web UI or an error page at that path.",
+                    "request_rejected" => "The internal Scryer URL rejected the request for /.well-known/oauth-authorization-server.",
+                    "rate_limited" => "Scryer is rate limiting the OAuth metadata request. Retry shortly.",
+                    "invalid_metadata_document" => "Scryer's OAuth metadata document could not be parsed.",
+                    "contract_mismatch" => "Scryer's OAuth metadata document does not advertise the endpoints, scopes, and PKCE methods this plugin requires.",
+                    _ => "Scryer's OAuth metadata could not be verified."
+                });
             }
 
-            if (!graphQl.Reachable)
-            {
-                compatibilityErrors.Add("The Scryer GraphQL endpoint is unreachable.");
-            }
-            else if (!graphQl.ContractVerified)
+            if (!graphQl.ContractVerified)
             {
                 compatibilityErrors.Add(graphQl.FailureCode switch
                 {
+                    "unreachable" => "The Jellyfin server could not reach the Scryer GraphQL endpoint at the internal Scryer URL.",
+                    "timeout" => "The Scryer GraphQL endpoint did not answer the compatibility probe within five seconds.",
+                    "invalid_url" => "The internal Scryer URL does not form a valid GraphQL endpoint.",
+                    "non_json_response" => "The Scryer GraphQL endpoint answered with a non-JSON response. A reverse proxy is usually serving the web UI or an error page at /graphql.",
                     "authentication_required" => "The Scryer GraphQL endpoint requires authentication for its compatibility probe.",
-                    "introspection_denied" => "The Scryer GraphQL endpoint denies the compatibility probe.",
-                    _ => "The Scryer GraphQL endpoint does not prove the RFC 153 Alpha operation contract."
+                    "introspection_denied" => "The Scryer GraphQL endpoint denies schema introspection, so the operation contract cannot be proven from Jellyfin.",
+                    "missing_alpha_fields" => "The Scryer GraphQL schema is missing operations this plugin requires. The Scryer server is most likely older than this plugin build.",
+                    "unexpected_status" or "probe_rejected" => "The Scryer GraphQL endpoint rejected the compatibility probe.",
+                    "invalid_json" or "invalid_response" => "The Scryer GraphQL endpoint returned a response that could not be parsed.",
+                    _ => "The Scryer GraphQL operation contract could not be verified."
                 });
             }
         }
@@ -155,16 +168,42 @@ public sealed class ScryerConnectionDiagnostics : IDisposable
             return ScryerOAuthMetadataDiagnostic.NotChecked;
         }
 
-        var result = await _oauthMetadataClient.DiscoverAsync(resolved.Value!, cancellationToken).ConfigureAwait(false);
+        var probe = await _oauthMetadataClient.DiscoverWithObservationAsync(resolved.Value!, cancellationToken).ConfigureAwait(false);
+        var result = probe.Result;
         var reachable = result.IsSuccess || result.Failure?.Code != ScryerFailureCode.ScryerOffline;
         return new ScryerOAuthMetadataDiagnostic(
             true,
             reachable,
-            null,
+            probe.HttpStatus,
             null,
             null,
             result.IsSuccess,
-            result.Failure?.WireCode);
+            MetadataFailureCode(probe));
+    }
+
+    /// <summary>
+    /// Normalizes discovery outcomes into the same shape as the GraphQL probe's failure codes so
+    /// an administrator can tell an unreachable server, a reverse-proxy misroute, and a genuine
+    /// contract mismatch apart.
+    /// </summary>
+    private static string? MetadataFailureCode(ScryerOAuthMetadataProbe probe)
+    {
+        if (probe.Result.IsSuccess)
+        {
+            return null;
+        }
+
+        return probe.Result.Failure?.Code switch
+        {
+            ScryerFailureCode.ScryerOffline => "unreachable",
+            ScryerFailureCode.ScryerIncompatible => "contract_mismatch",
+            ScryerFailureCode.RateLimited => "rate_limited",
+            ScryerFailureCode.AuthorizationExpired => "request_rejected",
+            // A well-known path answered by the web UI or a proxy error page is by far the most
+            // common cause, and the content type is what separates it from malformed JSON.
+            _ when probe.ResponseIsJson == false => "non_json_response",
+            _ => "invalid_metadata_document"
+        };
     }
 
     private async Task<ScryerReachabilityDiagnostic> CheckGraphQlAsync(string baseUrl, CancellationToken cancellationToken)

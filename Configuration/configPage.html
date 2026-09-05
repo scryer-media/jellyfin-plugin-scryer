@@ -11,7 +11,8 @@
                 <div class="verticalSection">
                     <h2>Scryer Plugin Settings</h2>
                     <div class="fieldDescription">
-                        This Alpha supports Jellyfin 10.11.x web clients and Scryer 0.19.7.
+                        This Alpha targets Jellyfin 10.11.x web clients and was tested against Scryer 0.19.7.
+                        Compatibility is decided by the live preflight checks below, not by a version number.
                         Each person connects their own Scryer account; do not enter a shared Scryer API key here.
                     </div>
                 </div>
@@ -157,24 +158,39 @@
             return normalized;
         }
 
+        function detail(probe) {
+            var parts = [];
+            if (probe.failureCode) parts.push('code ' + probe.failureCode);
+            if (typeof probe.httpStatus === 'number') parts.push('HTTP ' + probe.httpStatus);
+            return parts.length ? ' [' + parts.join(', ') + ']' : '';
+        }
+
         function displayDiagnostics(diagnostics) {
             diagnostics = normalizeApiPayload(diagnostics);
             var lines = [];
             lines.push(diagnostics.configurationValid ? 'Configuration: valid.' : 'Configuration: invalid.');
             (diagnostics.configurationErrors || []).forEach(function (error) { lines.push(error); });
+            // Jellyfin may serialize the enum as a name or a number depending on its JSON options.
+            var verbosity = diagnostics.diagnosticVerbosity;
+            var detailed = verbosity === 2 || verbosity === '2' || verbosity === 'Detailed';
             lines.push(diagnostics.preflightCompatible
-                ? 'Preflight: OAuth and GraphQL Alpha operation contracts are available.'
-                : 'Preflight: not compatible (requires Scryer ' + diagnostics.minimumScryerVersion + ' or newer).');
+                ? 'Preflight: OAuth and GraphQL operation contracts are available.'
+                : 'Preflight failed.');
+            // The plugin performs no Scryer version check. Report only what was actually probed.
             (diagnostics.compatibilityErrors || []).forEach(function (error) { lines.push(error); });
             if (diagnostics.callbackUri) lines.push('Callback: ' + diagnostics.callbackUri);
             if (diagnostics.oAuthMetadata && diagnostics.oAuthMetadata.checked) {
                 lines.push('OAuth metadata: ' + (diagnostics.oAuthMetadata.reachable ? 'reachable' : 'unreachable') +
-                    (diagnostics.oAuthMetadata.supportsAlphaContract ? ' (Alpha contract available).' : ' (Alpha contract not confirmed).'));
+                    (diagnostics.oAuthMetadata.supportsAlphaContract ? ' (contract verified).' : ' (contract not verified).') +
+                    (detailed ? detail(diagnostics.oAuthMetadata) : ''));
             }
             if (diagnostics.graphQl && diagnostics.graphQl.checked) {
                 lines.push('GraphQL: ' + (diagnostics.graphQl.reachable ? 'reachable' : 'unreachable') +
-                    (diagnostics.graphQl.contractVerified ? ' (Alpha operation contract verified).' :
-                        ' (' + (diagnostics.graphQl.failureCode || 'contract not verified') + ').'));
+                    (diagnostics.graphQl.contractVerified ? ' (operation contract verified).' : ' (contract not verified).') +
+                    (detailed ? detail(diagnostics.graphQl) : ''));
+            }
+            if (diagnostics.minimumScryerVersion) {
+                lines.push('Tested against Scryer ' + diagnostics.minimumScryerVersion + '.');
             }
             if (typeof diagnostics.linkedUserCount === 'number') {
                 lines.push('Linked Jellyfin users: ' + diagnostics.linkedUserCount +
