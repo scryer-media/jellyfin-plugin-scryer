@@ -2,7 +2,7 @@
 name: "Scryer"
 guid: "6a9c9f2e-6b2f-4a1a-9d3d-2c7f2f5b3d10"
 imageUrl: "https://raw.githubusercontent.com/scryer-media/jellyfin-plugin-scryer/main/artwork/scryer-plugin.png"
-version: "0.1.18.0"
+version: "0.1.19.0"
 targetAbi: "10.11.0.0"
 framework: "net9.0"
 overview: "Requests, discovery, and calendar pages for Jellyfin, backed by Scryer."
@@ -15,17 +15,13 @@ owner: "scryer-media"
 artifacts:
   - Jellyfin.Plugin.Scryer.dll
 changelog: >
-  Stops the Android TV channel from crashing the Jellyfin server and from going empty.
-  Opening a guidance card such as "Scryer Discovery unavailable" made the channel answer
-  the card's own folder query with the card again; Jellyfin 10.11 then stored the row as
-  its own parent and recursed through that parent chain until the whole server process
-  died of a stack overflow. Guidance cards now answer only the root query, and nothing is
-  ever listed as a child of itself. Separately, Jellyfin caches every channel response for
-  three hours and lists library rows on a cache hit, so a cached card whose row the
-  cleanup sweep had removed rendered as an empty channel. The cache key now rolls every
-  five minutes while a guidance card is the latest thing published, the sweep clears the
-  channel's response cache whenever it removes rows, and the data version is bumped so
-  responses cached by earlier versions are bypassed. Discovery is also resized: up to
-  twenty "More like ..." rails of five titles each, built from that user's most recently
-  watched titles, come first, followed by Scryer's sections, under a new configurable
-  total of 200 titles per user that bounds what Jellyfin stores.
+  Fixes the Android TV channel showing "Scryer Discovery unavailable" for users with a
+  watch history. The "More like ..." lookups went to Scryer as one GraphQL operation per
+  watched title per id namespace, up to 160 in one batch. Scryer meters every operation in
+  a batch against the caller's API quota (300 per minute per address) and rejects the whole
+  batch with a single error object once it is spent, which the plugin read as an unreadable
+  response. Lookups are now grouped into one operation per id namespace carrying every
+  title's ids (at most thirteen operations for twenty titles), any larger batch is sent in
+  consecutive requests of at most fifty operations, and a batch Scryer rejects is reported
+  as the rate limit or authorization failure it is, so the channel retries a few minutes
+  later instead of caching a blank card.
