@@ -228,7 +228,12 @@ separate OAuth flow.
 
 Open the channel to browse up to twenty **More like...** rails of five titles each,
 derived from that Jellyfin user's most recently watched movies and series, followed by
-their available Scryer discovery sections, all within the total-title budget.
+their available Scryer discovery sections, all within the total-title budget. The
+**More like...** lookups reach Scryer as one GraphQL operation per external-id namespace
+carrying every seed's ids (at most thirteen operations for twenty titles), and any larger
+batch the plugin ever sends is split into consecutive requests of at most fifty
+operations, because Scryer meters every operation in a batch against the caller's API
+quota and rejects the whole batch once it is spent.
 Titles intentionally appear as non-playable container folders, including movies, so the
 stock client does not offer a broken Play action for media that is not yet present and
 Jellyfin does not store them as real Series entries or run external metadata lookups

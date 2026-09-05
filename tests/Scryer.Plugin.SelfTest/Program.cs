@@ -487,7 +487,7 @@ static async Task AndroidTvDiscoveryAsync()
 {
     var responses = new Queue<string>(new[]
     {
-        """[{"data":{"titlesByExternalIds":[]}},{"data":{"titlesByExternalIds":[{"id":"seed","name":"Watched","moreLikeThis":[{"id":"one","targetKey":"tmdb:movie:1","targetKind":"MOVIE","displayTitle":"First","year":2026,"posterUrl":"https://scryer.example.test/first.avif"},{"id":"duplicate","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Duplicate","year":2025,"posterUrl":null}]}]}}]""",
+        """[{"data":{"titlesByExternalIds":[]}},{"data":{"titlesByExternalIds":[{"id":"seed","name":"Watched","facet":"MOVIE","externalIds":[{"source":"tmdb_movie","value":"99"}],"moreLikeThis":[{"id":"one","targetKey":"tmdb:movie:1","targetKind":"MOVIE","displayTitle":"First","year":2026,"posterUrl":"https://scryer.example.test/first.avif"},{"id":"duplicate","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Duplicate","year":2025,"posterUrl":null}]}]}}]""",
         """{"data":{"discoveryHomeCards":{"canViewPersonalized":true,"heroItem":null,"publicSections":[{"sectionId":"public","title":"Public","items":[{"id":"duplicate","targetKey":"tmdb:movie:2","targetKind":"MOVIE","displayTitle":"Duplicate","year":2025,"posterUrl":null},{"id":"three","targetKey":"tvdb:series:3","targetKind":"SERIES","displayTitle":"Third","year":2024,"posterUrl":null}]}],"personalizedSections":[{"sectionId":"personal","title":"For You","items":[{"id":"four","targetKey":"tmdb:movie:4","targetKind":"MOVIE","displayTitle":"Fourth","year":2023,"posterUrl":"/images/four.avif"}]}]}}}"""
     });
     var handler = new RecordingHandler(_ => JsonResponse(responses.Dequeue()));
@@ -515,8 +515,10 @@ static async Task AndroidTvDiscoveryAsync()
     Assert.Equal(ScryerAndroidTvLimits.ItemsPerRecommendationRail, recommendationBatch.RootElement[0].GetProperty("variables").GetProperty("limit").GetInt32());
     Assert.Equal(5, ScryerAndroidTvLimits.ItemsPerRecommendationRail);
 
-    // Twenty seeds with every identifier fan out to more lookups than one GraphQL batch allows.
-    // The most recent seeds that fit are sent; the rest are dropped rather than failing the rail set.
+    // Scryer meters every operation in a batch against the caller's API quota, so the seeds are
+    // grouped into one operation per external-id namespace: twenty series seeds carrying tvdb,
+    // tmdb and imdb ids are eight operations of twenty values, not 160 operations of one value.
+    // Seeds past the twentieth are dropped rather than failing the rail set.
     var batchHandler = new RecordingHandler(request =>
     {
         var body = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
@@ -536,9 +538,48 @@ static async Task AndroidTvDiscoveryAsync()
     var trimmed = await batchService.GetAndroidTvDiscoveryAsync("0123456789abcdef0123456789abcdef", manySeeds, CancellationToken.None);
     Assert.True(trimmed.IsSuccess, trimmed.Failure?.Message);
     using var trimmedBatch = JsonDocument.Parse(batchHandler.Requests[0].Content!);
-    // A series seed with all three identifiers is eight lookups; twelve seeds fit under 100.
-    Assert.Equal(96, trimmedBatch.RootElement.GetArrayLength());
+    Assert.Equal(8, trimmedBatch.RootElement.GetArrayLength());
+    Assert.Equal("tvdb", trimmedBatch.RootElement[0].GetProperty("variables").GetProperty("source").GetString());
+    Assert.Equal(20, trimmedBatch.RootElement[0].GetProperty("variables").GetProperty("values").GetArrayLength());
+    Assert.Equal("10", trimmedBatch.RootElement[0].GetProperty("variables").GetProperty("values")[0].GetString());
+    Assert.Equal("119", trimmedBatch.RootElement[0].GetProperty("variables").GetProperty("values")[19].GetString());
     Assert.Equal(ScryerAndroidTvLimits.RecommendationSeeds, 20);
+
+    // Two seeds whose ids come back in one operation are matched to their own titles by external
+    // id, in seed order, and a title backs only one rail even when two seeds resolve to it.
+    var sharedHandler = new RecordingHandler(request =>
+    {
+        var body = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+        if (body.TrimStart().StartsWith('['))
+        {
+            using var operations = JsonDocument.Parse(body);
+            var count = operations.RootElement.GetArrayLength();
+            var first = """{"data":{"titlesByExternalIds":[{"id":"t-b","name":"B","facet":"MOVIE","externalIds":[{"source":"tmdb","value":"2"}],"moreLikeThis":[{"id":"b1","targetKey":"tmdb:movie:20","targetKind":"MOVIE","displayTitle":"Like B","year":2020,"posterUrl":null}]},{"id":"t-a","name":"A","facet":"MOVIE","externalIds":[{"source":"tmdb","value":"1"}],"moreLikeThis":[{"id":"a1","targetKey":"tmdb:movie:10","targetKind":"MOVIE","displayTitle":"Like A","year":2021,"posterUrl":null}]}]}}""";
+            return JsonResponse("[" + string.Join(",", new[] { first }.Concat(Enumerable.Repeat("""{"data":{"titlesByExternalIds":[]}}""", count - 1))) + "]");
+        }
+
+        return JsonResponse("""{"data":{"discoveryHomeCards":{"canViewPersonalized":false,"heroItem":null,"publicSections":[],"personalizedSections":[]}}}""");
+    });
+    var sharedService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), sharedHandler);
+    var shared = await sharedService.GetAndroidTvDiscoveryAsync("0123456789abcdef0123456789abcdef", new[]
+    {
+        new ScryerRecommendationSeed("A", "MOVIE", new Dictionary<string, string> { ["tmdb"] = "1" }),
+        new ScryerRecommendationSeed("B", "MOVIE", new Dictionary<string, string> { ["tmdb"] = "2" }),
+        new ScryerRecommendationSeed("A again", "MOVIE", new Dictionary<string, string> { ["tmdb"] = "1" }),
+    }, CancellationToken.None);
+    Assert.True(shared.IsSuccess, shared.Failure?.Message);
+    Assert.True(shared.Value!.Select(rail => rail.Title).SequenceEqual(new[] { "More like A", "More like B" }));
+    Assert.Equal("tmdb:movie:10", shared.Value![0].Items[0].TargetKey);
+    Assert.Equal("tmdb:movie:20", shared.Value![1].Items[0].TargetKey);
+
+    // Scryer answers an over-quota batch with HTTP 200 and a single error object instead of an
+    // array. That is a rate limit, not an unreadable response, and it is reported as one so the
+    // channel retries later instead of blaming the payload.
+    var limitedHandler = new RecordingHandler(_ => JsonResponse("""{"errors":[{"message":"rate limited","extensions":{"code":"RATE_LIMITED","retryAfterSeconds":30}}]}"""));
+    var limitedService = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), limitedHandler);
+    var limited = await limitedService.GetAndroidTvDiscoveryAsync("0123456789abcdef0123456789abcdef", seeds, CancellationToken.None);
+    Assert.False(limited.IsSuccess);
+    Assert.Equal(ScryerFailureCode.RateLimited, limited.Failure!.Code);
 }
 
 static async Task AndroidTvActionsAsync()

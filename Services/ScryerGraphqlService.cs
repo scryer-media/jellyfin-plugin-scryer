@@ -56,7 +56,11 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
     private const int MaximumPageOffset = 10_000;
     private const int MaximumCalendarRangeDays = 62;
     private const int MaximumRecommendationSeeds = ScryerAndroidTvLimits.RecommendationSeeds;
-    private const int MaximumGraphqlBatchOperations = 100;
+    // Scryer meters every operation inside a GraphQL batch against the caller's API quota (300 per
+    // minute per client address by default) before executing any of it, and answers an over-quota
+    // batch with a single error object. Fifty operations per request leaves room for the other
+    // requests a Jellyfin server makes on behalf of its users inside the same minute.
+    private const int MaximumGraphqlBatchOperations = 50;
     private const int TitlePosterBatchSize = 16;
     private const int MaximumCalendarTitles = 64;
     private static readonly HashSet<string> RecommendationExternalIdSources = new(StringComparer.Ordinal)
@@ -71,7 +75,7 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
     private const string ManageableLibrariesQuery = """query ScryerManageableLibraries($facet: MediaFacetValue) { libraries(facet: $facet, permission: MANAGE_TITLES) { id facet name slug isDefault qualityProfileId roots { id path isDefault } } }""";
     private const string QualityProfilesQuery = """query ScryerQualityProfiles { qualityProfileSettings { profiles { id name } } }""";
     private const string DiscoveryHomeCardsQuery = """query ScryerDiscoveryHomeCards { discoveryHomeCards { canViewPersonalized heroItem { id targetKey targetKind displayTitle year posterUrl } publicSections { sectionId title items { id targetKey targetKind displayTitle year posterUrl } } personalizedSections { sectionId title items { id targetKey targetKind displayTitle year posterUrl } } } }""";
-    private const string TitleRecommendationsQuery = """query ScryerTitleRecommendations($source: String!, $values: [String!]!, $limit: Int!) { titlesByExternalIds(source: $source, values: $values) { id name moreLikeThis(limit: $limit) { id targetKey targetKind displayTitle year posterUrl } } }""";
+    private const string TitleRecommendationsQuery = """query ScryerTitleRecommendations($source: String!, $values: [String!]!, $limit: Int!) { titlesByExternalIds(source: $source, values: $values) { id name facet externalIds { source value } moreLikeThis(limit: $limit) { id targetKey targetKind displayTitle year posterUrl } } }""";
     private const string SearchMetadataMultiQuery = """query ScryerSearchMetadataMulti($query: String!, $limit: Int, $language: String! = "eng") { searchMetadataMulti(query: $query, limit: $limit, language: $language) { movies { tvdbId smgId tmdbId imdbId name slug type year status overview posterUrl language runtimeMinutes sortTitle externalIds { source value } } series { tvdbId smgId tmdbId imdbId name slug type year status overview posterUrl language runtimeMinutes sortTitle externalIds { source value } } anime { tvdbId smgId tmdbId imdbId name slug type year status overview posterUrl language runtimeMinutes sortTitle externalIds { source value } } } }""";
     private const string DiscoveryItemDetailQuery = """query ScryerDiscoveryItemDetail($input: DiscoveryItemDetailInput!) { discoveryItemDetail(input: $input) { targetKey targetKind displayTitle year posterUrl overview rating ratingSources externalRatings { source value score normalized votes url } externalIds { source id } } }""";
     private const string MyMediaRequestsQuery = """query ScryerMyMediaRequests { myMediaRequests { id libraryId facet status identityFingerprint title sortTitle slug posterUrl year overview runtimeMinutes language contentStatus requestedQualityProfileId requestedQualityProfileName requestedMonitorType resolvedByUserId resolvedAt createdTitleId approvedQualityProfileId approvedQualityProfileName externalIds { source value } requesters { userId username avatarUrl } } }""";
@@ -152,25 +156,39 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Fail(ScryerFailure.InvalidResponse);
         }
 
-        var lookups = seeds
-            .Select((seed, seedIndex) => RecommendationLookups(seed).Select(lookup => (SeedIndex: seedIndex, lookup.Source, lookup.Value)))
-            .SelectMany(seedLookups => seedLookups)
-            .ToArray();
-        if (lookups.Length > MaximumGraphqlBatchOperations)
+        // One operation per external-id namespace, carrying every seed's value for that namespace.
+        // titlesByExternalIds accepts a list of values, so twenty seeds cost at most thirteen
+        // operations here. One operation per seed per namespace cost up to 160, and Scryer meters
+        // each operation in a batch against the caller's API quota, so a single channel refresh
+        // could exhaust the quota by itself and every rail came back empty.
+        var valuesBySource = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var seed in seeds)
         {
-            return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Fail(ScryerFailure.InvalidResponse);
+            foreach (var (source, value) in RecommendationLookups(seed))
+            {
+                if (!valuesBySource.TryGetValue(source, out var values))
+                {
+                    values = new List<string>();
+                    valuesBySource[source] = values;
+                }
+
+                if (!values.Contains(value, StringComparer.Ordinal))
+                {
+                    values.Add(value);
+                }
+            }
         }
 
-        if (lookups.Length == 0)
+        if (valuesBySource.Count == 0)
         {
             return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Success(Array.Empty<ScryerRecommendationGroup>());
         }
 
-        var operations = lookups.Select(lookup => new
+        var operations = valuesBySource.Select(pair => new
         {
             operationName = "ScryerTitleRecommendations",
             query = TitleRecommendationsQuery,
-            variables = new { source = lookup.Source, values = new[] { lookup.Value }, limit }
+            variables = new { source = pair.Key, values = pair.Value.ToArray(), limit }
         }).ToArray();
         var batch = await ExecuteBatchOperationsAsync(jellyfinUserId, operations, "titlesByExternalIds", cancellationToken).ConfigureAwait(false);
         if (!batch.IsSuccess)
@@ -178,27 +196,35 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Fail(batch.Failure!);
         }
 
-        var groups = new List<ScryerRecommendationGroup>();
-        for (var seedIndex = 0; seedIndex < seeds.Count; seedIndex++)
+        var titles = new List<RecommendedTitle>();
+        foreach (var result in batch.Value!)
         {
-            for (var lookupIndex = 0; lookupIndex < lookups.Length; lookupIndex++)
+            if (!TryParseRecommendedTitles(result, out var parsed))
             {
-                if (lookups[lookupIndex].SeedIndex != seedIndex)
-                {
-                    continue;
-                }
-
-                if (!TryParseRecommendationItems(batch.Value![lookupIndex], out var items))
-                {
-                    return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Fail(ScryerFailure.InvalidResponse);
-                }
-
-                if (items.Count > 0)
-                {
-                    groups.Add(new ScryerRecommendationGroup($"More like {seeds[seedIndex].Title.Trim()}", items));
-                    break;
-                }
+                return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Fail(ScryerFailure.InvalidResponse);
             }
+
+            titles.AddRange(parsed);
+        }
+
+        // Titles are matched back to seeds by the external ids Scryer returns for them. A title
+        // that matches on facet as well as id wins over one that matches on id alone, and each
+        // Scryer title backs at most one rail so two seeds that resolve to the same title do not
+        // produce the same rail twice.
+        var groups = new List<ScryerRecommendationGroup>();
+        var claimed = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var seed in seeds)
+        {
+            var facet = NormalizeFacet(seed.Facet);
+            var candidates = titles.Where(title => !claimed.Contains(title.Id) && title.Items.Count > 0 && title.Matches(seed.ProviderIds)).ToArray();
+            var match = candidates.FirstOrDefault(title => string.Equals(title.Facet, facet, StringComparison.Ordinal)) ?? candidates.FirstOrDefault();
+            if (match is null)
+            {
+                continue;
+            }
+
+            claimed.Add(match.Id);
+            groups.Add(new ScryerRecommendationGroup($"More like {seed.Title.Trim()}", match.Items));
         }
 
         return ScryerResult<IReadOnlyList<ScryerRecommendationGroup>>.Success(groups);
@@ -325,7 +351,7 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
 
         var recommendations = await GetRecommendationGroupsAsync(
             jellyfinUserId,
-            SeedsWithinBatchBudget(recentSeeds),
+            recentSeeds.Take(MaximumRecommendationSeeds).ToArray(),
             ScryerAndroidTvLimits.ItemsPerRecommendationRail,
             cancellationToken).ConfigureAwait(false);
         if (!recommendations.IsSuccess)
@@ -502,30 +528,6 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
     /// fans out to one lookup per known identifier source, so twenty seeds can exceed the batch
     /// ceiling; the oldest seeds are dropped rather than failing the whole projection.
     /// </summary>
-    private static IReadOnlyList<ScryerRecommendationSeed> SeedsWithinBatchBudget(IReadOnlyList<ScryerRecommendationSeed> seeds)
-    {
-        var selected = new List<ScryerRecommendationSeed>();
-        var lookups = 0;
-        foreach (var seed in seeds.Take(MaximumRecommendationSeeds))
-        {
-            if (seed is null || seed.ProviderIds is null || NormalizeFacet(seed.Facet) is null)
-            {
-                continue;
-            }
-
-            var seedLookups = RecommendationLookups(seed).Count();
-            if (lookups + seedLookups > MaximumGraphqlBatchOperations)
-            {
-                break;
-            }
-
-            lookups += seedLookups;
-            selected.Add(seed);
-        }
-
-        return selected;
-    }
-
     private static IEnumerable<(string Source, string Value)> RecommendationLookups(ScryerRecommendationSeed seed)
     {
         var movie = string.Equals(NormalizeFacet(seed.Facet), "MOVIE", StringComparison.Ordinal);
@@ -542,27 +544,60 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
         }
     }
 
-    private static bool TryParseRecommendationItems(JsonElement titles, out IReadOnlyList<ScryerTvDiscoveryItem> items)
+    /// <summary>One Scryer title returned for a recommendation lookup, with the ids it can be matched on.</summary>
+    private sealed record RecommendedTitle(
+        string Id,
+        string? Facet,
+        IReadOnlyList<(string Source, string Value)> ExternalIds,
+        IReadOnlyList<ScryerTvDiscoveryItem> Items)
     {
-        items = Array.Empty<ScryerTvDiscoveryItem>();
-        if (titles.ValueKind != JsonValueKind.Array || titles.GetArrayLength() > 8)
+        public bool Matches(IReadOnlyDictionary<string, string> providerIds) =>
+            ExternalIds.Any(externalId =>
+                providerIds.TryGetValue(externalId.Source, out var value) &&
+                string.Equals(value?.Trim(), externalId.Value, StringComparison.Ordinal));
+    }
+
+    private static bool TryParseRecommendedTitles(JsonElement titles, out IReadOnlyList<RecommendedTitle> parsed)
+    {
+        parsed = Array.Empty<RecommendedTitle>();
+        // Every value in the operation can match a title in more than one library.
+        if (titles.ValueKind != JsonValueKind.Array || titles.GetArrayLength() > MaximumRecommendationSeeds * 8)
         {
             return false;
         }
 
+        var result = new List<RecommendedTitle>();
         foreach (var title in titles.EnumerateArray())
         {
-            if (title.ValueKind != JsonValueKind.Object || !title.TryGetProperty("moreLikeThis", out var recommendations))
+            if (title.ValueKind != JsonValueKind.Object ||
+                !TryReadBoundedString(title, "id", out var id) ||
+                !title.TryGetProperty("externalIds", out var externalIdsElement) || externalIdsElement.ValueKind != JsonValueKind.Array ||
+                !title.TryGetProperty("moreLikeThis", out var recommendations))
             {
                 return false;
             }
 
-            if (TryReadDiscoveryItems(recommendations, out items) && items.Count > 0)
+            var externalIds = new List<(string Source, string Value)>();
+            foreach (var externalId in externalIdsElement.EnumerateArray())
             {
-                return true;
+                if (externalId.ValueKind == JsonValueKind.Object &&
+                    TryReadBoundedString(externalId, "source", out var source) &&
+                    TryReadBoundedString(externalId, "value", out var value))
+                {
+                    // Scryer namespaces ids as "tmdb" or "tmdb_movie"; Jellyfin keys them by provider only.
+                    externalIds.Add((source.Split('_', 2)[0].ToLowerInvariant(), value));
+                }
             }
+
+            var facet = title.TryGetProperty("facet", out var facetElement) && facetElement.ValueKind == JsonValueKind.String
+                ? NormalizeFacet(facetElement.GetString())
+                : null;
+            // A rail whose items cannot be read is dropped, not the whole set of rails.
+            var items = TryReadDiscoveryItems(recommendations, out var readItems) ? readItems : Array.Empty<ScryerTvDiscoveryItem>();
+            result.Add(new RecommendedTitle(id, facet, externalIds, items));
         }
 
+        parsed = result;
         return true;
     }
 
@@ -844,15 +879,10 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.NotConnected);
         }
 
-        if (operations.Count is < 1 or > MaximumGraphqlBatchOperations)
+        if (operations.Count < 1)
         {
             return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse);
         }
-
-        byte[] payload;
-        try { payload = JsonSerializer.SerializeToUtf8Bytes(operations); }
-        catch (JsonException) { return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse); }
-        if (payload.Length > MaximumRequestBytes) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse);
 
         var configuration = _configurationProvider.GetConfiguration();
         if (!configuration.IsSuccess) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(configuration.Failure!);
@@ -864,13 +894,24 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.AuthorizationExpired);
         }
 
-        return await PostBatchAndProjectAsync(
-            BuildGraphqlEndpoint(currentConfiguration.Value!.InternalAuthority),
-            lease.Value!,
-            payload,
-            operations.Count,
-            rootField,
-            cancellationToken).ConfigureAwait(false);
+        var endpoint = BuildGraphqlEndpoint(currentConfiguration.Value!.InternalAuthority);
+        var projected = new List<JsonElement>(operations.Count);
+        // Larger batches go out as consecutive requests of at most MaximumGraphqlBatchOperations,
+        // in order, so the results line up with the operations regardless of how many there are.
+        for (var offset = 0; offset < operations.Count; offset += MaximumGraphqlBatchOperations)
+        {
+            var chunk = operations.Skip(offset).Take(MaximumGraphqlBatchOperations).ToArray();
+            byte[] payload;
+            try { payload = JsonSerializer.SerializeToUtf8Bytes(chunk); }
+            catch (JsonException) { return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse); }
+            if (payload.Length > MaximumRequestBytes) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse);
+
+            var result = await PostBatchAndProjectAsync(endpoint, lease.Value!, payload, chunk.Length, rootField, cancellationToken).ConfigureAwait(false);
+            if (!result.IsSuccess) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(result.Failure!);
+            projected.AddRange(result.Value!);
+        }
+
+        return ScryerResult<IReadOnlyList<JsonElement>>.Success(projected);
     }
 
     private async Task<ScryerResult<IReadOnlyList<JsonElement>>> PostBatchAndProjectAsync(
@@ -895,9 +936,21 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             if (!IsJsonResponse(response.Content.Headers.ContentType)) return ScryerResult<IReadOnlyList<JsonElement>>.Fail(statusFailure ?? ScryerFailure.InvalidResponse);
 
             using var document = await ReadJsonAsync(response.Content, timeout.Token).ConfigureAwait(false);
-            if (statusFailure is not null || document.RootElement.ValueKind != JsonValueKind.Array || document.RootElement.GetArrayLength() != expectedCount)
+            if (statusFailure is not null)
             {
-                return ScryerResult<IReadOnlyList<JsonElement>>.Fail(statusFailure ?? ScryerFailure.InvalidResponse);
+                return ScryerResult<IReadOnlyList<JsonElement>>.Fail(statusFailure);
+            }
+
+            if (document.RootElement.ValueKind == JsonValueKind.Object)
+            {
+                // Scryer rejects a whole batch (rate limited, revoked access) with HTTP 200 and one
+                // response object carrying the error, not an array of per-operation responses.
+                return ScryerResult<IReadOnlyList<JsonElement>>.Fail(MapGraphQlFailure(document.RootElement) ?? ScryerFailure.InvalidResponse);
+            }
+
+            if (document.RootElement.ValueKind != JsonValueKind.Array || document.RootElement.GetArrayLength() != expectedCount)
+            {
+                return ScryerResult<IReadOnlyList<JsonElement>>.Fail(ScryerFailure.InvalidResponse);
             }
 
             var projected = new List<JsonElement>(expectedCount);
