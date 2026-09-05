@@ -799,6 +799,19 @@ static async Task AndroidTvChannelAsync()
         ScryerDiscoveryChannel.StableId(userId, "title", "tmdb:movie:1"),
         ScryerDiscoveryChannel.StableId("11111111111111111111111111111111", "title", "tmdb:movie:1"),
         StringComparison.Ordinal));
+    // Jellyfin writes ProviderIds only when it creates the row, so a title's row id has to change
+    // whenever the kind or the stored external ids change; otherwise a title first seen as SERIES
+    // (Azur Lane, before Scryer's content type was read) keeps acting as SERIES forever.
+    var seriesRowId = ScryerDiscoveryChannel.TitleItemId(userId, "tvdb:series:367277", "SERIES", "");
+    Assert.False(string.Equals(
+        seriesRowId,
+        ScryerDiscoveryChannel.TitleItemId(userId, "tvdb:series:367277", "ANIME", ""),
+        StringComparison.Ordinal));
+    Assert.False(string.Equals(
+        seriesRowId,
+        ScryerDiscoveryChannel.TitleItemId(userId, "tvdb:series:367277", "SERIES", "tvdb=367277"),
+        StringComparison.Ordinal));
+    Assert.Equal(seriesRowId, ScryerDiscoveryChannel.TitleItemId(userId, "tvdb:series:367277", "SERIES", ""));
 
     Assert.True(channel.IsEnabledFor(userId));
     Assert.Equal(2, channel.GetChannelFeatures().AutoRefreshLevels);
@@ -816,6 +829,8 @@ static async Task AndroidTvChannelAsync()
     Assert.Equal(ChannelFolderType.Container, title.FolderType);
     Assert.Equal("tmdb:movie:1", title.ProviderIds[ScryerDiscoveryChannel.TargetProviderId]);
     Assert.Equal("MOVIE", title.ProviderIds[ScryerDiscoveryChannel.KindProviderId]);
+    title.ProviderIds.TryGetValue(ScryerDiscoveryChannel.ExternalIdsProviderId, out var publishedIds);
+    Assert.Equal(ScryerDiscoveryChannel.TitleItemId(userId, "tmdb:movie:1", "MOVIE", publishedIds ?? string.Empty), title.Id);
     // AVIF posters pass through unchanged: Jellyfin caches the file and serves the original bytes
     // when Skia cannot transcode them, and the Android TV 12+ client decodes AVIF itself.
     Assert.Equal("https://scryer.example.test/first.avif", title.ImageUrl);

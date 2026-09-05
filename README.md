@@ -253,6 +253,9 @@ Use the standard Favorite heart on a title to send it to Scryer:
   discovery store, so a rail title may have no discovery detail. Each row therefore
   carries the ids Scryer matched it on, and the action falls back to those, plus the id
   in the row's own key, when the detail lookup returns nothing.
+- Jellyfin stores a channel row's provider ids only when it first creates the row, so a
+  row's id also covers its kind and stored ids. When Scryer reports a title differently,
+  the channel publishes a fresh row and Jellyfin retires the old one on the next refresh.
 
 The action always uses `MONITORED`. Jellyfin displays a native success or failure message
 on the active user's clients. Scryer's AVIF posters are handed to Jellyfin unchanged.

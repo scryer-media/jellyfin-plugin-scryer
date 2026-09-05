@@ -49,7 +49,7 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
     private const int MaximumStoredExternalIdsLength = 1024;
     // v5: rows carry the content-type facet (anime is no longer published as a series) and their
     // external ids, so responses cached under v4 must not be served against the new rows.
-    internal const string DataSchemaVersion = "android-tv-v5";
+    internal const string DataSchemaVersion = "android-tv-v6";
 
     /// <summary>
     /// Channel item id prefix carried by every guidance stub ("Connect Scryer in Jellyfin Web" and
@@ -324,6 +324,9 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
 
     public IEnumerable<ImageType> GetSupportedChannelImages() => new[] { ImageType.Primary };
 
+    internal static string TitleItemId(string jellyfinUserId, string targetKey, string targetKind, string storedExternalIds) =>
+        StableId(jellyfinUserId, "title", string.Join("\u001f", targetKey, targetKind, storedExternalIds));
+
     internal static string StableId(string jellyfinUserId, string kind, string value) =>
         $"scryer-{kind}-{StableHash(string.Join("\u001f", jellyfinUserId, value))}";
 
@@ -420,9 +423,14 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
 
     private ChannelItemInfo TitleItem(string jellyfinUserId, ScryerTvDiscoveryItem item)
     {
+        var storedIds = EncodeExternalIds(item.ExternalIds);
         var result = new ChannelItemInfo
         {
-            Id = StableId(jellyfinUserId, "title", item.TargetKey),
+            // Jellyfin copies a channel item's ProviderIds into its library row only when it creates
+            // the row; a later refresh with the same id keeps the old kind and ids no matter what the
+            // channel returns. So the id covers everything stored in ProviderIds: when Scryer's kind
+            // or matched ids change, the row is republished and the stale one is retired as dead.
+            Id = TitleItemId(jellyfinUserId, item.TargetKey, item.TargetKind, storedIds),
             Name = item.DisplayTitle,
             Overview = item.Overview,
             ProductionYear = item.Year,
@@ -440,7 +448,6 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
                 [KindProviderId] = item.TargetKind
             }
         };
-        var storedIds = EncodeExternalIds(item.ExternalIds);
         if (storedIds.Length > 0)
         {
             result.ProviderIds[ExternalIdsProviderId] = storedIds;
