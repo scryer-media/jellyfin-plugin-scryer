@@ -36,17 +36,6 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
     private const int MaximumRecentItems = 25;
     private const int MaximumPageSize = 100;
 
-    /// <summary>
-    /// Jellyfin downloads a channel item's ImageUrl and decodes it server-side with Skia, which
-    /// cannot read AVIF. Scryer serves AVIF posters, so a poster is only offered when its URL
-    /// names a format the server can actually decode; otherwise no image is set at all and the
-    /// client falls back to its own placeholder rather than persisting an undecodable file.
-    /// </summary>
-    private static readonly HashSet<string> ServerDecodableImageExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".jpg", ".jpeg", ".png", ".webp"
-    };
-
     private readonly Func<PluginConfiguration?> _configuration;
     private readonly IScryerUserSessionService _sessions;
     private readonly IScryerGraphqlService _scryer;
@@ -302,7 +291,10 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
                 [KindProviderId] = item.TargetKind
             }
         };
-        if (IsServerDecodableImage(item.PosterUrl))
+        // Scryer posters are AVIF by design. Jellyfin downloads and caches the file (any image/*
+        // content type is accepted) and, because Skia cannot transcode AVIF, serves the original
+        // bytes to the client, whose Android TV 12+ decoder renders them.
+        if (!string.IsNullOrWhiteSpace(item.PosterUrl))
         {
             result.ImageUrl = item.PosterUrl;
         }
@@ -329,11 +321,6 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         var now = _timeProvider.GetUtcNow().UtcDateTime;
         return new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, DateTimeKind.Utc);
     }
-
-    private static bool IsServerDecodableImage(string? posterUrl) =>
-        !string.IsNullOrWhiteSpace(posterUrl) &&
-        Uri.TryCreate(posterUrl, UriKind.Absolute, out var parsed) &&
-        ServerDecodableImageExtensions.Contains(Path.GetExtension(parsed.AbsolutePath));
 
     private static ChannelItemResult Empty() => new()
     {

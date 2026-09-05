@@ -19,6 +19,6 @@ changelog: >
   linked users are no longer silently disconnected on every Jellyfin restart in
   container deployments, and quarantines rather than deletes records it cannot
   decrypt. Makes the Android TV discovery channel opt-in and stops it writing
-  Series rows, undecodable AVIF artwork, or anonymous stubs into the Jellyfin
+  Series rows or anonymous stubs into the Jellyfin
   library database, and reports what preflight actually checked instead of
   claiming a minimum Scryer version the plugin never verifies.

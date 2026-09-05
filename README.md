@@ -196,10 +196,10 @@ Use the standard Favorite heart on a title to send it to Scryer:
   cancel anything in Scryer; it only permits a later retry.
 
 The action always uses `MONITORED`. Jellyfin displays a native success or failure message
-on the active user's clients. Posters are only handed to Jellyfin when the poster URL names
-a format the server can decode (JPEG, PNG, or WebP); Scryer's AVIF posters are omitted
-entirely, because Jellyfin downloads and decodes channel images server-side with Skia,
-which cannot read AVIF. Titles therefore show the client's own placeholder artwork.
+on the active user's clients. Scryer's AVIF posters are handed to Jellyfin unchanged.
+Jellyfin downloads and caches each poster, and because its server-side Skia encoder cannot
+transcode AVIF it serves the original bytes regardless of the requested size, so the
+Android TV 12+ client decodes them itself. Older clients show placeholder artwork.
 
 ## Permissions and feature flags
 

@@ -596,8 +596,9 @@ static async Task AndroidTvChannelAsync()
     Assert.Equal(ChannelFolderType.Container, title.FolderType);
     Assert.Equal("tmdb:movie:1", title.ProviderIds[ScryerDiscoveryChannel.TargetProviderId]);
     Assert.Equal("MOVIE", title.ProviderIds[ScryerDiscoveryChannel.KindProviderId]);
-    // Jellyfin decodes channel images server-side with Skia, which cannot read Scryer's AVIF.
-    Assert.True(title.ImageUrl is null);
+    // AVIF posters pass through unchanged: Jellyfin caches the file and serves the original bytes
+    // when Skia cannot transcode them, and the Android TV 12+ client decodes AVIF itself.
+    Assert.Equal("https://scryer.example.test/first.avif", title.ImageUrl);
 
     var channelImage = await channel.GetChannelImage(ImageType.Primary, CancellationToken.None);
     Assert.True(channelImage.HasImage);
