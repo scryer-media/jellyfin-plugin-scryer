@@ -2,7 +2,7 @@
 name: "Scryer"
 guid: "6a9c9f2e-6b2f-4a1a-9d3d-2c7f2f5b3d10"
 imageUrl: "https://raw.githubusercontent.com/scryer-media/jellyfin-plugin-scryer/main/artwork/scryer-plugin.png"
-version: "0.1.16.0"
+version: "0.1.17.0"
 targetAbi: "10.11.0.0"
 framework: "net9.0"
 overview: "Requests, discovery, and calendar pages for Jellyfin, backed by Scryer."
@@ -15,10 +15,10 @@ owner: "scryer-media"
 artifacts:
   - Jellyfin.Plugin.Scryer.dll
 changelog: >
-  Caps how much Scryer discovery the Android TV channel publishes, because Scryer's
-  discovery query takes no size arguments and Jellyfin stores every published rail
-  and title as a library row and a downloaded poster for each user. Rails and titles
-  per rail are now configurable, defaulting to 8 and 20. Stops a guidance stub such
-  as "Connect Scryer in Jellyfin Web" outliving the moment it described: the channel
-  cache key now tracks whether the user has a stored Scryer grant, so connecting
-  clears the card at once, and cleanup removes stale stubs even with the channel on.
+  Logs why the Android TV channel published a guidance card. The channel previously
+  showed "Scryer Discovery unavailable" while writing nothing to the Jellyfin log, so
+  an administrator had a card on a television and no record to reconcile it against,
+  and no way to tell an unreachable Scryer from a stale authorization. The Scryer
+  failure code, such as scryer_offline or authorization_expired, is now recorded at
+  warning level, while a user who has simply not linked an account yet is recorded at
+  debug so warning level keeps carrying real faults.
