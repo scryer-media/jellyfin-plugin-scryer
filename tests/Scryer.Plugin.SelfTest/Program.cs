@@ -54,7 +54,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("calendar title posters use fixed bounded GraphQL batches", CalendarTitlePostersAsync),
     ("Android TV discovery rails are typed, ordered, and globally deduplicated", AndroidTvDiscoveryAsync),
     ("Android TV default actions prefer direct add and support request-only users", AndroidTvActionsAsync),
-    ("Android TV channel uses isolated stable IDs, hourly cache keys, and non-playable stubs", AndroidTvChannelAsync),
+    ("Android TV channel uses isolated stable IDs, daily cache keys, and container stubs", AndroidTvChannelAsync),
+    ("the Android TV channel is inert until the administrator opts in", AndroidTvChannelDisabledAsync),
     ("Android TV action journal is durable, bounded, and isolated by Jellyfin user", AndroidTvActionJournalAsync),
     ("Android TV favorite worker retains success, rolls back failure, and suppresses duplicates", AndroidTvFavoriteWorkerAsync),
     ("detached revoke journal survives restart discovery, promotion, and cleanup", DetachedRevokeJournalAsync),
@@ -540,39 +541,45 @@ static async Task AndroidTvActionsAsync()
 static async Task AndroidTvChannelAsync()
 {
     const string userId = "0123456789abcdef0123456789abcdef";
+    var jellyfinUser = new User("tv-user", "test-auth", "test-reset") { Id = Guid.ParseExact(userId, "N") };
     var handler = new RecordingHandler(_ => JsonResponse("""{"data":{"discoveryHomeCards":{"canViewPersonalized":true,"heroItem":null,"publicSections":[],"personalizedSections":[{"sectionId":"personal","title":"For You","items":[{"id":"one","targetKey":"tmdb:movie:1","targetKind":"MOVIE","displayTitle":"First","year":2026,"posterUrl":"https://scryer.example.test/first.avif"}]}]}}}"""));
     var graphql = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), handler);
     var time = new ManualTimeProvider(new DateTimeOffset(2026, 9, 2, 12, 15, 0, TimeSpan.Zero));
-    var channel = new ScryerDiscoveryChannel(
-        new TokenSession(),
-        graphql,
-        InterfaceProxy.Create<ILibraryManager>(),
-        InterfaceProxy.Create<IUserManager>(),
-        time);
-    var query = new InternalChannelItemQuery { UserId = Guid.ParseExact(userId, "N") };
+    var libraryManager = LibraryManagerHarness.Create().Contract;
+    var userManager = UserManagerHarness.Create(jellyfinUser).Contract;
+    var enabled = TvConfiguration(androidTvChannel: true);
+    var channel = new ScryerDiscoveryChannel(new TokenSession(), graphql, libraryManager, userManager, time, () => enabled);
+    var query = new InternalChannelItemQuery { UserId = jellyfinUser.Id };
 
     var cacheKey = channel.GetCacheKey(userId);
-    time.Advance(TimeSpan.FromMinutes(30));
+    time.Advance(TimeSpan.FromHours(6));
     Assert.Equal(cacheKey, channel.GetCacheKey(userId));
-    time.Advance(TimeSpan.FromMinutes(30));
+    time.Advance(TimeSpan.FromHours(24));
     Assert.False(string.Equals(cacheKey, channel.GetCacheKey(userId), StringComparison.Ordinal));
     Assert.False(string.Equals(
         ScryerDiscoveryChannel.StableId(userId, "title", "tmdb:movie:1"),
         ScryerDiscoveryChannel.StableId("11111111111111111111111111111111", "title", "tmdb:movie:1"),
         StringComparison.Ordinal));
 
+    Assert.True(channel.IsEnabledFor(userId));
+    Assert.Equal(2, channel.GetChannelFeatures().AutoRefreshLevels);
+
     var root = await channel.GetChannelItems(query, CancellationToken.None);
     Assert.Equal(1, root.TotalRecordCount);
     Assert.Equal(ChannelItemType.Folder, root.Items[0].Type);
+    Assert.Equal(ChannelFolderType.Container, root.Items[0].FolderType);
     query.FolderId = root.Items[0].Id;
     var titles = await channel.GetChannelItems(query, CancellationToken.None);
     Assert.Equal(1, titles.TotalRecordCount);
     var title = titles.Items[0];
     Assert.Equal(ChannelItemType.Folder, title.Type);
-    Assert.Equal(ChannelFolderType.Series, title.FolderType);
+    // Never Series: Jellyfin would persist it as a real Series row and refresh TVDB/TMDB on it.
+    Assert.Equal(ChannelFolderType.Container, title.FolderType);
     Assert.Equal("tmdb:movie:1", title.ProviderIds[ScryerDiscoveryChannel.TargetProviderId]);
     Assert.Equal("MOVIE", title.ProviderIds[ScryerDiscoveryChannel.KindProviderId]);
-    Assert.Equal("https://scryer.example.test/first.avif", title.ImageUrl);
+    // Jellyfin decodes channel images server-side with Skia, which cannot read Scryer's AVIF.
+    Assert.True(title.ImageUrl is null);
+
     var channelImage = await channel.GetChannelImage(ImageType.Primary, CancellationToken.None);
     Assert.True(channelImage.HasImage);
     Assert.Equal(ImageFormat.Png, channelImage.Format);
@@ -583,15 +590,75 @@ static async Task AndroidTvChannelAsync()
     new PluginServiceRegistrator().RegisterServices(services, InterfaceProxy.Create<IServerApplicationHost>());
     Assert.True(services.Any(descriptor => descriptor.ServiceType == typeof(IChannel)));
 
-    var unlinked = new ScryerDiscoveryChannel(
-        new UnlinkedSession(),
-        graphql,
-        InterfaceProxy.Create<ILibraryManager>(),
-        InterfaceProxy.Create<IUserManager>(),
-        time);
-    var instruction = await unlinked.GetChannelItems(new InternalChannelItemQuery { UserId = Guid.ParseExact(userId, "N") }, CancellationToken.None);
+    // The daily Refresh Channels task uses Guid.Empty; it must never persist stub rows.
+    var anonymous = await channel.GetChannelItems(new InternalChannelItemQuery { UserId = Guid.Empty }, CancellationToken.None);
+    Assert.Equal(0, anonymous.TotalRecordCount);
+    Assert.Equal(0, anonymous.Items.Count);
+
+    var unknown = await channel.GetChannelItems(
+        new InternalChannelItemQuery { UserId = Guid.ParseExact("11111111111111111111111111111111", "N") },
+        CancellationToken.None);
+    Assert.Equal(0, unknown.Items.Count);
+
+    var unlinked = new ScryerDiscoveryChannel(new UnlinkedSession(), graphql, libraryManager, userManager, time, () => enabled);
+    var instruction = await unlinked.GetChannelItems(new InternalChannelItemQuery { UserId = jellyfinUser.Id }, CancellationToken.None);
     Assert.Equal("Connect Scryer in Jellyfin Web", instruction.Items.Single().Name);
     Assert.Equal(0, instruction.Items.Single().ProviderIds.Count);
+    Assert.Equal(ChannelFolderType.Container, instruction.Items.Single().FolderType);
+}
+
+static async Task AndroidTvChannelDisabledAsync()
+{
+    const string userId = "0123456789abcdef0123456789abcdef";
+    var jellyfinUser = new User("tv-user", "test-auth", "test-reset") { Id = Guid.ParseExact(userId, "N") };
+    var handler = new RecordingHandler(_ => throw new InvalidOperationException("A disabled channel must not contact Scryer."));
+    var graphql = new ScryerGraphqlService(new FixedConfigurationProvider(ValidOAuthConfiguration()), new TokenSession(), handler);
+    var time = new ManualTimeProvider(new DateTimeOffset(2026, 9, 2, 12, 15, 0, TimeSpan.Zero));
+
+    // Jellyfin finds IChannel implementations by type scanning, so the class is always live.
+    // Opting out has to be enforced by the instance itself, not by DI registration.
+    foreach (var configuration in new[] { TvConfiguration(androidTvChannel: false), null })
+    {
+        var channel = new ScryerDiscoveryChannel(
+            new TokenSession(),
+            graphql,
+            LibraryManagerHarness.Create().Contract,
+            UserManagerHarness.Create(jellyfinUser).Contract,
+            time,
+            () => configuration);
+
+        Assert.False(channel.IsEnabledFor(userId));
+        Assert.Equal(0, channel.GetChannelFeatures().AutoRefreshLevels);
+
+        var forUser = await channel.GetChannelItems(new InternalChannelItemQuery { UserId = jellyfinUser.Id }, CancellationToken.None);
+        Assert.Equal(0, forUser.TotalRecordCount);
+        Assert.Equal(0, forUser.Items.Count);
+
+        var forTask = await channel.GetChannelItems(new InternalChannelItemQuery { UserId = Guid.Empty }, CancellationToken.None);
+        Assert.Equal(0, forTask.TotalRecordCount);
+        Assert.Equal(0, forTask.Items.Count);
+    }
+
+    // Discovery off must also disable the channel even when the channel flag is on.
+    var discoveryOff = TvConfiguration(androidTvChannel: true);
+    discoveryOff.EnableDiscovery = false;
+    var gated = new ScryerDiscoveryChannel(
+        new TokenSession(),
+        graphql,
+        LibraryManagerHarness.Create().Contract,
+        UserManagerHarness.Create(jellyfinUser).Contract,
+        time,
+        () => discoveryOff);
+    Assert.False(gated.IsEnabledFor(userId));
+    Assert.Equal(0, (await gated.GetChannelItems(new InternalChannelItemQuery { UserId = jellyfinUser.Id }, CancellationToken.None)).Items.Count);
+}
+
+static PluginConfiguration TvConfiguration(bool androidTvChannel)
+{
+    var configuration = ValidPluginConfiguration();
+    configuration.EnableDiscovery = true;
+    configuration.EnableAndroidTvChannel = androidTvChannel;
+    return configuration;
 }
 
 static async Task AndroidTvActionJournalAsync()
@@ -1698,10 +1765,17 @@ class LibraryManagerHarness : DispatchProxy
         return harness;
     }
 
-    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args) =>
-        targetMethod?.Name == "GetItemById" && args![0] is Guid id && _items.TryGetValue(id, out var item)
-            ? item
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+    {
+        if (targetMethod?.Name == "GetItemById" && args![0] is Guid id && _items.TryGetValue(id, out var item))
+        {
+            return item;
+        }
+
+        return targetMethod?.Name == "GetItemList"
+            ? Array.Empty<BaseItem>()
             : ProxyDefaults.Value(targetMethod?.ReturnType);
+    }
 }
 
 class SessionManagerHarness : DispatchProxy

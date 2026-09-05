@@ -50,6 +50,12 @@ public class PluginConfiguration : BasePluginConfiguration
 
     public bool EnableDownloads { get; set; } = true;
 
+    /// <summary>
+    /// Opt-in for the native Android TV discovery channel. It is off by default because
+    /// Jellyfin persists channel items into its own library database, one set of rows per user.
+    /// </summary>
+    public bool EnableAndroidTvChannel { get; set; }
+
     public ScryerDiagnosticVerbosity DiagnosticVerbosity { get; set; } = ScryerDiagnosticVerbosity.Basic;
 
     /// <summary>

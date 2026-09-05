@@ -74,6 +74,17 @@
                         <span>Enable downloads</span>
                     </label>
                 </div>
+                <div class="checkboxContainer">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="EnableAndroidTvChannel" />
+                        <span>Enable the Android TV discovery channel</span>
+                    </label>
+                    <div class="fieldDescription">
+                        Off by default. Jellyfin stores channel items in its own library database, once per
+                        Jellyfin user, and refreshes them on the daily Refresh Channels task. Enable it only if
+                        you want the Scryer Discovery tile under My Media on TV clients.
+                    </div>
+                </div>
                 <div class="inputContainer">
                     <label class="selectLabel" for="DiagnosticVerbosity">Diagnostic verbosity</label>
                     <select is="emby-select" id="DiagnosticVerbosity">
@@ -197,6 +208,7 @@
                     document.querySelector('#EnableRequests').checked = config.EnableRequests;
                     document.querySelector('#EnableCalendar').checked = config.EnableCalendar !== false;
                     document.querySelector('#EnableDownloads').checked = config.EnableDownloads !== false;
+                    document.querySelector('#EnableAndroidTvChannel').checked = config.EnableAndroidTvChannel === true;
                     document.querySelector('#DiagnosticVerbosity').value = String(config.DiagnosticVerbosity == null ? 1 : config.DiagnosticVerbosity);
                     setCallbackUri();
                     Dashboard.hideLoadingMsg();
@@ -221,6 +233,7 @@
                     config.EnableRequests = document.querySelector('#EnableRequests').checked;
                     config.EnableCalendar = document.querySelector('#EnableCalendar').checked;
                     config.EnableDownloads = document.querySelector('#EnableDownloads').checked;
+                    config.EnableAndroidTvChannel = document.querySelector('#EnableAndroidTvChannel').checked;
                     config.DiagnosticVerbosity = Number(document.querySelector('#DiagnosticVerbosity').value);
 
                     ApiClient.updatePluginConfiguration(ScryerConfig.pluginUniqueId, config).then(function (result) {

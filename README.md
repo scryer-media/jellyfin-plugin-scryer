@@ -164,15 +164,27 @@ Jellyfin login between people who need separate Scryer identities.
 
 ## Android TV discovery
 
-The unmodified Jellyfin Android TV client exposes **Scryer Discovery** as a channel tile
-under **My Media**. Android TV users must first link the same Jellyfin user to Scryer by
-following **Connect a user** in Jellyfin Web; the television does not run a separate OAuth
-flow.
+The Android TV discovery channel is **off by default**. Turn it on with **Enable the
+Android TV discovery channel** on the plugin configuration page; it also requires
+**Enable discovery**.
+
+It is opt-in because a Jellyfin channel is not a live view. Jellyfin persists every
+channel item it fetches as a row in its own library database, separately for each Jellyfin
+user, and re-fetches them from the daily **Refresh Channels** scheduled task. On a server
+with many users this creates a correspondingly large number of rows, and turning the
+channel back off does not remove rows Jellyfin has already stored.
+
+Once enabled, the unmodified Jellyfin Android TV client exposes **Scryer Discovery** as a
+channel tile under **My Media**. Android TV users must first link the same Jellyfin user to
+Scryer by following **Connect a user** in Jellyfin Web; the television does not run a
+separate OAuth flow.
 
 Open the channel to browse up to five **More like...** rails derived from that Jellyfin
 user's recent watch history, followed by their available Scryer discovery sections.
-Titles intentionally appear as non-playable series-style detail stubs, including movies,
-so the stock client does not offer a broken Play action for media that is not yet present.
+Titles intentionally appear as non-playable container folders, including movies, so the
+stock client does not offer a broken Play action for media that is not yet present and
+Jellyfin does not store them as real Series entries or run external metadata lookups
+against their names.
 
 Use the standard Favorite heart on a title to send it to Scryer:
 
@@ -184,8 +196,10 @@ Use the standard Favorite heart on a title to send it to Scryer:
   cancel anything in Scryer; it only permits a later retry.
 
 The action always uses `MONITORED`. Jellyfin displays a native success or failure message
-on the active user's clients. Scryer AVIF posters are passed through unchanged; Android TV
-versions and devices below API 31 are not supported and may show Jellyfin placeholders.
+on the active user's clients. Posters are only handed to Jellyfin when the poster URL names
+a format the server can decode (JPEG, PNG, or WebP); Scryer's AVIF posters are omitted
+entirely, because Jellyfin downloads and decodes channel images server-side with Skia,
+which cannot read AVIF. Titles therefore show the client's own placeholder artwork.
 
 ## Permissions and feature flags
 

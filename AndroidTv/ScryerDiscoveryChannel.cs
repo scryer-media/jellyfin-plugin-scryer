@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Enums;
+using Jellyfin.Plugin.Scryer.Configuration;
 using Jellyfin.Plugin.Scryer.OAuth;
 using Jellyfin.Plugin.Scryer.Services;
 using MediaBrowser.Controller.Channels;
@@ -31,9 +32,22 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
 {
     internal const string TargetProviderId = "ScryerTarget";
     internal const string KindProviderId = "ScryerKind";
-    internal const string DataSchemaVersion = "android-tv-v1";
+    internal const string DataSchemaVersion = "android-tv-v2";
     private const int MaximumRecentItems = 25;
     private const int MaximumPageSize = 100;
+
+    /// <summary>
+    /// Jellyfin downloads a channel item's ImageUrl and decodes it server-side with Skia, which
+    /// cannot read AVIF. Scryer serves AVIF posters, so a poster is only offered when its URL
+    /// names a format the server can actually decode; otherwise no image is set at all and the
+    /// client falls back to its own placeholder rather than persisting an undecodable file.
+    /// </summary>
+    private static readonly HashSet<string> ServerDecodableImageExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".jpg", ".jpeg", ".png", ".webp"
+    };
+
+    private readonly Func<PluginConfiguration?> _configuration;
     private readonly IScryerUserSessionService _sessions;
     private readonly IScryerGraphqlService _scryer;
     private readonly ILibraryManager _libraryManager;
@@ -45,7 +59,7 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         IScryerGraphqlService scryer,
         ILibraryManager libraryManager,
         IUserManager userManager)
-        : this(sessions, scryer, libraryManager, userManager, TimeProvider.System)
+        : this(sessions, scryer, libraryManager, userManager, TimeProvider.System, static () => Plugin.Instance?.Configuration)
     {
     }
 
@@ -54,8 +68,10 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         IScryerGraphqlService scryer,
         ILibraryManager libraryManager,
         IUserManager userManager,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        Func<PluginConfiguration?>? configuration = null)
     {
+        _configuration = configuration ?? (static () => Plugin.Instance?.Configuration);
         _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
         _scryer = scryer ?? throw new ArgumentNullException(nameof(scryer));
         _libraryManager = libraryManager ?? throw new ArgumentNullException(nameof(libraryManager));
@@ -74,22 +90,40 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         MediaTypes = new List<ChannelMediaType> { ChannelMediaType.Video },
         ContentTypes = new List<ChannelMediaContentType> { ChannelMediaContentType.Movie },
         MaxPageSize = MaximumPageSize,
-        AutoRefreshLevels = 2,
+        // Jellyfin discovers IChannel implementations by type scanning, so this class is always
+        // constructed. When the administrator has not opted in it must therefore ask Jellyfin for
+        // no automatic recursion at all, on top of returning nothing from GetChannelItems.
+        AutoRefreshLevels = IsChannelEnabled() ? 2 : 0,
         SupportsContentDownloading = false,
         SupportsSortOrderToggle = false
     };
 
-    public bool IsEnabledFor(string userId) => Plugin.Instance?.Configuration.EnableDiscovery == true;
+    public bool IsEnabledFor(string userId) => IsChannelEnabled();
 
     public string? GetCacheKey(string? userId)
     {
-        var hour = _timeProvider.GetUtcNow().ToUnixTimeSeconds() / 3600;
-        return $"{DataSchemaVersion}:{hour}:{StableHash(userId)}";
+        // Daily, not hourly: every key change makes Jellyfin refetch the channel and upsert its
+        // items into the server's own library database for each user.
+        var day = _timeProvider.GetUtcNow().ToUnixTimeSeconds() / 86400;
+        return $"{DataSchemaVersion}:{day}:{StableHash(userId)}";
+    }
+
+    private bool IsChannelEnabled()
+    {
+        var configuration = _configuration();
+        return configuration is { EnableDiscovery: true, EnableAndroidTvChannel: true };
     }
 
     public async Task<ChannelItemResult> GetChannelItems(InternalChannelItemQuery query, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(query);
+        // The daily "Refresh Channels" task calls this with Guid.Empty. There is no Scryer identity
+        // for that caller, so returning stubs would persist rows nobody asked for.
+        if (!IsChannelEnabled() || query.UserId == Guid.Empty || _userManager.GetUserById(query.UserId) is null)
+        {
+            return Empty();
+        }
+
         var jellyfinUserId = query.UserId.ToString("N");
         var status = await _sessions.GetGrantStatusAsync(jellyfinUserId, cancellationToken).ConfigureAwait(false);
         if (!status.IsSuccess || status.Value is null || !status.Value.Connected || !status.Value.AccountLinked)
@@ -255,7 +289,9 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
             Overview = item.Overview,
             ProductionYear = item.Year,
             Type = ChannelItemType.Folder,
-            FolderType = ChannelFolderType.Series,
+            // Container, not Series: a Series-typed channel folder becomes a real Series row in the
+            // Jellyfin library database and gets an external metadata refresh queued against it.
+            FolderType = ChannelFolderType.Container,
             MediaType = ChannelMediaType.Video,
             ContentType = ChannelMediaContentType.Movie,
             DateModified = CurrentHourUtc(),
@@ -266,7 +302,7 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
                 [KindProviderId] = item.TargetKind
             }
         };
-        if (!string.IsNullOrWhiteSpace(item.PosterUrl))
+        if (IsServerDecodableImage(item.PosterUrl))
         {
             result.ImageUrl = item.PosterUrl;
         }
@@ -280,7 +316,9 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         Name = name,
         Overview = overview,
         Type = ChannelItemType.Folder,
-        FolderType = ChannelFolderType.Series,
+        // Never Series: Jellyfin persists a Series-typed channel folder as a real Series row and
+        // queues a metadata refresh, so TVDB/TMDB would be searched for this stub's title.
+        FolderType = ChannelFolderType.Container,
         MediaType = ChannelMediaType.Video,
         DateModified = CurrentHourUtc(),
         Etag = StableHash(key)
@@ -291,6 +329,17 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         var now = _timeProvider.GetUtcNow().UtcDateTime;
         return new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, DateTimeKind.Utc);
     }
+
+    private static bool IsServerDecodableImage(string? posterUrl) =>
+        !string.IsNullOrWhiteSpace(posterUrl) &&
+        Uri.TryCreate(posterUrl, UriKind.Absolute, out var parsed) &&
+        ServerDecodableImageExtensions.Contains(Path.GetExtension(parsed.AbsolutePath));
+
+    private static ChannelItemResult Empty() => new()
+    {
+        Items = Array.Empty<ChannelItemInfo>(),
+        TotalRecordCount = 0
+    };
 
     private static ChannelItemResult Page(InternalChannelItemQuery query, IReadOnlyList<ChannelItemInfo> all)
     {
