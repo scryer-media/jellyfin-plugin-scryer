@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/scryer-media/jellyfin-plugin-scryer/main/artwork/scryer-plugin.png",
     "versions": [
       {
+        "version": "0.1.15.0",
+        "changelog": "",
+        "targetAbi": "10.11.0.0",
+        "sourceUrl": "https://github.com/scryer-media/jellyfin-plugin-scryer/releases/download/v0.1.15.0/Jellyfin.Plugin.Scryer_0.1.15.0.zip",
+        "checksum": "53e61e4d3bb3d4581f17db06b51c5d65",
+        "timestamp": "2026-09-05T15:20:23Z"
+      },
+      {
         "version": "0.1.14.0",
         "changelog": "Adds a native Android TV discovery channel with Favorite-to-add/request actions, batches watch-history recommendation lookups into one GraphQL request, and documents Scryer's built-in Jellyfin OAuth setup.",
         "targetAbi": "10.11.0.0",
