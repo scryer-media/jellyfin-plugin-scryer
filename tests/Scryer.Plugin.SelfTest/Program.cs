@@ -32,6 +32,7 @@ using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 
 var tests = new (string Name, Func<Task> Run)[]
@@ -56,6 +57,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Android TV default actions prefer direct add and support request-only users", AndroidTvActionsAsync),
     ("Android TV channel uses isolated stable IDs, daily cache keys, and container stubs", AndroidTvChannelAsync),
     ("the Android TV channel is inert until the administrator opts in", AndroidTvChannelDisabledAsync),
+    ("channel cleanup retracts the rows 0.1.14.0 wrote and spares the channel entity", AndroidTvChannelCleanupAsync),
     ("Android TV action journal is durable, bounded, and isolated by Jellyfin user", AndroidTvActionJournalAsync),
     ("Android TV favorite worker retains success, rolls back failure, and suppresses duplicates", AndroidTvFavoriteWorkerAsync),
     ("detached revoke journal survives restart discovery, promotion, and cleanup", DetachedRevokeJournalAsync),
@@ -672,6 +674,114 @@ static async Task AndroidTvChannelDisabledAsync()
     Assert.False(gated.IsEnabledFor(userId));
     Assert.Equal(0, (await gated.GetChannelItems(new InternalChannelItemQuery { UserId = jellyfinUser.Id }, CancellationToken.None)).Items.Count);
 }
+
+static async Task AndroidTvChannelCleanupAsync()
+{
+    var channelId = Guid.ParseExact("aaaaaaaabbbbccccddddeeeeeeeeeeee", "N");
+    var legacyRail = Guid.ParseExact("11111111111111111111111111111101", "N");
+    var legacyStub = Guid.ParseExact("11111111111111111111111111111102", "N");
+    var currentRail = Guid.ParseExact("11111111111111111111111111111103", "N");
+    var currentTitle = Guid.ParseExact("11111111111111111111111111111104", "N");
+    var foreignRow = Guid.ParseExact("11111111111111111111111111111105", "N");
+
+    // Disabled: every persisted row goes, the Channel entity Jellyfin owns stays.
+    var disabledHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, foreignRow);
+    var disabled = new ScryerChannelCleanupService(
+        disabledHarness.Contract,
+        NullLogger<ScryerChannelCleanupService>.Instance,
+        () => TvConfiguration(androidTvChannel: false));
+    var swept = await disabled.SweepAsync(CancellationToken.None);
+    Assert.Equal(channelId, swept.ChannelId);
+    Assert.Equal(4, swept.Found);
+    Assert.Equal(4, swept.Deleted);
+    Assert.Equal(0, swept.Failed);
+    Assert.True(disabledHarness.Deleted.OrderBy(id => id).SequenceEqual(
+        new[] { legacyRail, legacyStub, currentRail, currentTitle }.OrderBy(id => id)));
+    Assert.False(disabledHarness.Deleted.Contains(channelId));
+    Assert.False(disabledHarness.Deleted.Contains(foreignRow));
+    Assert.True(disabledHarness.Remaining.Any(item => item.Id == channelId && item is Channel));
+    // The channel owns no files, and Scryer is never asked to delete anything.
+    Assert.True(disabledHarness.DeleteOptionsUsed.All(options => !options.DeleteFileLocation && !options.DeleteFromExternalProvider));
+    // Jellyfin's own channel id derivation, verbatim.
+    Assert.Equal(("Channel Scryer Discovery", typeof(Channel)), disabledHarness.NewItemIdKeys[0]);
+    Assert.True(disabledHarness.Queries[0].Recursive);
+    Assert.True(disabledHarness.Queries[0].ChannelIds.SequenceEqual(new[] { channelId }));
+
+    // Idempotent: a second sweep finds nothing and deletes nothing.
+    var repeated = await disabled.SweepAsync(CancellationToken.None);
+    Assert.Equal(0, repeated.Found);
+    Assert.Equal(0, repeated.Deleted);
+    Assert.Equal(4, disabledHarness.Deleted.Count);
+
+    // Enabled: only the Series rows 0.1.14.0 wrote go; container rows keep their favourites.
+    var enabledHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, foreignRow);
+    var enabled = new ScryerChannelCleanupService(
+        enabledHarness.Contract,
+        NullLogger<ScryerChannelCleanupService>.Instance,
+        () => TvConfiguration(androidTvChannel: true));
+    var legacyOnly = await enabled.SweepAsync(CancellationToken.None);
+    Assert.Equal(2, legacyOnly.Found);
+    Assert.Equal(2, legacyOnly.Deleted);
+    Assert.Equal(0, legacyOnly.Failed);
+    Assert.True(enabledHarness.Deleted.OrderBy(id => id).SequenceEqual(new[] { legacyRail, legacyStub }.OrderBy(id => id)));
+    Assert.True(enabledHarness.Remaining.Any(item => item.Id == currentRail));
+    Assert.True(enabledHarness.Remaining.Any(item => item.Id == currentTitle));
+
+    // One unremovable row is counted and never aborts the sweep.
+    var failingHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, foreignRow);
+    failingHarness.ThrowOnDelete.Add(currentRail);
+    var failing = new ScryerChannelCleanupService(
+        failingHarness.Contract,
+        NullLogger<ScryerChannelCleanupService>.Instance,
+        () => TvConfiguration(androidTvChannel: false));
+    var partial = await failing.SweepAsync(CancellationToken.None);
+    Assert.Equal(4, partial.Found);
+    Assert.Equal(3, partial.Deleted);
+    Assert.Equal(1, partial.Failed);
+    Assert.True(failingHarness.Deleted.OrderBy(id => id).SequenceEqual(
+        new[] { legacyRail, legacyStub, currentTitle }.OrderBy(id => id)));
+    Assert.True(failingHarness.Remaining.Any(item => item.Id == currentRail));
+
+    // Startup runs the sweep off StartAsync and never lets it escape.
+    var startupHarness = CleanupHarness(channelId, legacyRail, legacyStub, currentRail, currentTitle, foreignRow);
+    var startup = new ScryerChannelCleanupService(
+        startupHarness.Contract,
+        NullLogger<ScryerChannelCleanupService>.Instance,
+        () => TvConfiguration(androidTvChannel: false));
+    await startup.StartAsync(CancellationToken.None);
+    await WaitUntilAsync(() => startupHarness.Deleted.Count == 4);
+
+    // Saving the configuration sweeps again, off the administrator's request thread.
+    var reappeared = Guid.ParseExact("11111111111111111111111111111106", "N");
+    startupHarness.Add(new Series { Id = reappeared, ChannelId = channelId, Name = "Re-fetched rail" });
+    startup.OnConfigurationSaved();
+    await WaitUntilAsync(() => startupHarness.Deleted.Contains(reappeared));
+
+    await startup.StopAsync(CancellationToken.None);
+    Assert.Equal(5, startupHarness.Deleted.Count);
+
+    var services = new ServiceCollection();
+    new PluginServiceRegistrator().RegisterServices(services, InterfaceProxy.Create<IServerApplicationHost>());
+    Assert.True(services.Any(descriptor =>
+        descriptor.ServiceType == typeof(IHostedService) &&
+        descriptor.ImplementationType == typeof(ScryerChannelCleanupService)));
+}
+
+static ChannelLibraryHarness CleanupHarness(
+    Guid channelId,
+    Guid legacyRail,
+    Guid legacyStub,
+    Guid currentRail,
+    Guid currentTitle,
+    Guid foreignRow) =>
+    ChannelLibraryHarness.Create(
+        channelId,
+        new Channel { Id = channelId, ChannelId = channelId, Name = ScryerDiscoveryChannel.ChannelName },
+        new Series { Id = legacyRail, ChannelId = channelId, Name = "More like Dune" },
+        new Series { Id = legacyStub, ChannelId = channelId, Name = "Connect Scryer in Jellyfin Web" },
+        new Folder { Id = currentRail, ChannelId = channelId, Name = "For You" },
+        new Folder { Id = currentTitle, ChannelId = channelId, Name = "Arrival" },
+        new Series { Id = foreignRow, ChannelId = Guid.ParseExact("99999999999999999999999999999999", "N"), Name = "Another channel" });
 
 static PluginConfiguration TvConfiguration(bool androidTvChannel)
 {
@@ -1795,6 +1905,64 @@ class LibraryManagerHarness : DispatchProxy
         return targetMethod?.Name == "GetItemList"
             ? Array.Empty<BaseItem>()
             : ProxyDefaults.Value(targetMethod?.ReturnType);
+    }
+}
+
+/// <summary>Recording ILibraryManager for the channel cleanup sweep.</summary>
+class ChannelLibraryHarness : DispatchProxy
+{
+    private readonly List<BaseItem> _items = new();
+    private Guid _channelId;
+    public ILibraryManager Contract { get; private set; } = null!;
+    public List<Guid> Deleted { get; } = new();
+    public List<DeleteOptions> DeleteOptionsUsed { get; } = new();
+    public List<InternalItemsQuery> Queries { get; } = new();
+    public List<(string Key, Type Type)> NewItemIdKeys { get; } = new();
+    public HashSet<Guid> ThrowOnDelete { get; } = new();
+    public IReadOnlyList<BaseItem> Remaining => _items;
+
+    public void Add(BaseItem item) => _items.Add(item);
+
+    public static ChannelLibraryHarness Create(Guid channelId, params BaseItem[] items)
+    {
+        var contract = DispatchProxy.Create<ILibraryManager, ChannelLibraryHarness>();
+        var harness = (ChannelLibraryHarness)(object)contract;
+        harness.Contract = contract;
+        harness._channelId = channelId;
+        harness._items.AddRange(items);
+        return harness;
+    }
+
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+    {
+        switch (targetMethod?.Name)
+        {
+            case "GetNewItemId":
+                var key = (string)args![0]!;
+                var type = (Type)args[1]!;
+                NewItemIdKeys.Add((key, type));
+                // Only Jellyfin's exact derivation resolves to the channel this harness holds.
+                return string.Equals(key, "Channel " + ScryerDiscoveryChannel.ChannelName, StringComparison.Ordinal) && type == typeof(Channel)
+                    ? _channelId
+                    : Guid.NewGuid();
+            case "GetItemList":
+                var query = (InternalItemsQuery)args![0]!;
+                Queries.Add(query);
+                return _items.Where(item => query.ChannelIds.Contains(item.ChannelId)).ToArray();
+            case "DeleteItem":
+                var item = (BaseItem)args![0]!;
+                if (ThrowOnDelete.Contains(item.Id))
+                {
+                    throw new InvalidOperationException("test delete failure");
+                }
+
+                DeleteOptionsUsed.Add((DeleteOptions)args[1]!);
+                Deleted.Add(item.Id);
+                _items.RemoveAll(existing => existing.Id == item.Id);
+                return null;
+            default:
+                return ProxyDefaults.Value(targetMethod?.ReturnType);
+        }
     }
 }
 

@@ -29,6 +29,9 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<IScryerGraphqlService, ScryerGraphqlService>();
         serviceCollection.AddSingleton<ScryerDiscoveryChannel>();
         serviceCollection.AddSingleton<MediaBrowser.Controller.Channels.IChannel>(provider => provider.GetRequiredService<ScryerDiscoveryChannel>());
+        // 0.1.14.0 shipped the channel on, so Jellyfin persisted its items into the server's own
+        // library database. Disabling the channel does not retract those rows; this sweep does.
+        serviceCollection.AddSingleton<IHostedService, ScryerChannelCleanupService>();
         serviceCollection.AddSingleton<IScryerTvActionJournal, ScryerTvActionJournal>();
         serviceCollection.AddSingleton<IHostedService, ScryerTvFavoriteService>();
         serviceCollection.AddSingleton<ScryerOAuthFlowStore>();

@@ -30,6 +30,11 @@ namespace Jellyfin.Plugin.Scryer.AndroidTv;
 /// </summary>
 public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
 {
+    /// <summary>
+    /// The channel's Jellyfin-facing name. Jellyfin derives the internal channel id from it
+    /// ("Channel " + name), so cleanup has to use the exact same value.
+    /// </summary>
+    internal const string ChannelName = "Scryer Discovery";
     internal const string TargetProviderId = "ScryerTarget";
     internal const string KindProviderId = "ScryerKind";
     internal const string DataSchemaVersion = "android-tv-v2";
@@ -68,7 +73,7 @@ public sealed class ScryerDiscoveryChannel : IChannel, IHasCacheKey
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
     }
 
-    public string Name => "Scryer Discovery";
+    public string Name => ChannelName;
     public string Description => "Personalized discovery and recommendations from Scryer.";
     public string DataVersion => DataSchemaVersion;
     public string HomePageUrl => string.Empty;
