@@ -792,6 +792,10 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
 
     private static bool TryReadTvActionDetail(JsonElement value, string expectedTargetKey, string expectedFacet, out ScryerTvActionDetail detail)
     {
+        // Only the identity of the item is checked strictly: it must be the item that was asked
+        // about, of the facet the row was published under, with a title. Everything else is read
+        // as well as it can be, because Scryer knows far more ids for a title than this action
+        // needs and one it cannot read must not stop the add or request.
         detail = default!;
         if (value.ValueKind != JsonValueKind.Object ||
             !TryReadBoundedString(value, "targetKey", out var targetKey) ||
@@ -800,20 +804,20 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             !string.Equals(NormalizeFacet(targetKind), expectedFacet, StringComparison.Ordinal) ||
             !TryReadBoundedString(value, "displayTitle", out var title) ||
             !value.TryGetProperty("externalIds", out var externalIds) ||
-            externalIds.ValueKind != JsonValueKind.Array || externalIds.GetArrayLength() is < 1 or > 16)
+            externalIds.ValueKind != JsonValueKind.Array)
         {
             return false;
         }
 
         var ids = new List<ScryerTvExternalId>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var externalId in externalIds.EnumerateArray())
+        foreach (var externalId in externalIds.EnumerateArray().Take(64))
         {
             if (externalId.ValueKind != JsonValueKind.Object ||
                 !TryReadBoundedString(externalId, "source", out var source) || source.Length > 64 ||
                 !TryReadBoundedString(externalId, "id", out var id))
             {
-                return false;
+                continue;
             }
 
             source = source.ToLowerInvariant();
@@ -823,24 +827,31 @@ public sealed class ScryerGraphqlService : IScryerGraphqlService
             }
         }
 
-        int? year = null;
-        if (value.TryGetProperty("year", out var yearElement) && yearElement.ValueKind != JsonValueKind.Null)
+        if (ids.Count == 0)
         {
-            if (yearElement.ValueKind != JsonValueKind.Number || !yearElement.TryGetInt32(out var parsedYear) || parsedYear is < 1800 or > 2100)
-            {
-                return false;
-            }
+            return false;
+        }
 
+        int? year = null;
+        if (value.TryGetProperty("year", out var yearElement) &&
+            yearElement.ValueKind == JsonValueKind.Number &&
+            yearElement.TryGetInt32(out var parsedYear) &&
+            parsedYear is >= 1800 and <= 2100)
+        {
             year = parsedYear;
         }
 
         string? overview = null;
-        if (value.TryGetProperty("overview", out var overviewElement) && overviewElement.ValueKind != JsonValueKind.Null)
+        if (value.TryGetProperty("overview", out var overviewElement) && overviewElement.ValueKind == JsonValueKind.String)
         {
-            overview = overviewElement.ValueKind == JsonValueKind.String ? overviewElement.GetString()?.Trim() : null;
-            if (overview is null || overview.Length > 8192)
+            overview = overviewElement.GetString()?.Trim();
+            if (string.IsNullOrEmpty(overview))
             {
-                return false;
+                overview = null;
+            }
+            else if (overview.Length > 8192)
+            {
+                overview = overview[..8192];
             }
         }
 
