@@ -69,6 +69,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("library-only grants activate anonymously without linking", AnonymousActivationAsync),
     ("encrypted token store isolates two Jellyfin users", TokenStoreUserIsolationAsync),
     ("version 2 grants migrate to version 3 with linked scope", TokenStoreVersionMigrationAsync),
+    ("the plugin key ring persists grants across a restart", PersistedKeyRingSurvivesRestartAsync),
+    ("an undecryptable grant is quarantined, never deleted", UndecryptableGrantIsQuarantinedAsync),
     ("per-user refresh is single-flight and persists rotation before lease publication", SingleFlightRefreshAsync),
     ("refresh preserves the grant's exact scope", RefreshScopePreservationAsync),
     ("failed rotated-token persistence quarantines the issued family without releasing a lease", FailedRefreshPersistenceAsync),
@@ -725,17 +727,13 @@ static async Task DetachedRevokeJournalAsync()
     var dataPath = Path.Combine(Path.GetTempPath(), "scryer-plugin-selftest-" + Guid.NewGuid().ToString("N"));
     try
     {
-        var store = new ScryerTokenStore(
-            DataProtectionProvider.Create(new DirectoryInfo(dataPath), builder => builder.SetApplicationName("Scryer.Plugin.SelfTest")),
-            ApplicationPathsProxy.Create(dataPath));
+        var store = TokenStore(dataPath);
         var grant = PendingRevoke(jellyfinUserId, "detached-refresh");
         Assert.True(await store.QuarantineDetachedAsync(grant, CancellationToken.None));
 
         var grantsPath = Path.Combine(dataPath, "plugins", "scryer", "oauth-grants");
         Assert.Equal(1, Directory.GetFiles(grantsPath, "*.revoke.dat.next").Length);
-        var restartedStore = new ScryerTokenStore(
-            DataProtectionProvider.Create(new DirectoryInfo(dataPath), builder => builder.SetApplicationName("Scryer.Plugin.SelfTest")),
-            ApplicationPathsProxy.Create(dataPath));
+        var restartedStore = TokenStore(dataPath);
         var pendingUsers = await restartedStore.GetPendingUserIdsAsync(4, null, CancellationToken.None);
         Assert.Equal(jellyfinUserId, pendingUsers.Single());
         var discovered = await restartedStore.ReadDetachedQuarantinesAsync(jellyfinUserId, CancellationToken.None);
@@ -848,7 +846,7 @@ static async Task DisconnectCorruptDetachedRecordAsync()
     try
     {
         var configuration = ValidOAuthConfiguration();
-        var store = new ScryerTokenStore(DataProtectionProvider.Create(dataPath), ApplicationPathsProxy.Create(dataPath));
+        var store = TokenStore(dataPath);
         Assert.True(await store.SaveAsync(ActiveGrant(jellyfinUserId, configuration, "current-refresh"), CancellationToken.None));
         var grantsPath = Path.Combine(dataPath, "plugins", "scryer", "oauth-grants");
         var corruptJournalPath = Path.Combine(grantsPath, "corrupt.revoke.dat.next");
@@ -892,7 +890,7 @@ static async Task OAuthFlowBindingAsync()
             new ScryerOAuthMetadataClient(handler),
             session,
             new ScryerOAuthFlowStore(),
-            DataProtectionProvider.Create(dataPath));
+            ScryerDataProtection.Create(dataPath));
 
         var first = await flow.StartAsync("user-a", "#/scryer-calendar", CancellationToken.None);
         var second = await flow.StartAsync("user-b", null, CancellationToken.None);
@@ -960,7 +958,7 @@ static async Task OAuthFlowExpiryAndCallbackHandlingAsync()
                 : JsonResponse(TokenJson("library jellyfin-link")))),
             session,
             new ScryerOAuthFlowStore(clock),
-            DataProtectionProvider.Create(dataPath));
+            ScryerDataProtection.Create(dataPath));
 
         var expired = await flow.StartAsync("expired-user", null, CancellationToken.None);
         Assert.True(expired.IsSuccess);
@@ -1126,7 +1124,7 @@ static async Task TokenStoreUserIsolationAsync()
     try
     {
         var configuration = ValidOAuthConfiguration();
-        var store = new ScryerTokenStore(DataProtectionProvider.Create(dataPath), ApplicationPathsProxy.Create(dataPath));
+        var store = TokenStore(dataPath);
         var first = ActiveGrant(firstUserId, configuration, "first-refresh");
         var second = ActiveGrant(secondUserId, configuration, "second-refresh", ScryerOAuthScopes.Library);
         Assert.True(await store.SaveAsync(first, CancellationToken.None));
@@ -1156,7 +1154,7 @@ static async Task TokenStoreVersionMigrationAsync()
     try
     {
         var configuration = ValidOAuthConfiguration();
-        var provider = DataProtectionProvider.Create(dataPath);
+        var provider = ScryerDataProtection.Create(dataPath);
         var protector = provider.CreateProtector("Jellyfin.Plugin.Scryer", "OAuthRefreshGrant", "v1");
         var directory = Path.Combine(dataPath, "plugins", "scryer", "oauth-grants");
         Directory.CreateDirectory(directory);
@@ -1177,7 +1175,7 @@ static async Task TokenStoreVersionMigrationAsync()
         });
         await File.WriteAllBytesAsync(path, protector.Protect(Encoding.UTF8.GetBytes(versionTwo)));
 
-        var store = new ScryerTokenStore(provider, ApplicationPathsProxy.Create(dataPath));
+        var store = new ScryerTokenStore(provider, ApplicationPathsProxy.Create(dataPath), NullLogger<ScryerTokenStore>.Instance);
         var read = await store.ReadCurrentAsync(jellyfinUserId, CancellationToken.None);
         Assert.Equal(ScryerGrantReadState.Found, read.State);
         Assert.Equal(ScryerOAuthScopes.Linked, read.Grant!.GrantedScope);
@@ -1190,6 +1188,62 @@ static async Task TokenStoreVersionMigrationAsync()
     finally
     {
         if (Directory.Exists(dataPath)) Directory.Delete(dataPath, recursive: true);
+    }
+}
+
+static async Task PersistedKeyRingSurvivesRestartAsync()
+{
+    const string jellyfinUserId = "0123456789abcdef0123456789abcdef";
+    var dataPath = Path.Combine(Path.GetTempPath(), "scryer-plugin-selftest-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var configuration = ValidOAuthConfiguration();
+        // Two independently constructed stores stand in for two server processes over one data path.
+        var store = TokenStore(dataPath);
+        Assert.True(await store.SaveAsync(ActiveGrant(jellyfinUserId, configuration, "persisted-refresh"), CancellationToken.None));
+
+        var restarted = TokenStore(dataPath);
+        var read = await restarted.ReadCurrentAsync(jellyfinUserId, CancellationToken.None);
+        Assert.Equal(ScryerGrantReadState.Found, read.State);
+        Assert.Equal("persisted-refresh", read.Grant!.RefreshToken);
+        Assert.Equal(ScryerGrantLinkState.Active, read.Grant.LinkState);
+
+        Assert.True(Directory.Exists(ScryerDataProtection.GetKeyRingDirectory(dataPath)));
+        Assert.True(Directory.GetFiles(ScryerDataProtection.GetKeyRingDirectory(dataPath), "*.xml").Length > 0);
+    }
+    finally
+    {
+        if (Directory.Exists(dataPath)) Directory.Delete(dataPath, recursive: true);
+    }
+}
+
+static async Task UndecryptableGrantIsQuarantinedAsync()
+{
+    const string jellyfinUserId = "0123456789abcdef0123456789abcdef";
+    var dataPath = Path.Combine(Path.GetTempPath(), "scryer-plugin-selftest-" + Guid.NewGuid().ToString("N"));
+    var foreignKeyPath = Path.Combine(Path.GetTempPath(), "scryer-plugin-selftest-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var configuration = ValidOAuthConfiguration();
+        Assert.True(await TokenStore(dataPath).SaveAsync(
+            ActiveGrant(jellyfinUserId, configuration, "orphaned-refresh"), CancellationToken.None));
+
+        var grantsPath = Path.Combine(dataPath, "plugins", "scryer", "oauth-grants");
+        Assert.Equal(1, Directory.GetFiles(grantsPath, "*.dat").Length);
+
+        // A different key ring is exactly what an ephemeral provider looks like after a restart.
+        var stranded = TokenStore(dataPath, foreignKeyPath);
+        var read = await stranded.ReadCurrentAsync(jellyfinUserId, CancellationToken.None);
+        Assert.Equal(ScryerGrantReadState.Corrupt, read.State);
+        Assert.True(read.Grant is null);
+
+        Assert.Equal(0, Directory.GetFiles(grantsPath, "*.dat").Length);
+        Assert.Equal(1, Directory.GetFiles(grantsPath, "*.undecryptable-*").Length);
+    }
+    finally
+    {
+        if (Directory.Exists(dataPath)) Directory.Delete(dataPath, recursive: true);
+        if (Directory.Exists(foreignKeyPath)) Directory.Delete(foreignKeyPath, recursive: true);
     }
 }
 
@@ -1342,6 +1396,16 @@ static ScryerRefreshGrant ActiveGrant(
 
 static ScryerRefreshGrant PendingRevoke(string jellyfinUserId, string refreshToken) =>
     new(new ScryerGrantKey(jellyfinUserId, "https://scryer.example.test", "jellyfin-plugin"), refreshToken, DateTimeOffset.UtcNow, ScryerGrantLinkState.PendingRevoke);
+
+/// <summary>
+/// Builds a store over the production key-ring factory so the tests exercise the persisted
+/// provider the server uses, not a locally constructed one. Pass a separate keyPath to simulate a
+/// key ring that no longer matches the stored grants.
+/// </summary>
+static ScryerTokenStore TokenStore(string dataPath, string? keyPath = null) => new(
+    ScryerDataProtection.Create(keyPath ?? dataPath),
+    ApplicationPathsProxy.Create(dataPath),
+    NullLogger<ScryerTokenStore>.Instance);
 
 static ScryerUserSessionService SessionService(ScryerOAuthConfiguration configuration, IScryerTokenStore store, HttpMessageHandler handler) =>
     new(new FixedConfigurationProvider(configuration), new ScryerOAuthMetadataClient(handler), store, new NeverLinkService());

@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
@@ -9,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using MediaBrowser.Common.Configuration;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.Scryer.OAuth;
 
@@ -39,15 +41,24 @@ public sealed class ScryerTokenStore : IScryerTokenStore
     private const string PurposeRoot = "Jellyfin.Plugin.Scryer";
     private const string PurposeRecord = "OAuthRefreshGrant";
     private const string PurposeVersion = "v1";
+    private const string UndecryptableSuffix = ".undecryptable-";
+    private static int _keyRingWarningEmitted;
     private readonly IDataProtector _protector;
     private readonly string _directory;
+    private readonly ILogger _logger;
 
-    public ScryerTokenStore(IDataProtectionProvider dataProtectionProvider, IApplicationPaths applicationPaths)
+    /// <summary>
+    /// Takes the plugin-owned key ring explicitly. Jellyfin's injected provider is ephemeral in a
+    /// container deployment, so binding to it would silently drop every grant on restart.
+    /// </summary>
+    public ScryerTokenStore(ScryerDataProtection dataProtection, IApplicationPaths applicationPaths, ILogger<ScryerTokenStore> logger)
     {
-        ArgumentNullException.ThrowIfNull(dataProtectionProvider);
+        ArgumentNullException.ThrowIfNull(dataProtection);
         ArgumentNullException.ThrowIfNull(applicationPaths);
-        _protector = dataProtectionProvider.CreateProtector(PurposeRoot, PurposeRecord, PurposeVersion);
+        ArgumentNullException.ThrowIfNull(logger);
+        _protector = dataProtection.CreateProtector(PurposeRoot, PurposeRecord, PurposeVersion);
         _directory = Path.Combine(applicationPaths.DataPath, "plugins", "scryer", "oauth-grants");
+        _logger = logger;
     }
 
     public async Task<ScryerGrantReadResult> ReadAsync(ScryerGrantKey key, CancellationToken cancellationToken)
@@ -81,7 +92,7 @@ public sealed class ScryerTokenStore : IScryerTokenStore
             var protectedBytes = await ReadBoundedAsync(candidatePath, cancellationToken).ConfigureAwait(false);
             if (protectedBytes is null)
             {
-                return await CorruptResultAsync(path, hasJournal ? journalPath : null, cancellationToken).ConfigureAwait(false);
+                return await CorruptResultAsync(path, hasJournal ? journalPath : null, decryptionFailed: false, cancellationToken).ConfigureAwait(false);
             }
 
             var json = Encoding.UTF8.GetString(_protector.Unprotect(protectedBytes));
@@ -90,7 +101,7 @@ public sealed class ScryerTokenStore : IScryerTokenStore
                 !FixedTimeEquals(record.JellyfinUserId, jellyfinUserId) ||
                 !IsValidStoredAuthority(record.Authority) || string.IsNullOrWhiteSpace(record.ClientId))
             {
-                return await CorruptResultAsync(path, hasJournal ? journalPath : null, cancellationToken).ConfigureAwait(false);
+                return await CorruptResultAsync(path, hasJournal ? journalPath : null, decryptionFailed: false, cancellationToken).ConfigureAwait(false);
             }
 
             if (hasJournal)
@@ -110,13 +121,13 @@ public sealed class ScryerTokenStore : IScryerTokenStore
                 !Enum.TryParse<ScryerGrantLinkState>(record.LinkState, ignoreCase: false, out var linkState) ||
                 record.LinkIdempotencyKey is not null || record.LinkAttempts is < 0 or > 3)
             {
-                return await CorruptResultAsync(path, hasJournal ? journalPath : null, cancellationToken).ConfigureAwait(false);
+                return await CorruptResultAsync(path, hasJournal ? journalPath : null, decryptionFailed: false, cancellationToken).ConfigureAwait(false);
             }
 
             var grantedScope = record.Version == 2 ? ScryerOAuthScopes.Linked : record.GrantedScope;
             if (!ScryerOAuthScopes.TryNormalizeExact(grantedScope, out var normalizedScope))
             {
-                return await CorruptResultAsync(path, hasJournal ? journalPath : null, cancellationToken).ConfigureAwait(false);
+                return await CorruptResultAsync(path, hasJournal ? journalPath : null, decryptionFailed: false, cancellationToken).ConfigureAwait(false);
             }
 
             return new ScryerGrantReadResult(ScryerGrantReadState.Found,
@@ -124,11 +135,11 @@ public sealed class ScryerTokenStore : IScryerTokenStore
         }
         catch (CryptographicException)
         {
-            return await CorruptResultAsync(path, File.Exists(journalPath) ? journalPath : null, cancellationToken).ConfigureAwait(false);
+            return await CorruptResultAsync(path, File.Exists(journalPath) ? journalPath : null, decryptionFailed: true, cancellationToken).ConfigureAwait(false);
         }
         catch (JsonException)
         {
-            return await CorruptResultAsync(path, File.Exists(journalPath) ? journalPath : null, cancellationToken).ConfigureAwait(false);
+            return await CorruptResultAsync(path, File.Exists(journalPath) ? journalPath : null, decryptionFailed: false, cancellationToken).ConfigureAwait(false);
         }
         catch (IOException)
         {
@@ -631,12 +642,36 @@ public sealed class ScryerTokenStore : IScryerTokenStore
         return buffer.AsSpan(0, total).ToArray();
     }
 
-    private static async Task<ScryerGrantReadResult> CorruptResultAsync(string path, string? journalPath, CancellationToken cancellationToken)
+    /// <summary>
+    /// Retires an unusable record without destroying it. An undecryptable grant is almost always a
+    /// key-ring problem rather than real corruption, and the operator can still see that a grant
+    /// existed. The user is reported as unusable either way and must reconnect Scryer.
+    /// </summary>
+    private async Task<ScryerGrantReadResult> CorruptResultAsync(
+        string path,
+        string? journalPath,
+        bool decryptionFailed,
+        CancellationToken cancellationToken)
     {
-        DeleteOnce(path);
+        if (decryptionFailed)
+        {
+            if (Interlocked.Exchange(ref _keyRingWarningEmitted, 1) == 0)
+            {
+                _logger.LogWarning(
+                    "Scryer could not decrypt a stored OAuth grant with the plugin key ring. The affected Jellyfin users are disconnected and must reconnect Scryer in Jellyfin Web. Undecryptable records were renamed with a '{Suffix}' suffix rather than deleted.",
+                    UndecryptableSuffix);
+            }
+        }
+        else
+        {
+            _logger.LogWarning(
+                "A stored Scryer OAuth grant failed validation and was quarantined. The affected Jellyfin user must reconnect Scryer.");
+        }
+
+        QuarantineOnce(path);
         if (journalPath is not null)
         {
-            DeleteOnce(journalPath);
+            QuarantineOnce(journalPath);
         }
 
         var absent = await BothAbsentAsync(path, journalPath, cancellationToken).ConfigureAwait(false);
@@ -644,6 +679,32 @@ public sealed class ScryerTokenStore : IScryerTokenStore
             absent ? ScryerGrantReadState.Corrupt : ScryerGrantReadState.Unavailable,
             null,
             RequiresInvalidation: !absent);
+    }
+
+    private static void QuarantineOnce(string path)
+    {
+        var quarantinePath = path + UndecryptableSuffix +
+            DateTimeOffset.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
+        try
+        {
+            File.Move(path, quarantinePath, overwrite: true);
+        }
+        catch (FileNotFoundException)
+        {
+            // Nothing to retire.
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // Nothing to retire.
+        }
+        catch (IOException)
+        {
+            // A record that cannot be retired is treated as unusable on every subsequent read.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // A record that cannot be retired is treated as unusable on every subsequent read.
+        }
     }
 
     private static void DeleteOnce(string path)

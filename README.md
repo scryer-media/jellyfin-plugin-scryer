@@ -231,6 +231,20 @@ Do not restore a shared Scryer API key as a troubleshooting workaround. Do not e
 internal Scryer URL, Jellyfin administrator API key, OAuth grants, or plugin data directory
 to untrusted clients.
 
+### Encrypted grant storage
+
+Protected refresh grants live in `<jellyfin data>/plugins/scryer/oauth-grants`, and the
+encryption key ring that reads them lives in `<jellyfin data>/plugins/scryer/keys`. The
+plugin owns this key ring rather than using Jellyfin's own DataProtection provider,
+because that provider is ephemeral whenever the server runs without a writable user
+profile — the standard Docker deployment — which would silently disconnect every linked
+user on each restart.
+
+Back up both directories together and restore them together. If the key ring is lost or
+replaced, existing grants can no longer be decrypted: the plugin renames each affected
+record with an `.undecryptable-<timestamp>` suffix instead of deleting it, logs one
+warning, and every affected user must reconnect Scryer from Jellyfin Web.
+
 ## Theme compatibility
 
 `Web/scryer-styles.js` is an intentional compatibility layer, not a generated artifact.

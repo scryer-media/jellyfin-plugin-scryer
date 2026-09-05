@@ -52,14 +52,14 @@ public sealed class ScryerOAuthFlowService : IScryerOAuthFlowService
         ScryerOAuthMetadataClient metadataClient,
         IScryerUserSessionService sessionService,
         ScryerOAuthFlowStore flowStore,
-        IDataProtectionProvider dataProtectionProvider)
+        ScryerDataProtection dataProtection)
     {
         _configurationProvider = configurationProvider ?? throw new ArgumentNullException(nameof(configurationProvider));
         _metadataClient = metadataClient ?? throw new ArgumentNullException(nameof(metadataClient));
         _sessionService = sessionService ?? throw new ArgumentNullException(nameof(sessionService));
         _flowStore = flowStore ?? throw new ArgumentNullException(nameof(flowStore));
-        ArgumentNullException.ThrowIfNull(dataProtectionProvider);
-        _cookieProtector = dataProtectionProvider.CreateProtector("Jellyfin.Plugin.Scryer", "OAuthFlowCookie", "v1");
+        ArgumentNullException.ThrowIfNull(dataProtection);
+        _cookieProtector = dataProtection.CreateProtector("Jellyfin.Plugin.Scryer", "OAuthFlowCookie", "v1");
     }
 
     public async Task<ScryerResult<ScryerOAuthStartResult>> StartAsync(

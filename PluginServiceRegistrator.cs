@@ -17,6 +17,10 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddHttpClient(nameof(ScryerGraphqlService))
             .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
         serviceCollection.AddSingleton<IScryerOAuthConfigurationProvider, PluginScryerOAuthConfigurationProvider>();
+        // The plugin owns its DataProtection key ring. Jellyfin's injected provider is ephemeral
+        // whenever the server has no writable user profile (the standard container deployment),
+        // which silently invalidates every stored refresh grant on restart.
+        serviceCollection.AddSingleton<ScryerDataProtection>();
         serviceCollection.AddSingleton<ScryerOAuthMetadataClient>();
         serviceCollection.AddSingleton<IScryerTokenStore, ScryerTokenStore>();
         serviceCollection.AddSingleton<IScryerJellyfinLinkService, ScryerJellyfinLinkService>();
